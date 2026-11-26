@@ -66,7 +66,6 @@ var expectedAllowedTools = []string{
 	"manage_subagents",
 	"ask_question",
 	"manage_task",
-	"call_mcp_tool",
 }
 
 var forbiddenPiTokens = []string{
@@ -259,6 +258,25 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 			}
 		}
 	}
+
+	mcpAgents := []string{
+		"agents/odd-orchestrator.md",
+		"agents/gentle-ai-worker.md",
+		"agents/review-risk.md",
+		"agents/review-resilience.md",
+		"agents/review-readability.md",
+		"agents/review-reliability.md",
+		"agents/review-refuter.md",
+	}
+	for _, mcpPath := range mcpAgents {
+		fm, _, _ := assets.ParseFrontmatter(byPath[mcpPath].Content)
+		if fm.InheritMcp == nil || !*fm.InheritMcp {
+			t.Errorf("%s must declare inheritMcp: true", mcpPath)
+		}
+		if slices.Contains(fm.Tools, "call_mcp_tool") {
+			t.Errorf("%s must not include call_mcp_tool in tools", mcpPath)
+		}
+	}
 }
 
 func TestZeroPiOnlyTokensAcrossAllAssets(t *testing.T) {
@@ -326,6 +344,16 @@ func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
 
 func TestValidateFSNegativeCases(t *testing.T) {
 	baseFS := cloneEmbeddedToMapFS(t)
+
+	t.Run("rejects agent declaring call_mcp_tool in tools", func(t *testing.T) {
+		m := cloneMapFS(baseFS)
+		m["agents/gentle-ai-explore.md"] = &fstest.MapFile{
+			Data: []byte("---\nname: gentle-ai-explore\ndescription: Explore.\nsubagent: true\ntools: [view_file, call_mcp_tool]\n---\n\nExplore.\n"),
+		}
+		if err := assets.ValidateFS(m); err == nil || !strings.Contains(err.Error(), "call_mcp_tool") {
+			t.Fatalf("ValidateFS() err = %v, want error mentioning call_mcp_tool", err)
+		}
+	})
 
 	t.Run("rejects unknown tool name", func(t *testing.T) {
 		m := cloneMapFS(baseFS)
