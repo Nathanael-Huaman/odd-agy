@@ -24,7 +24,6 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 
 	toolName := strings.ToLower(strings.TrimSpace(in.ToolCall.Name))
 
-	cmdDir := workspace
 	// Rule A: Sensitive path and workspace-boundary protection.
 	switch toolName {
 	case "view_file", "write_to_file", "replace_file_content", "multi_replace_file_content":
@@ -36,15 +35,11 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 		}
 	case "run_command":
 		cmdStr := getCommandLine(in.ToolCall.Args)
-		if cwdArg := getStringArg(in.ToolCall.Args, "Cwd"); cwdArg != "" {
-			if reason := checkSensitiveOrOutOfBoundsPath(workspace, cwdArg, nil); reason != "" {
-				return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
-			}
-			if resolved, _ := resolveAndCheckPathBounds(workspace, cwdArg); resolved != "" {
-				cmdDir = resolved
-			}
+		cmdCwd, reason := resolveCommandCwd(workspace, in.ToolCall.Args)
+		if reason != "" {
+			return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
 		}
-		if reason := checkCommandSensitivePaths(workspace, cmdDir, cmdStr); reason != "" {
+		if reason := checkCommandSensitivePaths(workspace, cmdCwd, cmdStr); reason != "" {
 			return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
 		}
 	}
@@ -61,7 +56,11 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 			}
 		case "run_command":
 			cmdStr := getCommandLine(in.ToolCall.Args)
-			if reason := checkFullDelegationCommandMutation(workspace, cmdDir, cmdStr); reason != "" {
+			cmdCwd, reason := resolveCommandCwd(workspace, in.ToolCall.Args)
+			if reason != "" {
+				return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
+			}
+			if reason := checkFullDelegationCommandMutation(workspace, cmdCwd, cmdStr); reason != "" {
 				return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
 			}
 		}
@@ -136,11 +135,43 @@ func checkSensitiveOrOutOfBoundsPath(workspace, rawPath string, args map[string]
 	return ""
 }
 
-func resolveAndCheckPathBounds(workspace, rawPath string) (string, string) {
-	return resolvePathBoundsFromBase(workspace, workspace, rawPath)
+func resolveCommandCwd(workspace string, args map[string]any) (string, string) {
+	realWorkspace, err := evalSymlinksBestEffort(workspace)
+	if err != nil {
+		return "", fmt.Sprintf("access denied: unable to resolve workspace root: %v", err)
+	}
+	cwdArg := strings.TrimSpace(getStringArg(args, "Cwd"))
+	if cwdArg == "" {
+		return realWorkspace, ""
+	}
+	if reason := checkSensitivePathPattern(workspace, cwdArg, nil); reason != "" {
+		return "", reason
+	}
+	if cwdArg == "~" || strings.HasPrefix(cwdArg, "~/") || strings.HasPrefix(cwdArg, "~\\") {
+		return "", fmt.Sprintf("access denied: Cwd %q escapes workspace root", cwdArg)
+	}
+	absCwd := cwdArg
+	if !filepath.IsAbs(absCwd) {
+		absCwd = filepath.Join(realWorkspace, absCwd)
+	}
+	realCwd, err := evalSymlinksBestEffort(absCwd)
+	if err != nil {
+		return "", fmt.Sprintf("access denied: unable to resolve Cwd %q: %v", cwdArg, err)
+	}
+	if !isWithinDir(realCwd, realWorkspace) {
+		return "", fmt.Sprintf("access denied: Cwd %q escapes workspace root", cwdArg)
+	}
+	if reason := checkSensitivePathPattern(workspace, realCwd, nil); reason != "" {
+		return "", reason
+	}
+	return realCwd, ""
 }
 
-func resolvePathBoundsFromBase(workspace, baseDir, rawPath string) (string, string) {
+func resolveAndCheckPathBounds(workspace, rawPath string) (string, string) {
+	return resolveAndCheckPathBoundsFrom(workspace, workspace, rawPath)
+}
+
+func resolveAndCheckPathBoundsFrom(workspace, baseDir, rawPath string) (string, string) {
 	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
 		return "", ""
@@ -175,6 +206,10 @@ func resolvePathBoundsFromBase(workspace, baseDir, rawPath string) (string, stri
 }
 
 func checkSensitivePathPattern(workspace, rawPath string, args map[string]any) string {
+	return checkSensitivePathPatternFrom(workspace, workspace, rawPath, args)
+}
+
+func checkSensitivePathPatternFrom(workspace, baseDir, rawPath string, args map[string]any) string {
 	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
 		return ""
@@ -210,7 +245,7 @@ func checkSensitivePathPattern(workspace, rawPath string, args map[string]any) s
 	}
 
 	if base == ".npmrc" {
-		if npmrcHasAuth(workspace, trimmed, args) {
+		if npmrcHasAuth(baseDir, trimmed, args) {
 			return fmt.Sprintf("sensitive .npmrc with auth credentials blocked: %q", rawPath)
 		}
 	}
@@ -256,7 +291,12 @@ func containsNPMAuth(s string) bool {
 		strings.Contains(lower, "_password")
 }
 
-func checkCommandSensitivePaths(workspace, cmdDir, cmdStr string) string {
+func checkCommandSensitivePaths(workspace, cmdCwd, cmdStr string) string {
+	baseDir := cmdCwd
+	if strings.TrimSpace(baseDir) == "" {
+		baseDir = workspace
+	}
+
 	for _, seg := range splitShellCommands(cmdStr) {
 		tokens := splitShellTokens(seg)
 		for _, tok := range tokens {
@@ -264,7 +304,7 @@ func checkCommandSensitivePaths(workspace, cmdDir, cmdStr string) string {
 			if eq := strings.IndexByte(clean, '='); eq >= 0 {
 				clean = clean[eq+1:]
 			} else if strings.HasPrefix(clean, "-") {
-				if strings.HasPrefix(clean, "--") || len(clean) <= 2 || (!looksLikeFilePathToken(clean[2:]) && !strings.ContainsAny(clean[2:], "/\\.") && checkSensitivePathPattern(cmdDir, clean[2:], nil) == "") {
+				if strings.HasPrefix(clean, "--") || len(clean) <= 2 || (!looksLikeFilePathToken(clean[2:]) && !strings.ContainsAny(clean[2:], "/\\.") && checkSensitivePathPatternFrom(workspace, baseDir, clean[2:], nil) == "") {
 					continue
 				}
 				clean = clean[2:]
@@ -273,17 +313,17 @@ func checkCommandSensitivePaths(workspace, cmdDir, cmdStr string) string {
 				continue
 			}
 			// Check obvious sensitive path references.
-			if reason := checkSensitivePathPattern(cmdDir, clean, nil); reason != "" {
+			if reason := checkSensitivePathPatternFrom(workspace, baseDir, clean, nil); reason != "" {
 				return reason
 			}
 			// Check path escapes for tokens that look like filesystem paths.
 			if looksLikeFilePathToken(clean) {
-				realTarget, reason := resolvePathBoundsFromBase(workspace, cmdDir, clean)
+				realTarget, reason := resolveAndCheckPathBoundsFrom(workspace, baseDir, clean)
 				if reason != "" {
 					return reason
 				}
 				if realTarget != "" {
-					if reason := checkSensitivePathPattern(workspace, realTarget, nil); reason != "" {
+					if reason := checkSensitivePathPatternFrom(workspace, baseDir, realTarget, nil); reason != "" {
 						return reason
 					}
 				}
@@ -292,20 +332,20 @@ func checkCommandSensitivePaths(workspace, cmdDir, cmdStr string) string {
 			// Also resolve relative path-like or existing workspace entries (including symlinks)
 			// so commands like "cat innocent.txt" (innocent.txt -> secret.pem) are checked against realTarget.
 			if !strings.Contains(clean, "://") && !strings.HasPrefix(clean, "~") {
-				absCandidate := filepath.Join(cmdDir, clean)
+				absCandidate := filepath.Join(baseDir, clean)
 				if _, lstatErr := os.Lstat(absCandidate); lstatErr == nil {
-					realTarget, reason := resolvePathBoundsFromBase(workspace, cmdDir, clean)
+					realTarget, reason := resolveAndCheckPathBoundsFrom(workspace, baseDir, clean)
 					if reason != "" {
 						return reason
 					}
 					if realTarget != "" {
-						if reason := checkSensitivePathPattern(workspace, realTarget, nil); reason != "" {
+						if reason := checkSensitivePathPatternFrom(workspace, baseDir, realTarget, nil); reason != "" {
 							return reason
 						}
 					}
-				} else if realTarget, reason := resolvePathBoundsFromBase(workspace, cmdDir, clean); reason != "" {
+				} else if realTarget, reason := resolveAndCheckPathBoundsFrom(workspace, baseDir, clean); reason != "" {
 					return reason
-				} else if reason := checkSensitivePathPattern(workspace, realTarget, nil); realTarget != "" && reason != "" {
+				} else if reason := checkSensitivePathPatternFrom(workspace, baseDir, realTarget, nil); realTarget != "" && reason != "" {
 					return reason
 				}
 			}
@@ -381,10 +421,17 @@ func isOddTaskMarkdown(realRoot, realTarget string) bool {
 	return strings.HasSuffix(strings.ToLower(name), ".md")
 }
 
-func checkFullDelegationCommandMutation(workspace, cmdDir, cmdStr string) string {
+func checkFullDelegationCommandMutation(workspace, cmdCwd, cmdStr string) string {
 	realRoot, err := evalSymlinksBestEffort(workspace)
 	if err != nil {
 		return fmt.Sprintf("full-delegation guard failed to resolve workspace: %v", err)
+	}
+	realCwd := realRoot
+	if strings.TrimSpace(cmdCwd) != "" {
+		realCwd, err = evalSymlinksBestEffort(cmdCwd)
+		if err != nil {
+			return fmt.Sprintf("full-delegation guard failed to resolve Cwd: %v", err)
+		}
 	}
 
 	for _, seg := range splitShellCommands(cmdStr) {
@@ -406,7 +453,7 @@ func checkFullDelegationCommandMutation(workspace, cmdDir, cmdStr string) string
 				target = tokens[i+1]
 				i++
 			}
-			if reason := validateMutationTargetForFullDelegation(realRoot, cmdDir, target); reason != "" {
+			if reason := validateMutationTargetForFullDelegation(realRoot, realCwd, target); reason != "" {
 				return reason
 			}
 		}
@@ -422,7 +469,7 @@ func checkFullDelegationCommandMutation(workspace, cmdDir, cmdStr string) string
 				if arg == "(" || arg == ")" || strings.HasPrefix(arg, "-") {
 					continue
 				}
-				if reason := validateMutationTargetForFullDelegation(realRoot, cmdDir, arg); reason != "" {
+				if reason := validateMutationTargetForFullDelegation(realRoot, realCwd, arg); reason != "" {
 					return reason
 				}
 			}
@@ -430,12 +477,12 @@ func checkFullDelegationCommandMutation(workspace, cmdDir, cmdStr string) string
 
 		// 3. sed -i / --in-place or perl -i / -pi
 		if cmdName == "sed" && hasInPlaceFlag(tokens[1:], true) {
-			if reason := checkInPlaceCommandTargets(realRoot, cmdDir, tokens[1:], true); reason != "" {
+			if reason := checkInPlaceCommandTargets(realRoot, realCwd, tokens[1:], true); reason != "" {
 				return reason
 			}
 		}
 		if cmdName == "perl" && hasInPlaceFlag(tokens[1:], false) {
-			if reason := checkInPlaceCommandTargets(realRoot, cmdDir, tokens[1:], false); reason != "" {
+			if reason := checkInPlaceCommandTargets(realRoot, realCwd, tokens[1:], false); reason != "" {
 				return reason
 			}
 		}
@@ -475,7 +522,7 @@ func hasInPlaceFlag(args []string, allowLongInPlace bool) bool {
 	return false
 }
 
-func checkInPlaceCommandTargets(realRoot, realCmdDir string, args []string, isSed bool) string {
+func checkInPlaceCommandTargets(realRoot, realCwd string, args []string, isSed bool) string {
 	skipNext := false
 	seenScript := false
 	for i := 0; i < len(args); i++ {
@@ -504,14 +551,14 @@ func checkInPlaceCommandTargets(realRoot, realCmdDir string, args []string, isSe
 				continue
 			}
 		}
-		if reason := validateMutationTargetForFullDelegation(realRoot, realCmdDir, a); reason != "" {
+		if reason := validateMutationTargetForFullDelegation(realRoot, realCwd, a); reason != "" {
 			return reason
 		}
 	}
 	return ""
 }
 
-func validateMutationTargetForFullDelegation(realRoot, realCmdDir, target string) string {
+func validateMutationTargetForFullDelegation(realRoot, realCwd, target string) string {
 	clean := strings.TrimSpace(target)
 	if clean == "" || clean == "/dev/null" || isFDTarget(clean) {
 		return ""
@@ -521,7 +568,7 @@ func validateMutationTargetForFullDelegation(realRoot, realCmdDir, target string
 	}
 	absTarget := clean
 	if !filepath.IsAbs(absTarget) {
-		absTarget = filepath.Join(realCmdDir, absTarget)
+		absTarget = filepath.Join(realCwd, absTarget)
 	}
 	realTarget, err := evalSymlinksBestEffort(absTarget)
 	if err != nil {
@@ -991,6 +1038,13 @@ func isAllowedTempPath(realTarget string) bool {
 }
 
 func evalSymlinksBestEffort(p string) (string, error) {
+	return evalSymlinksBestEffortDepth(p, 0)
+}
+
+func evalSymlinksBestEffortDepth(p string, depth int) (string, error) {
+	if depth > 40 {
+		return "", fmt.Errorf("too many symlink levels resolving %q", p)
+	}
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", err
@@ -1002,6 +1056,18 @@ func evalSymlinksBestEffort(p string) (string, error) {
 	var tail []string
 	cur := abs
 	for {
+		if info, lstatErr := os.Lstat(cur); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			if target, readErr := os.Readlink(cur); readErr == nil {
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(cur), target)
+				}
+				next := target
+				if len(tail) > 0 {
+					next = filepath.Join(append([]string{target}, tail...)...)
+				}
+				return evalSymlinksBestEffortDepth(next, depth+1)
+			}
+		}
 		parent := filepath.Dir(cur)
 		base := filepath.Base(cur)
 		if parent == cur {

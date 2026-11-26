@@ -640,3 +640,119 @@ func TestStartRequestContextPathValidationAndPrivatePermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestUntrackedSymlinkHighRisk(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	writeFile(t, dir, "README.md", "# Readme\n", 0o644)
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "base")
+
+	docsDir := filepath.Join(dir, "docs")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	if err := os.Symlink("../README.md", filepath.Join(docsDir, "link.md")); err != nil {
+		t.Fatalf("symlink docs/link.md: %v", err)
+	}
+
+	res, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess failed: %v", err)
+	}
+	if res.NativeRisk != RiskHigh || res.Risk != RiskHigh || !res.ReviewDue {
+		t.Fatalf("untracked symlink docs/link.md expected RiskHigh and ReviewDue=true, got %+v", res)
+	}
+}
+
+func TestAssessRenamedFileCountsFullLinesWithDiffRenamesTrue(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	runGit(t, dir, "config", "diff.renames", "true")
+	writeFile(t, dir, "old.go", "package p\n\nfunc F() int {\n\treturn 42\n}\n", 0o644)
+	runGit(t, dir, "add", "old.go")
+	runGit(t, dir, "commit", "-m", "base")
+
+	runGit(t, dir, "mv", "old.go", "new.go")
+
+	res, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess failed: %v", err)
+	}
+	if len(res.ChangedPaths) != 2 {
+		t.Fatalf("ChangedPaths = %v, want 2 paths (old.go and new.go)", res.ChangedPaths)
+	}
+	if res.ChangedLines != 10 {
+		t.Fatalf("ChangedLines = %d, want 10 (5 deleted + 5 added)", res.ChangedLines)
+	}
+}
+
+func TestTamperedOrMissingRequestContextFailsClosed(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	writeFile(t, dir, "app.go", "package app\nfunc Run() int { return 1 }\n", 0o644)
+	runGit(t, dir, "add", "app.go")
+	runGit(t, dir, "commit", "-m", "base")
+
+	writeFile(t, dir, "app.go", "package app\nfunc Run() int { return 2 }\n", 0o644)
+	writeFile(t, dir, "docs/spec.md", "# Spec\nImmutable context\n", 0o644)
+
+	st, err := eng.Start(StartRequest{
+		Lenses:             []string{"risk"},
+		LensesReason:       "context integrity",
+		RequestContextPath: "docs/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if _, err := eng.AnswerConsent(st.LineageID, "granted"); err != nil {
+		t.Fatalf("AnswerConsent failed: %v", err)
+	}
+
+	rev1Dir := filepath.Join(dir, ".git", "odd-agy", "candidates", st.LineageID, "rev-1")
+	ctxPath := filepath.Join(rev1Dir, "request-context.txt")
+	if err := os.Chmod(rev1Dir, 0o755); err != nil {
+		t.Fatalf("chmod rev1Dir: %v", err)
+	}
+	if err := os.Chmod(ctxPath, 0o644); err != nil {
+		t.Fatalf("chmod ctxPath: %v", err)
+	}
+	if err := os.WriteFile(ctxPath, []byte("tampered context\n"), 0o444); err != nil {
+		t.Fatalf("tamper request-context.txt: %v", err)
+	}
+	if _, err := eng.Scope(st.LineageID, 0, 10); err == nil {
+		t.Fatal("expected Scope to fail closed when request-context.txt was tampered with")
+	}
+
+	// Restore valid context, submit blocker -> refuter confirms -> remove request-context.txt -> ApplyCorrection must fail closed.
+	if err := os.Chmod(ctxPath, 0o644); err != nil {
+		t.Fatalf("chmod ctxPath: %v", err)
+	}
+	if err := os.WriteFile(ctxPath, []byte("# Spec\nImmutable context\n"), 0o444); err != nil {
+		t.Fatalf("restore request-context.txt: %v", err)
+	}
+	if _, err := eng.Submit(SubmitRequest{
+		LineageID: st.LineageID,
+		Lens:      "risk",
+		Findings:  []Finding{{ID: "B1", Severity: SeveritySEVERE, Causality: CausalityCandidate, Location: "app.go:2", Claim: "bug"}},
+	}); err != nil {
+		t.Fatalf("Submit risk: %v", err)
+	}
+	if _, err := eng.Submit(SubmitRequest{
+		LineageID: st.LineageID,
+		Lens:      "refuter",
+		Verdicts:  []RefuterVerdict{{FindingID: "B1", Verdict: VerdictConfirmed}},
+	}); err != nil {
+		t.Fatalf("Submit refuter: %v", err)
+	}
+	if err := os.Remove(ctxPath); err != nil {
+		t.Fatalf("remove request-context.txt: %v", err)
+	}
+	if _, err := eng.ApplyCorrection(st.LineageID); err == nil {
+		t.Fatal("expected ApplyCorrection to fail when prior revision request-context.txt is missing")
+	}
+}
+

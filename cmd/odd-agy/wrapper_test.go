@@ -3,6 +3,7 @@ package main
 import (
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -47,7 +48,11 @@ func TestWrapperBuildAndRun(t *testing.T) {
 	}
 
 	// Verify ODD_AGY_BIN override.
-	builtBin := filepath.Join(root, "dist", "bin", "odd-agy")
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	builtBin := filepath.Join(root, "dist", "bin", "odd-agy"+ext)
 	overrideCmd := exec.Command("node", filepath.Join(root, "bin", "odd-agy.mjs"), "--version")
 	overrideCmd.Dir = root
 	overrideCmd.Env = append(overrideCmd.Environ(), "ODD_AGY_BIN="+builtBin)

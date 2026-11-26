@@ -276,6 +276,54 @@ func TestZeroPiOnlyTokensAcrossAllAssets(t *testing.T) {
 	}
 }
 
+func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
+	agents, err := assets.Agents()
+	if err != nil {
+		t.Fatalf("Agents() error: %v", err)
+	}
+	skills, err := assets.Skills()
+	if err != nil {
+		t.Fatalf("Skills() error: %v", err)
+	}
+
+	var targets []assets.AssetFile
+	for _, a := range agents {
+		if strings.HasPrefix(a.RelPath, "agents/review-") {
+			targets = append(targets, a)
+		}
+	}
+	for _, s := range skills {
+		if s.RelPath == "skills/rdd-defect-workflow/SKILL.md" {
+			targets = append(targets, s)
+		}
+	}
+	if len(targets) != 6 {
+		t.Fatalf("expected 5 review-* agents + 1 rdd-defect-workflow skill, got %d", len(targets))
+	}
+
+	for _, af := range targets {
+		text := string(af.Content)
+		if !strings.Contains(text, "SEVERE") {
+			t.Errorf("%s must reference uppercase SEVERE", af.RelPath)
+		}
+		if !strings.Contains(text, "causality") {
+			t.Errorf("%s must reference causality field", af.RelPath)
+		}
+		if !strings.Contains(text, "pre_existing") {
+			t.Errorf("%s must reference pre_existing causality value", af.RelPath)
+		}
+		if strings.Contains(text, "pre-existing") {
+			t.Errorf("%s must not use hyphenated pre-existing", af.RelPath)
+		}
+		if strings.Contains(strings.ToLower(text), "origin") {
+			t.Errorf("%s must use causality instead of origin", af.RelPath)
+		}
+		if strings.Contains(text, "severe") {
+			t.Errorf("%s must not contain lowercase severe schema instructions", af.RelPath)
+		}
+	}
+}
+
 func TestValidateFSNegativeCases(t *testing.T) {
 	baseFS := cloneEmbeddedToMapFS(t)
 

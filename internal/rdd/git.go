@@ -89,7 +89,7 @@ func collectCandidate(repoRoot, baseRef string, committedOnly bool) (candidateSn
 	}
 
 	rawArgs := []string{"diff", "--raw", "--no-renames", "-z", diffFrom}
-	numArgs := []string{"diff", "--numstat", "-z", diffFrom}
+	numArgs := []string{"diff", "--numstat", "--no-renames", "-z", diffFrom}
 	if committedOnly {
 		rawArgs = append(rawArgs, diffTo)
 		numArgs = append(numArgs, diffTo)
@@ -189,6 +189,7 @@ func collectCandidate(repoRoot, baseRef string, committedOnly bool) (candidateSn
 			mode := "100644"
 			if info.Mode()&os.ModeSymlink != 0 {
 				mode = "120000"
+				hasModeChange = true
 			} else if info.Mode()&0o111 != 0 {
 				mode = "100755"
 				hasModeChange = true

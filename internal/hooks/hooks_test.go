@@ -982,6 +982,150 @@ func TestPreToolUseRDDCorrectionSecurityFixes(t *testing.T) {
 	}
 }
 
+func TestPreToolUseRunCommandCwdAwareSymlinkAndBounds(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeOrganic
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.txt")
+	writeFile(t, outsideFile, "OUTSIDE SECRET")
+	writeFile(t, filepath.Join(repo, "secret.pem"), "PRIVATE KEY")
+	writeFile(t, filepath.Join(repo, "sub", "ok.txt"), "safe")
+	writeFile(t, filepath.Join(repo, "sub", ".npmrc"), "//registry.npmjs.org/:_authToken=secret\n")
+
+	// Symlink inside sub/ pointing outside workspace and pointing to ../secret.pem.
+	if err := os.Symlink(outsideFile, filepath.Join(repo, "sub", "sub_escape_link.txt")); err != nil {
+		t.Fatalf("symlink sub_escape_link.txt: %v", err)
+	}
+	if err := os.Symlink("../secret.pem", filepath.Join(repo, "sub", "sub_secret_link.txt")); err != nil {
+		t.Fatalf("symlink sub_secret_link.txt: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outsideDir, "missing_outside.txt"), filepath.Join(repo, "sub", "sub_dangling_escape.txt")); err != nil {
+		t.Fatalf("symlink sub_dangling_escape.txt: %v", err)
+	}
+	if err := os.Symlink("ok.txt", filepath.Join(repo, "sub", "sub_ok_link.txt")); err != nil {
+		t.Fatalf("symlink sub_ok_link.txt: %v", err)
+	}
+
+	subDir := filepath.Join(repo, "sub")
+
+	deniedCases := []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "cwd_sub_escape_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_escape_link.txt"},
+		},
+		{
+			name: "cwd_sub_secret_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_secret_link.txt"},
+		},
+		{
+			name: "cwd_sub_dangling_escape_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_dangling_escape.txt"},
+		},
+		{
+			name: "cwd_sub_npmrc_auth",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat .npmrc"},
+		},
+		{
+			name: "cwd_outside_workspace",
+			args: map[string]any{"Cwd": outsideDir, "CommandLine": "cat outside.txt"},
+		},
+		{
+			name: "cwd_temp_root_outside_workspace",
+			args: map[string]any{"Cwd": os.TempDir(), "CommandLine": "ls"},
+		},
+		{
+			name: "cwd_relative_escape",
+			args: map[string]any{"Cwd": "../outside", "CommandLine": "ls"},
+		},
+		{
+			name: "cwd_sub_relative_double_dot_escape",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat ../../outside.txt"},
+		},
+	}
+
+	for _, tc := range deniedCases {
+		t.Run("deny_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{
+					ConversationID: "conv-cwd-sym",
+					WorkspacePaths: []string{repo},
+				},
+				ToolCall: ToolCall{Name: "run_command", Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionDeny {
+				t.Fatalf("expected deny for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+
+	// Preserve: benign symlink and in-workspace parent ref from Cwd=sub remain allowed.
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "cwd_sub_benign_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_ok_link.txt"},
+		},
+		{
+			name: "cwd_sub_in_workspace_parent",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat ../README.md"},
+		},
+	} {
+		t.Run("allow_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{
+					ConversationID: "conv-cwd-sym",
+					WorkspacePaths: []string{repo},
+				},
+				ToolCall: ToolCall{Name: "run_command", Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionAllow {
+				t.Fatalf("expected allow for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+
+	// Preserve & verify full-delegation Cwd-aware mutation checks.
+	cfg.DelegationMode = config.DelegationModeFull
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig full-delegation: %v", err)
+	}
+	var allowOddTask PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-cwd-full", WorkspacePaths: []string{repo}},
+		ToolCall: ToolCall{
+			Name: "run_command",
+			Args: map[string]any{"Cwd": filepath.Join(repo, "odd", "tasks"), "CommandLine": "echo '# feat' > feat.md"},
+		},
+	}, &allowOddTask)
+	if allowOddTask.Decision != DecisionAllow {
+		t.Fatalf("expected allow for odd/tasks/feat.md with Cwd=odd/tasks, got %+v", allowOddTask)
+	}
+
+	var denySubMutation PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-cwd-full", WorkspacePaths: []string{repo}},
+		ToolCall: ToolCall{
+			Name: "run_command",
+			Args: map[string]any{"Cwd": subDir, "CommandLine": "echo x > ok.txt"},
+		},
+	}, &denySubMutation)
+	if denySubMutation.Decision != DecisionDeny {
+		t.Fatalf("expected deny for shell mutation in subDir under full-delegation, got %+v", denySubMutation)
+	}
+}
+
 func TestDispatch_Errors(t *testing.T) {
 	var out bytes.Buffer
 	if err := Dispatch("UnknownEvent", strings.NewReader("{}"), &out); err == nil {
