@@ -576,3 +576,67 @@ func TestSecondBlockerEscalatesAndUnknownEscalatesAndRefutedApproves(t *testing.
 		t.Fatalf("expected approved_pending_ack when all refuted, got %+v", stC)
 	}
 }
+
+func TestStartRequestContextPathValidationAndPrivatePermissions(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("top-secret"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	writeFile(t, dir, "app.go", "package app\n", 0o644)
+	writeFile(t, dir, "docs/spec.md", "# Valid Spec\n", 0o644)
+	symlinkPath := filepath.Join(dir, "escape-link.txt")
+	if err := os.Symlink(outsideFile, symlinkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	relTraversal, err := filepath.Rel(dir, outsideFile)
+	if err != nil {
+		t.Fatalf("filepath.Rel: %v", err)
+	}
+
+	for _, bad := range []string{outsideFile, relTraversal, "escape-link.txt", "docs"} {
+		if _, err := eng.Start(StartRequest{
+			Lenses:             []string{"risk"},
+			LensesReason:       "context path validation",
+			RequestContextPath: bad,
+		}); err == nil {
+			t.Fatalf("expected Start to reject RequestContextPath %q", bad)
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(dir, ".git", "odd-agy", "candidates"))
+	if err == nil && len(entries) > 0 {
+		t.Fatalf("expected no snapshot directories created for rejected RequestContextPath, found %d", len(entries))
+	}
+
+	okRes, err := eng.Start(StartRequest{
+		Lenses:             []string{"risk"},
+		LensesReason:       "valid context path",
+		RequestContextPath: "docs/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("Start with valid RequestContextPath failed: %v", err)
+	}
+
+	candDir := filepath.Join(dir, ".git", "odd-agy", "candidates", okRes.LineageID)
+	for _, p := range []string{
+		candDir,
+		filepath.Join(candDir, "rev-1"),
+		filepath.Join(candDir, "manifest.json"),
+		filepath.Join(candDir, "rev-1", "request-context.txt"),
+		filepath.Join(candDir, "rev-1", "files", "app.go"),
+	} {
+		info, statErr := os.Stat(p)
+		if statErr != nil {
+			t.Fatalf("stat %s: %v", p, statErr)
+		}
+		if mode := info.Mode().Perm(); mode&0o077 != 0 {
+			t.Fatalf("path %s has group/other permissions %04o; want private owner-only", p, mode)
+		}
+	}
+}

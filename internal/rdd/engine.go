@@ -176,9 +176,9 @@ func (e *Engine) Start(req StartRequest) (StartResult, error) {
 	var reqCtxBytes []byte
 	var reqCtxHash string
 	if strings.TrimSpace(req.RequestContextPath) != "" {
-		reqCtxPath := req.RequestContextPath
-		if !filepath.IsAbs(reqCtxPath) {
-			reqCtxPath = filepath.Join(e.repoRoot, reqCtxPath)
+		reqCtxPath, err := resolveRequestContextPath(e.repoRoot, req.RequestContextPath)
+		if err != nil {
+			return StartResult{}, err
 		}
 		reqCtxBytes, err = os.ReadFile(reqCtxPath)
 		if err != nil {
@@ -691,18 +691,18 @@ func freezeSnapshot(
 
 	// Ensure candidate dir is writable when adding revision 2+.
 	if info, err := os.Stat(candDir); err == nil && info.IsDir() {
-		if err := os.Chmod(candDir, 0o755); err != nil {
+		if err := os.Chmod(candDir, 0o700); err != nil {
 			return Manifest{}, "", fmt.Errorf("unlock candidate dir %s: %w", candDir, err)
 		}
 	}
 	manifestPath := filepath.Join(candDir, "manifest.json")
 	if _, err := os.Stat(manifestPath); err == nil {
-		if err := os.Chmod(manifestPath, 0o644); err != nil {
+		if err := os.Chmod(manifestPath, 0o600); err != nil {
 			return Manifest{}, "", fmt.Errorf("unlock manifest %s: %w", manifestPath, err)
 		}
 	}
 
-	if err := os.MkdirAll(filesDir, 0o755); err != nil {
+	if err := os.MkdirAll(filesDir, 0o700); err != nil {
 		return Manifest{}, "", fmt.Errorf("create snapshot dir %s: %w", filesDir, err)
 	}
 
@@ -711,7 +711,7 @@ func freezeSnapshot(
 
 	if reqCtxHash != "" {
 		ctxPath := filepath.Join(revDir, "request-context.txt")
-		if err := os.WriteFile(ctxPath, reqCtxBytes, 0o444); err != nil {
+		if err := os.WriteFile(ctxPath, reqCtxBytes, 0o400); err != nil {
 			return Manifest{}, "", fmt.Errorf("write frozen request context: %w", err)
 		}
 		createdFiles = append(createdFiles, ctxPath)
@@ -723,7 +723,7 @@ func freezeSnapshot(
 		}
 		dst := filepath.Join(filesDir, filepath.FromSlash(f.Path))
 		parent := filepath.Dir(dst)
-		if err := os.MkdirAll(parent, 0o755); err != nil {
+		if err := os.MkdirAll(parent, 0o700); err != nil {
 			return Manifest{}, "", fmt.Errorf("create snapshot parent %s: %w", parent, err)
 		}
 		for cur := parent; strings.HasPrefix(cur, filesDir); cur = filepath.Dir(cur) {
@@ -732,7 +732,7 @@ func freezeSnapshot(
 				break
 			}
 		}
-		if err := os.WriteFile(dst, []byte(f.Content), 0o444); err != nil {
+		if err := os.WriteFile(dst, []byte(f.Content), 0o400); err != nil {
 			return Manifest{}, "", fmt.Errorf("write frozen file %s: %w", dst, err)
 		}
 		createdFiles = append(createdFiles, dst)
@@ -763,14 +763,14 @@ func freezeSnapshot(
 	finalBytes = append(finalBytes, '\n')
 	manifestFileHash := sha256Hex(finalBytes)
 
-	if err := os.WriteFile(manifestPath, finalBytes, 0o644); err != nil {
+	if err := os.WriteFile(manifestPath, finalBytes, 0o600); err != nil {
 		return Manifest{}, "", fmt.Errorf("write manifest.json: %w", err)
 	}
-	if err := os.Chmod(manifestPath, 0o444); err != nil {
+	if err := os.Chmod(manifestPath, 0o400); err != nil {
 		return Manifest{}, "", fmt.Errorf("chmod manifest.json: %w", err)
 	}
 	for _, fp := range createdFiles {
-		_ = os.Chmod(fp, 0o444)
+		_ = os.Chmod(fp, 0o400)
 	}
 
 	// Lock directories deepest-first so files inside cannot be added/removed/renamed.
@@ -782,12 +782,39 @@ func freezeSnapshot(
 		return len(dirs[i]) > len(dirs[j])
 	})
 	for _, d := range dirs {
-		if err := os.Chmod(d, 0o555); err != nil {
+		if err := os.Chmod(d, 0o500); err != nil {
 			return Manifest{}, "", fmt.Errorf("chmod snapshot dir %s: %w", d, err)
 		}
 	}
 
 	return manifest, manifestFileHash, nil
+}
+
+func resolveRequestContextPath(repoRoot, raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if filepath.IsAbs(trimmed) {
+		return "", fmt.Errorf("requestContextPath %q must be a relative path inside the repository", raw)
+	}
+	realRoot, err := filepath.EvalSymlinks(repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository root %q: %w", repoRoot, err)
+	}
+	realTarget, err := filepath.EvalSymlinks(filepath.Join(realRoot, trimmed))
+	if err != nil {
+		return "", fmt.Errorf("resolve requestContextPath %q: %w", raw, err)
+	}
+	rel, err := filepath.Rel(realRoot, realTarget)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("requestContextPath %q escapes repository root", raw)
+	}
+	info, err := os.Stat(realTarget)
+	if err != nil {
+		return "", fmt.Errorf("stat requestContextPath %q: %w", raw, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("requestContextPath %q must be a regular file", raw)
+	}
+	return realTarget, nil
 }
 
 func loadAndVerifyManifest(gitDir string, st persistedLineage) (Manifest, error) {
