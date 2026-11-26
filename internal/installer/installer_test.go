@@ -1,0 +1,743 @@
+package installer
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/Nathanael-Huaman/odd-agy/internal/assets"
+	"github.com/Nathanael-Huaman/odd-agy/internal/config"
+	"github.com/Nathanael-Huaman/odd-agy/internal/version"
+)
+
+func fakeLookPath(found map[string]string) func(string) (string, error) {
+	return func(name string) (string, error) {
+		if p, ok := found[name]; ok {
+			return p, nil
+		}
+		return "", errors.New("executable file not found in $PATH")
+	}
+}
+
+func fakeLookupEnv(vars map[string]string) func(string) (string, bool) {
+	return func(k string) (string, bool) {
+		v, ok := vars[k]
+		return v, ok
+	}
+}
+
+func sha256Prefixed(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func TestInitCreatesAssetsConfigAndMergesHooksAndMCP(t *testing.T) {
+	ws := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	// Pre-populate user hooks.json and mcp_config.json with custom entries.
+	agentsDir := filepath.Join(ws, ".agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .agents: %v", err)
+	}
+
+	userHooks := map[string]any{
+		"user-custom-hook": map[string]any{
+			"Stop": []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{"type": "command", "command": "echo user-stop"},
+					},
+				},
+			},
+		},
+	}
+	writeJSONFile(t, filepath.Join(agentsDir, "hooks.json"), userHooks)
+
+	userMCP := map[string]any{
+		"customTopField": "keep-me",
+		"mcpServers": map[string]any{
+			"user-server": map[string]any{
+				"command": "npx",
+				"args":    []string{"-y", "my-mcp"},
+			},
+		},
+	}
+	writeJSONFile(t, filepath.Join(agentsDir, "mcp_config.json"), userMCP)
+
+	res, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/usr/local/bin/agy",
+			"engram": "/usr/local/bin/engram",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+	if len(res.InstalledFiles) == 0 {
+		t.Fatalf("expected installed asset files, got 0")
+	}
+
+	// Verify ~/.gemini/ was never created or touched.
+	if _, err := os.Stat(filepath.Join(fakeHome, ".gemini")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected ~/.gemini not to exist, got err=%v", err)
+	}
+
+	// Verify all embedded assets were written.
+	allAssets, err := assets.All()
+	if err != nil {
+		t.Fatalf("assets.All: %v", err)
+	}
+	for _, af := range allAssets {
+		diskPath := filepath.Join(ws, ".agents", filepath.FromSlash(af.RelPath))
+		got, err := os.ReadFile(diskPath)
+		if err != nil {
+			t.Fatalf("missing installed asset %s: %v", diskPath, err)
+		}
+		if string(got) != string(af.Content) {
+			t.Fatalf("installed asset %s content mismatch", af.RelPath)
+		}
+	}
+
+	// Verify default config.json and profiles.json.
+	cfg, err := config.LoadConfig(ws)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.DelegationMode != config.DelegationModeFull {
+		t.Errorf("DelegationMode = %q, want %q", cfg.DelegationMode, config.DelegationModeFull)
+	}
+	if cfg.InstallMode != config.InstallModeLocal {
+		t.Errorf("InstallMode = %q, want %q", cfg.InstallMode, config.InstallModeLocal)
+	}
+	if cfg.BinaryCommand != "./node_modules/.bin/odd-agy" {
+		t.Errorf("BinaryCommand = %q, want ./node_modules/.bin/odd-agy", cfg.BinaryCommand)
+	}
+	if !cfg.RDDEnabled {
+		t.Errorf("RDDEnabled = false, want true")
+	}
+
+	profCfg, err := config.LoadProfiles(ws)
+	if err != nil {
+		t.Fatalf("LoadProfiles: %v", err)
+	}
+	if profCfg.ActiveProfile != "agy-oauth" {
+		t.Errorf("ActiveProfile = %q, want agy-oauth", profCfg.ActiveProfile)
+	}
+
+	// Verify .agents/hooks.json schema and preservation of user hook.
+	hooksDoc := readJSONFile(t, filepath.Join(agentsDir, "hooks.json"))
+	if _, ok := hooksDoc["user-custom-hook"]; !ok {
+		t.Fatalf("expected user-custom-hook to be preserved in hooks.json")
+	}
+	oddHooks, ok := hooksDoc["odd-agy"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected odd-agy hook map in hooks.json, got %T", hooksDoc["odd-agy"])
+	}
+	wantEvents := map[string]struct {
+		matcher string
+		cmd     string
+	}{
+		"SessionStart": {
+			cmd: "./node_modules/.bin/odd-agy hook SessionStart",
+		},
+		"PreToolUse": {
+			matcher: "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|send_message|run_command|view_file",
+			cmd:     "./node_modules/.bin/odd-agy hook PreToolUse",
+		},
+		"PostToolUse": {
+			matcher: "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|run_command",
+			cmd:     "./node_modules/.bin/odd-agy hook PostToolUse",
+		},
+		"PreInvocation": {
+			cmd: "./node_modules/.bin/odd-agy hook PreInvocation",
+		},
+		"Stop": {
+			cmd: "./node_modules/.bin/odd-agy hook Stop",
+		},
+	}
+	for event, want := range wantEvents {
+		entries, ok := oddHooks[event].([]any)
+		if !ok || len(entries) != 1 {
+			t.Fatalf("hooks.json event %s: got %#v, want 1 entry", event, oddHooks[event])
+		}
+		entry, ok := entries[0].(map[string]any)
+		if !ok {
+			t.Fatalf("hooks.json event %s entry not object", event)
+		}
+		if want.matcher != "" {
+			if gotMatcher, _ := entry["matcher"].(string); gotMatcher != want.matcher {
+				t.Errorf("hooks.json %s matcher = %q, want %q", event, gotMatcher, want.matcher)
+			}
+		} else if _, hasMatcher := entry["matcher"]; hasMatcher {
+			t.Errorf("hooks.json %s unexpectedly has matcher", event)
+		}
+		innerHooks, ok := entry["hooks"].([]any)
+		if !ok || len(innerHooks) != 1 {
+			t.Fatalf("hooks.json %s inner hooks invalid: %#v", event, entry["hooks"])
+		}
+		h0 := innerHooks[0].(map[string]any)
+		if h0["type"] != "command" || h0["command"] != want.cmd {
+			t.Errorf("hooks.json %s command = %#v, want type=command command=%q", event, h0, want.cmd)
+		}
+	}
+
+	// Verify .agents/mcp_config.json schema and preservation of user MCP server.
+	mcpDoc := readJSONFile(t, filepath.Join(agentsDir, "mcp_config.json"))
+	if mcpDoc["customTopField"] != "keep-me" {
+		t.Errorf("customTopField lost from mcp_config.json")
+	}
+	servers := mcpDoc["mcpServers"].(map[string]any)
+	if _, ok := servers["user-server"]; !ok {
+		t.Fatalf("user-server lost from mcp_config.json")
+	}
+	oddMCP, ok := servers["odd-agy"].(map[string]any)
+	if !ok {
+		t.Fatalf("odd-agy missing from mcp_config.json")
+	}
+	if oddMCP["command"] != "./node_modules/.bin/odd-agy" {
+		t.Errorf("odd-agy mcp command = %v", oddMCP["command"])
+	}
+	if oddMCP["timeoutSeconds"] != float64(600) {
+		t.Errorf("odd-agy timeoutSeconds = %v, want 600", oddMCP["timeoutSeconds"])
+	}
+	toolsMap, ok := oddMCP["tools"].(map[string]any)
+	if !ok {
+		t.Fatalf("odd-agy tools missing or invalid: %T", oddMCP["tools"])
+	}
+	if toolsMap["todo"].(map[string]any)["eager"] != true {
+		t.Errorf("todo.eager != true")
+	}
+	if toolsMap["odd_review_assess"].(map[string]any)["eager"] != true {
+		t.Errorf("odd_review_assess.eager != true")
+	}
+	if toolsMap["odd_external_run"].(map[string]any)["background"] != "always" {
+		t.Errorf("odd_external_run.background != always")
+	}
+	if toolsMap["odd_external_continue"].(map[string]any)["background"] != "always" {
+		t.Errorf("odd_external_continue.background != always")
+	}
+
+	engramMCP, ok := servers["engram"].(map[string]any)
+	if !ok {
+		t.Fatalf("engram missing from mcp_config.json")
+	}
+	if engramMCP["command"] != "engram" {
+		t.Errorf("engram command = %v, want engram", engramMCP["command"])
+	}
+
+	// Verify managed manifest.
+	manifest, err := LoadManifest(ws)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if manifest.SchemaVersion != ManifestSchemaVersion {
+		t.Errorf("manifest.SchemaVersion = %d, want %d", manifest.SchemaVersion, ManifestSchemaVersion)
+	}
+	if manifest.Version != version.Version {
+		t.Errorf("manifest.Version = %q, want %q", manifest.Version, version.Version)
+	}
+	if len(manifest.Files) != len(allAssets) {
+		t.Errorf("manifest.Files len = %d, want %d", len(manifest.Files), len(allAssets))
+	}
+	if !slices.Contains(manifest.ManagedHookKeys, "odd-agy") {
+		t.Errorf("manifest.ManagedHookKeys = %v, want odd-agy", manifest.ManagedHookKeys)
+	}
+	if !slices.Contains(manifest.ManagedMCPKeys, "odd-agy") || !slices.Contains(manifest.ManagedMCPKeys, "engram") {
+		t.Errorf("manifest.ManagedMCPKeys = %v, want [odd-agy engram]", manifest.ManagedMCPKeys)
+	}
+}
+
+func TestInitIdempotentAndPreservesUserConfigUnlessForce(t *testing.T) {
+	ws := t.TempDir()
+	opts := InitOptions{
+		InstallMode:    config.InstallModeStandalone,
+		DelegationMode: config.DelegationModeOrganic,
+		Profile:        "deepseek-hybrid",
+		LookPath:       fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+	}
+	if _, err := Init(ws, opts); err != nil {
+		t.Fatalf("first Init: %v", err)
+	}
+
+	// Mutate config and profile by user.
+	cfg, err := config.LoadConfig(ws)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cfg.RDDEnabled = false
+	if err := config.SaveConfig(ws, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	// Second Init without Force preserves user config.
+	if _, err := Init(ws, InitOptions{
+		InstallMode:    config.InstallModeLocal,
+		DelegationMode: config.DelegationModeFull,
+		Profile:        "agy-oauth",
+		LookPath:       fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+	}); err != nil {
+		t.Fatalf("second Init: %v", err)
+	}
+
+	cfgAfter, err := config.LoadConfig(ws)
+	if err != nil {
+		t.Fatalf("LoadConfig after 2nd init: %v", err)
+	}
+	if cfgAfter.RDDEnabled != false || cfgAfter.DelegationMode != config.DelegationModeOrganic {
+		t.Fatalf("second Init overwrote user config without Force: %+v", cfgAfter)
+	}
+	profAfter, err := config.LoadProfiles(ws)
+	if err != nil {
+		t.Fatalf("LoadProfiles after 2nd init: %v", err)
+	}
+	if profAfter.ActiveProfile != "deepseek-hybrid" {
+		t.Fatalf("second Init overwrote user profile without Force: %q", profAfter.ActiveProfile)
+	}
+
+	// Third Init with Force resets config and profile.
+	if _, err := Init(ws, InitOptions{
+		InstallMode:    config.InstallModeLocal,
+		DelegationMode: config.DelegationModeFull,
+		Profile:        "agy-oauth",
+		Force:          true,
+		LookPath:       fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+	}); err != nil {
+		t.Fatalf("forced Init: %v", err)
+	}
+	cfgForced, _ := config.LoadConfig(ws)
+	if !cfgForced.RDDEnabled || cfgForced.DelegationMode != config.DelegationModeFull {
+		t.Fatalf("forced Init did not reset config: %+v", cfgForced)
+	}
+	profForced, _ := config.LoadProfiles(ws)
+	if profForced.ActiveProfile != "agy-oauth" {
+		t.Fatalf("forced Init did not reset profile: %q", profForced.ActiveProfile)
+	}
+}
+
+func TestInitPreservesExistingUserEngramAndQuotesBinaryWithSpaces(t *testing.T) {
+	ws := t.TempDir()
+	agentsDir := filepath.Join(ws, ".agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-existing user engram entry with custom args must NOT be touched or claimed by manifest.
+	writeJSONFile(t, filepath.Join(agentsDir, "mcp_config.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"engram": map[string]any{
+				"command": "/custom/engram",
+				"args":    []string{"mcp", "--port", "9999"},
+			},
+		},
+	})
+
+	_, err := Init(ws, InitOptions{
+		InstallMode:      config.InstallModeStandalone,
+		BinaryCommand:    "/opt/My Tools/odd-agy",
+		IncludeEngramMCP: true,
+	})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	hooksDoc := readJSONFile(t, filepath.Join(agentsDir, "hooks.json"))
+	oddHooks := hooksDoc["odd-agy"].(map[string]any)
+	ss := oddHooks["SessionStart"].([]any)[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
+	if ss["command"] != "'/opt/My Tools/odd-agy' hook SessionStart" {
+		t.Errorf("quoted hook command = %q", ss["command"])
+	}
+
+	mcpDoc := readJSONFile(t, filepath.Join(agentsDir, "mcp_config.json"))
+	servers := mcpDoc["mcpServers"].(map[string]any)
+	engram := servers["engram"].(map[string]any)
+	if engram["command"] != "/custom/engram" {
+		t.Errorf("user engram overwritten: %v", engram["command"])
+	}
+
+	manifest, err := LoadManifest(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(manifest.ManagedMCPKeys, "engram") {
+		t.Errorf("manifest claimed user-owned engram key: %v", manifest.ManagedMCPKeys)
+	}
+}
+
+func TestSyncCleanUpdateRefusalAndForceBackup(t *testing.T) {
+	ws := t.TempDir()
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Simulate an older embedded version of odd-01-core.md on disk matching an older manifest hash,
+	// and a deleted agent file.
+	ruleRel := ".agents/rules/odd-01-core.md"
+	rulePath := filepath.Join(ws, filepath.FromSlash(ruleRel))
+	oldContent := []byte("---\ntrigger: always_on\n---\nold content\n")
+	if err := os.WriteFile(rulePath, oldContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := LoadManifest(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Files[ruleRel] = sha256Prefixed(oldContent)
+	manifest.Version = "0.0.1"
+	if err := saveManifest(ws, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	missingRel := ".agents/agents/gentle-ai-explore.md"
+	missingPath := filepath.Join(ws, filepath.FromSlash(missingRel))
+	if err := os.Remove(missingPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Clean sync should update odd-01-core.md and recreate missing agent.
+	syncRes, err := Sync(ws, SyncOptions{})
+	if err != nil {
+		t.Fatalf("clean Sync failed: %v", err)
+	}
+	if !slices.Contains(syncRes.Updated, ruleRel) {
+		t.Errorf("expected %s in Updated, got %v", ruleRel, syncRes.Updated)
+	}
+	if !slices.Contains(syncRes.Created, missingRel) {
+		t.Errorf("expected %s in Created, got %v", missingRel, syncRes.Created)
+	}
+	if _, err := os.Stat(missingPath); err != nil {
+		t.Fatalf("missing file not recreated: %v", err)
+	}
+
+	// Now simulate user editing two files: one modified, one outdated.
+	// Without Force, Sync MUST refuse all-or-nothing without touching ANY file.
+	editedRel := ".agents/rules/odd-02-orchestrator.md"
+	editedPath := filepath.Join(ws, filepath.FromSlash(editedRel))
+	userEdits := []byte("---\ntrigger: always_on\n---\n# user custom edits\n")
+	if err := os.WriteFile(editedPath, userEdits, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rulePath, oldContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ = LoadManifest(ws)
+	manifest.Files[ruleRel] = sha256Prefixed(oldContent)
+	if err := saveManifest(ws, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	refusedRes, err := Sync(ws, SyncOptions{Force: false})
+	if err == nil {
+		t.Fatalf("expected Sync without Force to fail on user-edited file")
+	}
+	if !slices.Contains(refusedRes.Conflicts, editedRel) {
+		t.Errorf("expected %s in Conflicts, got %v", editedRel, refusedRes.Conflicts)
+	}
+	// Verify all-or-nothing: rulePath must STILL have oldContent and editedPath must STILL have userEdits.
+	if got, _ := os.ReadFile(rulePath); string(got) != string(oldContent) {
+		t.Errorf("Sync modified %s despite preflight conflict refusal", ruleRel)
+	}
+	if got, _ := os.ReadFile(editedPath); string(got) != string(userEdits) {
+		t.Errorf("Sync overwrote %s despite conflict refusal", editedRel)
+	}
+
+	// With Force: true, Sync backs up editedPath to .agents/odd/.backups/<ts>/ and overwrites cleanly.
+	forcedRes, err := Sync(ws, SyncOptions{Force: true})
+	if err != nil {
+		t.Fatalf("forced Sync failed: %v", err)
+	}
+	if len(forcedRes.BackedUp) != 1 {
+		t.Fatalf("expected 1 backup entry, got %v", forcedRes.BackedUp)
+	}
+	backupFile := filepath.Join(ws, filepath.FromSlash(forcedRes.BackedUp[0]))
+	gotBackup, err := os.ReadFile(backupFile)
+	if err != nil {
+		t.Fatalf("read backup %s: %v", backupFile, err)
+	}
+	if string(gotBackup) != string(userEdits) {
+		t.Errorf("backup content mismatch: got %q, want %q", string(gotBackup), string(userEdits))
+	}
+	if !strings.HasPrefix(forcedRes.BackedUp[0], ".agents/odd/.backups/") {
+		t.Errorf("unexpected backup location %q", forcedRes.BackedUp[0])
+	}
+	// Disk file now matches embedded asset.
+	allAssets, _ := assets.All()
+	for _, af := range allAssets {
+		if ".agents/"+af.RelPath == editedRel {
+			gotDisk, _ := os.ReadFile(editedPath)
+			if string(gotDisk) != string(af.Content) {
+				t.Errorf("forced Sync did not restore embedded content for %s", editedRel)
+			}
+		}
+	}
+}
+
+func TestDoctorHealthyAndWarningsAndSecretRedaction(t *testing.T) {
+	ws := t.TempDir()
+	fakeHome := t.TempDir()
+
+	if _, err := Init(ws, InitOptions{
+		Profile: "deepseek-hybrid",
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	const secretKey = "sk-super-secret-deepseek-value-12345"
+
+	// 1. Healthy green report (with DeepSeek key set -> must NEVER leak secretKey in output).
+	report, err := Doctor(ws, DoctorOptions{
+		HomeDir: fakeHome,
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+		LookupEnv: fakeLookupEnv(map[string]string{
+			"DEEPSEEK_API_KEY": secretKey,
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Doctor healthy: %v", err)
+	}
+	if report.HasFailures() || report.HasWarnings() {
+		t.Fatalf("expected healthy green report, got checks=%+v", report.Checks)
+	}
+	for _, c := range report.Checks {
+		if strings.Contains(c.Detail, secretKey) {
+			t.Fatalf("Doctor leaked secret key in check %s: %s", c.Name, c.Detail)
+		}
+	}
+
+	// 2. Missing engram + global gentle-ai collision + drifted file.
+	geminiRulesDir := filepath.Join(fakeHome, ".gemini", "config", "rules")
+	if err := os.MkdirAll(geminiRulesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(geminiRulesDir, "gentle-ai-core.md"), []byte("# collision"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeHome, ".gemini", "GEMINI.md"), []byte("<!-- gentle-ai -->\n# old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	driftedRule := filepath.Join(ws, ".agents", "rules", "odd-01-core.md")
+	originalBytes, _ := os.ReadFile(driftedRule)
+	if err := os.WriteFile(driftedRule, append(originalBytes, []byte("\n# drifted\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	warnReport, err := Doctor(ws, DoctorOptions{
+		HomeDir: fakeHome,
+		LookPath: fakeLookPath(map[string]string{
+			"agy": "/bin/agy",
+		}),
+		LookupEnv: fakeLookupEnv(nil),
+	})
+	if err != nil {
+		t.Fatalf("Doctor warn: %v", err)
+	}
+
+	findCheck := func(name string) Check {
+		for _, c := range warnReport.Checks {
+			if c.Name == name {
+				return c
+			}
+		}
+		t.Fatalf("missing check %q in %+v", name, warnReport.Checks)
+		return Check{}
+	}
+
+	if c := findCheck("engram-cli"); c.Status != CheckWarn {
+		t.Errorf("engram-cli status = %q, want warn (%s)", c.Status, c.Detail)
+	}
+	if c := findCheck("global-collision"); c.Status != CheckWarn {
+		t.Errorf("global-collision status = %q, want warn (%s)", c.Status, c.Detail)
+	}
+	if c := findCheck("managed-files"); c.Status != CheckWarn {
+		t.Errorf("managed-files status = %q, want warn (%s)", c.Status, c.Detail)
+	}
+	if c := findCheck("provider-readiness"); c.Status != CheckWarn {
+		t.Errorf("provider-readiness status = %q, want warn (%s)", c.Status, c.Detail)
+	}
+
+	// Verify Doctor is strictly read-only (drifted file was NOT overwritten).
+	afterBytes, _ := os.ReadFile(driftedRule)
+	if string(afterBytes) == string(originalBytes) {
+		t.Fatalf("Doctor mutated drifted file!")
+	}
+
+	// 3. Loopback 9router-hybrid profile is OK even without API key env var; missing agy & missing managed file are fail.
+	profCfg, err := config.LoadProfiles(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profCfg.ActiveProfile = "9router-hybrid"
+	if err := config.SaveProfiles(ws, profCfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(ws, ".agents", "agents", "odd-orchestrator.md")); err != nil {
+		t.Fatal(err)
+	}
+	failReport, err := Doctor(ws, DoctorOptions{
+		HomeDir:   fakeHome,
+		LookPath:  fakeLookPath(map[string]string{}),
+		LookupEnv: fakeLookupEnv(nil),
+	})
+	if err != nil {
+		t.Fatalf("Doctor fail report: %v", err)
+	}
+	findCheckFail := func(name string) Check {
+		for _, c := range failReport.Checks {
+			if c.Name == name {
+				return c
+			}
+		}
+		t.Fatalf("missing check %q", name)
+		return Check{}
+	}
+	if c := findCheckFail("agy-cli"); c.Status != CheckFail {
+		t.Errorf("agy-cli status = %q, want fail", c.Status)
+	}
+	if c := findCheckFail("managed-files"); c.Status != CheckFail {
+		t.Errorf("managed-files status = %q, want fail", c.Status)
+	}
+	if c := findCheckFail("provider-readiness"); c.Status != CheckOK {
+		t.Errorf("provider-readiness for loopback 9router-hybrid = %q (%s), want ok", c.Status, c.Detail)
+	}
+}
+
+func TestUninstallRemovesManagedAndPreservesUserFilesAndEdits(t *testing.T) {
+	ws := t.TempDir()
+	agentsDir := filepath.Join(ws, ".agents")
+	if err := os.MkdirAll(filepath.Join(agentsDir, "rules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unrelated user file inside .agents/rules/
+	userRulePath := filepath.Join(agentsDir, "rules", "my-team-rule.md")
+	if err := os.WriteFile(userRulePath, []byte("# team rule\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-existing user hook and user MCP server.
+	writeJSONFile(t, filepath.Join(agentsDir, "hooks.json"), map[string]any{
+		"user-hook": map[string]any{"Stop": []any{}},
+	})
+	writeJSONFile(t, filepath.Join(agentsDir, "mcp_config.json"), map[string]any{
+		"mcpServers": map[string]any{
+			"user-mcp": map[string]any{"command": "node", "args": []string{"server.js"}},
+		},
+	})
+
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// User modifies one managed rule; Uninstall must preserve it.
+	editedManagedRel := ".agents/rules/odd-03-tracking.md"
+	editedManagedPath := filepath.Join(ws, filepath.FromSlash(editedManagedRel))
+	if err := os.WriteFile(editedManagedPath, []byte("# user customized\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	unRes, err := Uninstall(ws)
+	if err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+
+	if !slices.Contains(unRes.Preserved, editedManagedRel) {
+		t.Errorf("expected %s in Preserved, got %v", editedManagedRel, unRes.Preserved)
+	}
+	if _, err := os.Stat(editedManagedPath); err != nil {
+		t.Errorf("user-edited managed file was deleted: %v", err)
+	}
+	if _, err := os.Stat(userRulePath); err != nil {
+		t.Errorf("unrelated user rule was deleted: %v", err)
+	}
+
+	// Unmodified managed file must be gone.
+	if _, err := os.Stat(filepath.Join(agentsDir, "rules", "odd-01-core.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("unmodified managed rule still exists: %v", err)
+	}
+	// Manifest must be gone.
+	if _, err := os.Stat(ManifestPath(ws)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("manifest still exists: %v", err)
+	}
+
+	// hooks.json and mcp_config.json keep user entries and drop managed entries.
+	hooksDoc := readJSONFile(t, filepath.Join(agentsDir, "hooks.json"))
+	if _, ok := hooksDoc["odd-agy"]; ok {
+		t.Errorf("odd-agy still in hooks.json")
+	}
+	if _, ok := hooksDoc["user-hook"]; !ok {
+		t.Errorf("user-hook lost from hooks.json")
+	}
+
+	mcpDoc := readJSONFile(t, filepath.Join(agentsDir, "mcp_config.json"))
+	servers := mcpDoc["mcpServers"].(map[string]any)
+	if _, ok := servers["odd-agy"]; ok {
+		t.Errorf("odd-agy still in mcp_config.json")
+	}
+	if _, ok := servers["engram"]; ok {
+		t.Errorf("installer-added engram still in mcp_config.json")
+	}
+	if _, ok := servers["user-mcp"]; !ok {
+		t.Errorf("user-mcp lost from mcp_config.json")
+	}
+
+	// In a fresh workspace with NO user hooks/MCP, Uninstall removes hooks.json and mcp_config.json completely.
+	wsClean := t.TempDir()
+	if _, err := Init(wsClean, InitOptions{
+		LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+	}); err != nil {
+		t.Fatalf("Init clean: %v", err)
+	}
+	if _, err := Uninstall(wsClean); err != nil {
+		t.Fatalf("Uninstall clean: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wsClean, ".agents", "hooks.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected empty hooks.json to be removed, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wsClean, ".agents", "mcp_config.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected empty mcp_config.json to be removed, got err=%v", err)
+	}
+}
+
+func writeJSONFile(t *testing.T, path string, v any) {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal %s: %v", path, err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func readJSONFile(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshal %s: %v", path, err)
+	}
+	return m
+}
