@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -8,6 +9,11 @@ import (
 	"strings"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
+	"github.com/Nathanael-Huaman/odd-agy/internal/hooks"
+	"github.com/Nathanael-Huaman/odd-agy/internal/installer"
+	"github.com/Nathanael-Huaman/odd-agy/internal/llm"
+	"github.com/Nathanael-Huaman/odd-agy/internal/mcp"
+	"github.com/Nathanael-Huaman/odd-agy/internal/tui"
 	"github.com/Nathanael-Huaman/odd-agy/internal/version"
 )
 
@@ -17,18 +23,15 @@ const (
 	exitUsage = 2
 )
 
-var stubSubcommands = map[string]bool{
-	"init":      true,
-	"sync":      true,
-	"doctor":    true,
-	"uninstall": true,
-	"hook":      true,
-	"mcp":       true,
-	"ui":        true,
-	"upstream":  true,
+var runTUI = tui.Run
+
+// Run executes the CLI using os.Stdin as standard input.
+func Run(args []string, stdout, stderr io.Writer, cwd string) int {
+	return RunWithIO(args, os.Stdin, stdout, stderr, cwd)
 }
 
-func Run(args []string, stdout, stderr io.Writer, cwd string) int {
+// RunWithIO executes the CLI with explicit stdin/stdout/stderr streams.
+func RunWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd string) int {
 	pos, targetCwd, err := extractCwdFlag(args, cwd)
 	if err != nil {
 		fmt.Fprintf(stderr, "odd-agy: %v\n", err)
@@ -36,7 +39,10 @@ func Run(args []string, stdout, stderr io.Writer, cwd string) int {
 	}
 
 	if len(pos) == 0 {
-		printHelp(stdout)
+		if err := runTUI(targetCwd); err != nil {
+			fmt.Fprintf(stderr, "odd-agy ui: %v\n", err)
+			return exitError
+		}
 		return exitOK
 	}
 
@@ -54,17 +60,38 @@ func Run(args []string, stdout, stderr io.Writer, cwd string) int {
 	case "--help", "-h", "help":
 		printHelp(stdout)
 		return exitOK
+	case "ui":
+		if len(rest) > 0 {
+			fmt.Fprintf(stderr, "odd-agy ui: unexpected arguments %v\n", rest)
+			return exitUsage
+		}
+		if err := runTUI(targetCwd); err != nil {
+			fmt.Fprintf(stderr, "odd-agy ui: %v\n", err)
+			return exitError
+		}
+		return exitOK
+	case "init":
+		return runInit(rest, stdout, stderr, targetCwd)
+	case "sync":
+		return runSync(rest, stdout, stderr, targetCwd)
+	case "doctor":
+		return runDoctor(rest, stdout, stderr, targetCwd)
+	case "uninstall":
+		return runUninstall(rest, stdout, stderr, targetCwd)
+	case "hook":
+		return runHook(rest, stdin, stdout, stderr)
+	case "mcp":
+		return runMCP(rest, stdin, stdout, stderr, targetCwd)
 	case "mode":
 		return runMode(rest, stdout, stderr, targetCwd)
 	case "rdd":
 		return runRDD(rest, stdout, stderr, targetCwd)
 	case "profile":
 		return runProfile(rest, stdout, stderr, targetCwd)
+	case "upstream":
+		fmt.Fprintf(stderr, "odd-agy upstream: not implemented yet\n")
+		return exitUsage
 	default:
-		if stubSubcommands[cmd] {
-			fmt.Fprintf(stderr, "odd-agy %s: not implemented yet\n", cmd)
-			return exitUsage
-		}
 		fmt.Fprintf(stderr, "odd-agy: unknown command %q (run 'odd-agy --help' for usage)\n", cmd)
 		return exitUsage
 	}
@@ -107,6 +134,172 @@ func extractCwdFlag(args []string, defaultCwd string) ([]string, string, error) 
 		}
 	}
 	return pos, cwd, nil
+}
+
+func parseValueFlag(args []string, idx int, name string) (string, int, bool, error) {
+	arg := args[idx]
+	if arg == name {
+		if idx+1 >= len(args) {
+			return "", idx, true, fmt.Errorf("%s requires a value", name)
+		}
+		return args[idx+1], idx + 1, true, nil
+	}
+	prefix := name + "="
+	if strings.HasPrefix(arg, prefix) {
+		return strings.TrimPrefix(arg, prefix), idx, true, nil
+	}
+	return "", idx, false, nil
+}
+
+func runInit(args []string, stdout, stderr io.Writer, cwd string) int {
+	var opts installer.InitOptions
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--force" {
+			opts.Force = true
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(args, i, "--mode"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy init: %v\n", err)
+				return exitUsage
+			}
+			opts.InstallMode = val
+			i = nextIdx
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(args, i, "--delegation"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy init: %v\n", err)
+				return exitUsage
+			}
+			opts.DelegationMode = val
+			i = nextIdx
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(args, i, "--profile"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy init: %v\n", err)
+				return exitUsage
+			}
+			opts.Profile = val
+			i = nextIdx
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(args, i, "--binary"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy init: %v\n", err)
+				return exitUsage
+			}
+			opts.BinaryCommand = val
+			i = nextIdx
+			continue
+		}
+		fmt.Fprintf(stderr, "odd-agy init: unknown or unexpected argument %q\n", arg)
+		return exitUsage
+	}
+
+	res, err := installer.Init(cwd, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "odd-agy init: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t)\n",
+		len(res.InstalledFiles), res.ManifestPath, res.PreservedConfig, res.AddedEngramMCP)
+	return exitOK
+}
+
+func runSync(args []string, stdout, stderr io.Writer, cwd string) int {
+	var opts installer.SyncOptions
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--force" {
+			opts.Force = true
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(args, i, "--binary"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy sync: %v\n", err)
+				return exitUsage
+			}
+			opts.BinaryCommand = val
+			i = nextIdx
+			continue
+		}
+		fmt.Fprintf(stderr, "odd-agy sync: unknown or unexpected argument %q\n", arg)
+		return exitUsage
+	}
+
+	res, err := installer.Sync(cwd, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "odd-agy sync: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintf(stdout, "sync complete: %d created, %d updated, %d unchanged, %d removed, %d backed up\n",
+		len(res.Created), len(res.Updated), len(res.Unchanged), len(res.Removed), len(res.BackedUp))
+	return exitOK
+}
+
+func runDoctor(args []string, stdout, stderr io.Writer, cwd string) int {
+	if len(args) > 0 {
+		fmt.Fprintf(stderr, "odd-agy doctor: unexpected arguments %v\n", args)
+		return exitUsage
+	}
+	report, err := installer.Doctor(cwd, installer.DoctorOptions{})
+	if err != nil {
+		fmt.Fprintf(stderr, "odd-agy doctor: %v\n", err)
+		return exitError
+	}
+	for _, c := range report.Checks {
+		fmt.Fprintf(stdout, "%-6s %-20s %s\n", "["+c.Status+"]", c.Name, c.Detail)
+	}
+	if report.HasFailures() {
+		return exitError
+	}
+	return exitOK
+}
+
+func runUninstall(args []string, stdout, stderr io.Writer, cwd string) int {
+	if len(args) > 0 {
+		fmt.Fprintf(stderr, "odd-agy uninstall: unexpected arguments %v\n", args)
+		return exitUsage
+	}
+	res, err := installer.Uninstall(cwd)
+	if err != nil {
+		fmt.Fprintf(stderr, "odd-agy uninstall: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintf(stdout, "uninstall complete: %d removed, %d updated, %d preserved\n",
+		len(res.Removed), len(res.Updated), len(res.Preserved))
+	return exitOK
+}
+
+func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintf(stderr, "odd-agy hook: expected <SessionStart|PreToolUse|PostToolUse|PreInvocation|Stop>\n")
+		return exitUsage
+	}
+	if err := hooks.Dispatch(args[0], stdin, stdout); err != nil {
+		fmt.Fprintf(stderr, "odd-agy hook %s: %v\n", args[0], err)
+		if strings.Contains(err.Error(), "unknown hook event") {
+			return exitUsage
+		}
+		return exitError
+	}
+	return exitOK
+}
+
+func runMCP(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd string) int {
+	if len(args) > 0 {
+		fmt.Fprintf(stderr, "odd-agy mcp: unexpected arguments %v\n", args)
+		return exitUsage
+	}
+	srv := mcp.NewServer(mcp.ServerConfig{Workspace: cwd})
+	if err := srv.Serve(context.Background(), stdin, stdout); err != nil {
+		fmt.Fprintf(stderr, "odd-agy mcp: %v\n", err)
+		return exitError
+	}
+	return exitOK
 }
 
 func runMode(args []string, stdout, stderr io.Writer, cwd string) int {
@@ -297,38 +490,87 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 			names = append(names, name)
 		}
 		sort.Strings(names)
+		hasInvalid := false
 		for _, name := range names {
 			p := cfg.Providers[name]
 			ep, err := config.ResolveProviderEndpoint(p, os.LookupEnv)
 			if err != nil {
-				fmt.Fprintf(stdout, "%-18s invalid (%v)\n", name, err)
+				hasInvalid = true
+				fmt.Fprintf(stdout, "%-18s invalid (%s)\n", name, sanitizeProviderErr(p, err))
 				continue
 			}
 			fmt.Fprintf(stdout, "%-18s url=%s compat=%s keyEnv=%s keyStatus=%s defaultModel=%s\n",
-				name, ep.BaseURL, ep.Compatibility, p.APIKeyEnv, ep.KeySource, p.DefaultModel)
+				name, llm.RedactURL(ep.BaseURL), ep.Compatibility, p.APIKeyEnv, ep.KeySource, p.DefaultModel)
+		}
+		if hasInvalid {
+			return exitError
+		}
+		return exitOK
+
+	case "test":
+		if len(rest) != 1 {
+			fmt.Fprintf(stderr, "odd-agy profile test: expected exactly 1 provider name\n")
+			return exitUsage
+		}
+		name := rest[0]
+		prov, ok := cfg.Providers[name]
+		if !ok {
+			fmt.Fprintf(stderr, "odd-agy profile test: unknown provider %q\n", name)
+			return exitUsage
+		}
+		res := llm.ProbeProvider(context.Background(), name, prov, os.LookupEnv)
+		if res.Error != "" {
+			fmt.Fprintf(stdout, "provider=%s reachable=%t status=%d latency=%dms url=%s keySource=%s error=%s\n",
+				res.Provider, res.Reachable, res.StatusCode, res.LatencyMS, res.RedactedURL, res.KeySource, res.Error)
+		} else {
+			fmt.Fprintf(stdout, "provider=%s reachable=%t status=%d latency=%dms url=%s keySource=%s\n",
+				res.Provider, res.Reachable, res.StatusCode, res.LatencyMS, res.RedactedURL, res.KeySource)
+		}
+		if !res.Reachable {
+			return exitError
 		}
 		return exitOK
 
 	default:
-		fmt.Fprintf(stderr, "odd-agy profile: unknown subcommand %q (expected \"list\", \"show\", \"use\", or \"providers\")\n", sub)
+		fmt.Fprintf(stderr, "odd-agy profile: unknown subcommand %q (expected \"list\", \"show\", \"use\", \"providers\", or \"test\")\n", sub)
 		return exitUsage
 	}
+}
+
+func sanitizeProviderErr(p config.ProviderConfig, err error) string {
+	if p.BaseURLEnv != "" {
+		if val, ok := os.LookupEnv(p.BaseURLEnv); ok && strings.TrimSpace(val) != "" {
+			return fmt.Sprintf("invalid %s (%s)", p.BaseURLEnv, llm.RedactURL(val))
+		}
+	}
+	return fmt.Sprintf("invalid endpoint (%v)", err)
 }
 
 func printHelp(w io.Writer) {
 	fmt.Fprintf(w, `odd-agy %s - Project-scoped ODD & RDD harness for Antigravity CLI/IDE
 
 Usage:
-  odd-agy [--cwd <dir>] <command> [args]
+  odd-agy [--cwd <dir>] [<command> [args]]
 
 Commands:
-  mode [status|full-delegation|organic]   View or set delegation mode
-  rdd [status|enable|disable]             View or toggle frozen-snapshot RDD
-  profile [list|show|use <name>|providers] Manage model routing profiles
-  version, --version                      Print version information
-  help, --help                            Show this help message
+  ui                                        Launch interactive Bubble Tea TUI (default when no command is given)
+  init [--mode=local|standalone]            Install .agents/ rules, agents, skills, hooks, and MCP config
+       [--delegation=full-delegation|organic]
+       [--profile=agy-oauth] [--binary=...] [--force]
+  sync [--binary=...] [--force]             Refresh managed .agents/ files against manifest
+  doctor                                    Run workspace, CLI, provider, and collision diagnostics
+  uninstall                                 Remove managed .agents/ files and hook/MCP entries
+  mode [status|full-delegation|organic]     View or set delegation mode
+  rdd [status|enable|disable]               View or toggle frozen-snapshot RDD
+  profile [list|show|use <name>|providers|test <provider>]
+                                            Manage model routing profiles and probe providers
+  hook <SessionStart|PreToolUse|PostToolUse|PreInvocation|Stop>
+                                            Dispatch an Antigravity lifecycle hook via stdin/stdout JSON
+  mcp                                       Run the unified stdio MCP server (todo, RDD, external runner)
+  version, --version                        Print version information
+  help, --help                              Show this help message
 
-Planned commands (implemented in later slices):
-  init, sync, doctor, uninstall, hook, mcp, ui, upstream
+Planned commands:
+  upstream                                  Check and sync upstream Gentle Shell/AI assets (T8)
 `, version.Version)
 }
