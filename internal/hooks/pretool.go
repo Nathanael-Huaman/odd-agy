@@ -199,7 +199,9 @@ func resolveAndCheckPathBoundsFrom(workspace, baseDir, rawPath string) (string, 
 	if !filepath.IsAbs(trimmed) {
 		return "", fmt.Sprintf("access denied: relative path %q escapes workspace root", rawPath)
 	}
-	if isAllowedTempTarget(realWorkspace, realTarget) {
+	absWs, _ := filepath.Abs(workspace)
+	cleanTarget := filepath.Clean(absTarget)
+	if !isWithinDir(cleanTarget, absWs) && !isWithinDir(cleanTarget, realWorkspace) && isAllowedTempTarget(realWorkspace, realTarget) {
 		return realTarget, ""
 	}
 	return "", fmt.Sprintf("access denied: path %q escapes workspace root", rawPath)
@@ -1059,7 +1061,15 @@ func evalSymlinksBestEffortDepth(p string, depth int) (string, error) {
 		if info, lstatErr := os.Lstat(cur); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
 			if target, readErr := os.Readlink(cur); readErr == nil {
 				if !filepath.IsAbs(target) {
-					target = filepath.Join(filepath.Dir(cur), target)
+					parentReal := filepath.Dir(cur)
+					if resolved, rerr := filepath.EvalSymlinks(parentReal); rerr == nil {
+						parentReal = resolved
+					} else if resolved, rerr := evalSymlinksBestEffortDepth(parentReal, depth+1); rerr == nil {
+						parentReal = resolved
+					} else {
+						return "", rerr
+					}
+					target = filepath.Join(parentReal, target)
 				}
 				next := target
 				if len(tail) > 0 {

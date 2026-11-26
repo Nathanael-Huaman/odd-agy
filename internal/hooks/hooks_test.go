@@ -1126,6 +1126,47 @@ func TestPreToolUseRunCommandCwdAwareSymlinkAndBounds(t *testing.T) {
 	}
 }
 
+func TestPreToolUseDeniesDanglingSymlinkInsideSymlinkedExternalDir(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeOrganic
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	extParent := t.TempDir()
+	extDir := filepath.Join(extParent, "ext")
+	if err := os.MkdirAll(extDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Symlink("../outside_new.txt", filepath.Join(extDir, "escape")); err != nil {
+		t.Fatalf("symlink escape: %v", err)
+	}
+	if err := os.Symlink(extDir, filepath.Join(repo, "extdir")); err != nil {
+		t.Fatalf("symlink extdir: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"write_to_file", "write_to_file", map[string]any{"TargetFile": filepath.Join(repo, "extdir", "escape"), "CodeContent": "hi"}},
+		{"run_command", "run_command", map[string]any{"CommandLine": "echo hi > extdir/escape"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-dangling", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionDeny {
+				t.Fatalf("expected deny for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+}
+
 func TestDispatch_Errors(t *testing.T) {
 	var out bytes.Buffer
 	if err := Dispatch("UnknownEvent", strings.NewReader("{}"), &out); err == nil {
