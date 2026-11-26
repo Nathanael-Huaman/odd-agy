@@ -160,11 +160,64 @@ func TestProfileCommandAndCwdFlag(t *testing.T) {
 
 func TestStubAndUnknownCommands(t *testing.T) {
 	dir := t.TempDir()
-	for _, cmd := range []string{"upstream", "does-not-exist"} {
+	for _, cmd := range []string{"does-not-exist"} {
 		code, _, errOut := runCLI(t, dir, cmd)
 		if code != 2 || errOut == "" {
 			t.Fatalf("cmd %q => code=%d err=%q, want code=2", cmd, code, errOut)
 		}
+	}
+}
+
+func TestUpstreamCommand(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	gsDir := filepath.Join(srcDir, "gentle-shell")
+	if err := os.MkdirAll(filepath.Join(gsDir, "assets"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gsDir, "assets", "orchestrator.md"), []byte("# orch v1\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	lockPath := filepath.Join(dir, "upstream.lock.json")
+	lockJSON := `{
+  "schemaVersion": 1,
+  "updatedAt": "2026-04-20T00:00:00Z",
+  "repos": [{"name": "Gentleman-Programming/gentle-shell", "ref": "v5.0.0"}],
+  "entries": [{
+    "id": "orch",
+    "repo": "Gentleman-Programming/gentle-shell",
+    "path": "assets/orchestrator.md",
+    "category": "prompts-and-skills",
+    "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  }]
+}
+`
+	if err := os.WriteFile(lockPath, []byte(lockJSON), 0o644); err != nil {
+		t.Fatalf("write lock: %v", err)
+	}
+
+	// Drift detected -> exit 1 with classification output.
+	code, out, errOut := runCLI(t, dir, "upstream", "check", "--lock", lockPath, "--source-dir", srcDir)
+	if code != 1 || errOut != "" || !strings.Contains(out, "[prompts-and-skills]") || !strings.Contains(out, "[changed]") {
+		t.Fatalf("upstream check drift => code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// Sync updates digests & validates contracts -> exit 0.
+	code, out, errOut = runCLI(t, dir, "upstream", "sync", "--lock", lockPath, "--source-dir", srcDir, "--ref", "v5.0.1")
+	if code != 0 || errOut != "" || !strings.Contains(out, "validated=true") {
+		t.Fatalf("upstream sync => code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// Re-check -> exit 0 unchanged.
+	code, out, errOut = runCLI(t, dir, "upstream", "check", "--lock", lockPath, "--source-dir", srcDir)
+	if code != 0 || errOut != "" || !strings.Contains(out, "1 unchanged, 0 changed, 0 missing") {
+		t.Fatalf("upstream check clean => code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// Help text no longer lists Planned commands.
+	code, helpOut, _ := runCLI(t, dir, "--help")
+	if code != 0 || strings.Contains(helpOut, "Planned commands:") || !strings.Contains(helpOut, "upstream check") {
+		t.Fatalf("help output unexpected:\n%s", helpOut)
 	}
 }
 

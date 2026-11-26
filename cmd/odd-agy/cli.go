@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/Nathanael-Huaman/odd-agy/internal/llm"
 	"github.com/Nathanael-Huaman/odd-agy/internal/mcp"
 	"github.com/Nathanael-Huaman/odd-agy/internal/tui"
+	"github.com/Nathanael-Huaman/odd-agy/internal/upstream"
 	"github.com/Nathanael-Huaman/odd-agy/internal/version"
 )
 
@@ -89,8 +91,7 @@ func RunWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 	case "profile":
 		return runProfile(rest, stdout, stderr, targetCwd)
 	case "upstream":
-		fmt.Fprintf(stderr, "odd-agy upstream: not implemented yet\n")
-		return exitUsage
+		return runUpstream(rest, stdout, stderr, targetCwd)
 	default:
 		fmt.Fprintf(stderr, "odd-agy: unknown command %q (run 'odd-agy --help' for usage)\n", cmd)
 		return exitUsage
@@ -537,6 +538,107 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 	}
 }
 
+func runUpstream(args []string, stdout, stderr io.Writer, cwd string) int {
+	if len(args) == 0 {
+		fmt.Fprintf(stderr, "odd-agy upstream: expected subcommand \"check\" or \"sync\"\n")
+		return exitUsage
+	}
+	sub := args[0]
+	rest := args[1:]
+
+	lockPath := filepath.Join(cwd, "upstream", "upstream.lock.json")
+	var sourceDir, ref string
+
+	for i := 0; i < len(rest); i++ {
+		if val, nextIdx, matched, err := parseValueFlag(rest, i, "--lock"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy upstream %s: %v\n", sub, err)
+				return exitUsage
+			}
+			if filepath.IsAbs(val) {
+				lockPath = val
+			} else {
+				lockPath = filepath.Join(cwd, val)
+			}
+			i = nextIdx
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(rest, i, "--source-dir"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy upstream %s: %v\n", sub, err)
+				return exitUsage
+			}
+			if filepath.IsAbs(val) {
+				sourceDir = val
+			} else {
+				sourceDir = filepath.Join(cwd, val)
+			}
+			i = nextIdx
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(rest, i, "--ref"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy upstream %s: %v\n", sub, err)
+				return exitUsage
+			}
+			ref = val
+			i = nextIdx
+			continue
+		}
+		fmt.Fprintf(stderr, "odd-agy upstream %s: unknown or unexpected argument %q\n", sub, rest[i])
+		return exitUsage
+	}
+
+	switch sub {
+	case "check":
+		rep, err := upstream.Check(context.Background(), lockPath, upstream.CheckOptions{
+			SourceDir: sourceDir,
+			Ref:       ref,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy upstream check: %v\n", err)
+			return exitError
+		}
+		fmt.Fprintf(stdout, "Upstream check (%s) lock=%s\n", rep.Source, rep.LockPath)
+		printUpstreamGroup(stdout, "prompts-and-skills", rep.PromptsAndSkills)
+		printUpstreamGroup(stdout, "enforcement-code", rep.EnforcementCode)
+		fmt.Fprintf(stdout, "summary: %d unchanged, %d changed, %d missing\n",
+			rep.UnchangedCount, rep.ChangedCount, rep.MissingCount)
+		if rep.ChangedCount > 0 || rep.MissingCount > 0 {
+			return exitError
+		}
+		return exitOK
+
+	case "sync":
+		rep, err := upstream.Sync(context.Background(), lockPath, upstream.SyncOptions{
+			SourceDir: sourceDir,
+			Ref:       ref,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy upstream sync: %v\n", err)
+			return exitError
+		}
+		fmt.Fprintf(stdout, "upstream sync complete: %d updated, %d unchanged, validated=%t (%s)\n",
+			rep.UpdatedCount, rep.UnchangedCount, rep.Validated, rep.LockPath)
+		return exitOK
+
+	default:
+		fmt.Fprintf(stderr, "odd-agy upstream: unknown subcommand %q (expected \"check\" or \"sync\")\n", sub)
+		return exitUsage
+	}
+}
+
+func printUpstreamGroup(w io.Writer, label string, entries []upstream.EntryResult) {
+	fmt.Fprintf(w, "[%s]\n", label)
+	for _, e := range entries {
+		detail := e.Path
+		if len(e.ChangedFiles) > 0 || len(e.MissingFiles) > 0 {
+			detail = fmt.Sprintf("%s (changed=%v missing=%v)", e.Path, e.ChangedFiles, e.MissingFiles)
+		}
+		fmt.Fprintf(w, "  %-10s %s:%s\n", "["+e.Status+"]", e.Repo, detail)
+	}
+}
+
 func sanitizeProviderErr(p config.ProviderConfig, err error) string {
 	if p.BaseURLEnv != "" {
 		if val, ok := os.LookupEnv(p.BaseURLEnv); ok && strings.TrimSpace(val) != "" {
@@ -567,10 +669,11 @@ Commands:
   hook <SessionStart|PreToolUse|PostToolUse|PreInvocation|Stop>
                                             Dispatch an Antigravity lifecycle hook via stdin/stdout JSON
   mcp                                       Run the unified stdio MCP server (todo, RDD, external runner)
+  upstream check [--lock=...] [--source-dir=...] [--ref=...]
+                                            Check tracked Gentle Shell/AI upstream drift
+  upstream sync [--ref=...] [--lock=...] [--source-dir=...]
+                                            Sync upstream lock digests and validate embedded contracts
   version, --version                        Print version information
   help, --help                              Show this help message
-
-Planned commands:
-  upstream                                  Check and sync upstream Gentle Shell/AI assets (T8)
 `, version.Version)
 }
