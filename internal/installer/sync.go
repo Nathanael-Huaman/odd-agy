@@ -194,8 +194,11 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 		}
 		relUnderAgents := strings.TrimPrefix(relSlash, ".agents/")
 		backupRel := filepath.ToSlash(filepath.Join(backupRootRel, relUnderAgents))
-		backupAbs := filepath.Join(ws, filepath.FromSlash(backupRel))
-		if err := writeFileAtomic(backupAbs, data, 0o644); err != nil {
+		backupAbs, err := resolveContainedPath(ws, backupRel)
+		if err != nil {
+			return err
+		}
+		if err := writeFileAtomic(backupAbs, data, 0o600); err != nil {
 			return fmt.Errorf("write backup %s: %w", backupRel, err)
 		}
 		result.BackedUp = append(result.BackedUp, backupRel)

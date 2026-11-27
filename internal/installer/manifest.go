@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	ManifestRelPath    = ".agents/odd/.managed-manifest.json"
 	preToolUseMatcher  = "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|send_message|run_command|view_file"
 	postToolUseMatcher = "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|run_command"
 )
@@ -53,10 +54,14 @@ func LoadManifest(workspaceRoot string) (Manifest, error) {
 }
 
 func saveManifest(workspaceRoot string, m Manifest) error {
+	p, err := resolveContainedPath(workspaceRoot, ManifestRelPath)
+	if err != nil {
+		return err
+	}
 	if m.Files == nil {
 		m.Files = map[string]string{}
 	}
-	return writeJSONAtomic(ManifestPath(workspaceRoot), m, 0o644)
+	return writeJSONAtomic(p, m, 0o644)
 }
 
 func sha256PrefixedHex(data []byte) string {
@@ -99,6 +104,21 @@ func resolveContainedPath(workspaceRoot, relSlash string) (string, error) {
 	rel, err := filepath.Rel(agentsRoot, target)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q escapes .agents/", relSlash)
+	}
+
+	cur := workspaceRoot
+	for _, part := range strings.Split(cleaned, "/") {
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			return "", fmt.Errorf("lstat %s: %w", cur, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("path %q traverses symlink %s", relSlash, cur)
+		}
 	}
 	return target, nil
 }
@@ -252,7 +272,10 @@ func buildEngramMCPEntry() map[string]any {
 }
 
 func mergeHooksJSON(workspaceRoot, binaryCommand string) error {
-	p := HooksPath(workspaceRoot)
+	p, err := resolveContainedPath(workspaceRoot, ".agents/hooks.json")
+	if err != nil {
+		return err
+	}
 	doc, _, err := readJSONObject(p)
 	if err != nil {
 		return err
@@ -262,7 +285,10 @@ func mergeHooksJSON(workspaceRoot, binaryCommand string) error {
 }
 
 func mergeMCPConfigJSON(workspaceRoot, binaryCommand string, includeEngram, prevEngramManaged bool) (bool, error) {
-	p := MCPConfigPath(workspaceRoot)
+	p, err := resolveContainedPath(workspaceRoot, ".agents/mcp_config.json")
+	if err != nil {
+		return false, err
+	}
 	doc, _, err := readJSONObject(p)
 	if err != nil {
 		return false, err
@@ -287,6 +313,8 @@ func mergeMCPConfigJSON(workspaceRoot, binaryCommand string, includeEngram, prev
 			servers[EngramMCPKey] = buildEngramMCPEntry()
 			engramManaged = true
 		}
+	} else if prevEngramManaged {
+		delete(servers, EngramMCPKey)
 	}
 
 	doc["mcpServers"] = servers

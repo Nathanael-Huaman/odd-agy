@@ -741,3 +741,89 @@ func readJSONFile(t *testing.T, path string) map[string]any {
 	}
 	return m
 }
+
+func TestInstallerRejectsSymlinkEscape(t *testing.T) {
+	outside := t.TempDir()
+	outsideFile, outsideDir := filepath.Join(outside, "secret.txt"), filepath.Join(outside, "rules-target")
+	const sentinel = "outside-sentinel\n"
+	if err := os.WriteFile(outsideFile, []byte(sentinel), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct{ target, linkRel string }{
+		{outsideDir, filepath.Join(".agents", "rules")},
+		{outsideFile, filepath.Join(".agents", "hooks.json")},
+	} {
+		ws := t.TempDir()
+		_ = os.MkdirAll(filepath.Join(ws, ".agents"), 0o755)
+		if err := os.Symlink(tc.target, filepath.Join(ws, tc.linkRel)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Init(ws, InitOptions{}); err == nil {
+			t.Fatalf("expected Init to reject symlink %s", tc.linkRel)
+		}
+	}
+	if entries, _ := os.ReadDir(outsideDir); len(entries) != 0 {
+		t.Fatalf("Init wrote into external symlink target: %v", entries)
+	}
+
+	ws := t.TempDir()
+	if _, err := Init(ws, InitOptions{}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	rulePath := filepath.Join(ws, ".agents", "rules", "odd-01-core.md")
+	_ = os.Remove(rulePath)
+	if err := os.Symlink(outsideFile, rulePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Sync(ws, SyncOptions{Force: true}); err == nil {
+		t.Fatalf("expected Sync(Force: true) to reject file symlink")
+	}
+	if _, err := os.Stat(filepath.Join(ws, ".agents", "odd", ".backups")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Sync created backup despite symlink rejection: err=%v", err)
+	}
+	if _, err := Uninstall(ws); err == nil {
+		t.Fatalf("expected Uninstall to reject file symlink")
+	}
+	if got, err := os.ReadFile(outsideFile); err != nil || string(got) != sentinel {
+		t.Fatalf("external symlink target altered or deleted: got=%q err=%v", string(got), err)
+	}
+}
+
+func TestInitExcludeEngramRemovesPreviouslyManagedEntry(t *testing.T) {
+	ws := t.TempDir()
+	if r1, err := Init(ws, InitOptions{IncludeEngramMCP: true}); err != nil || !r1.AddedEngramMCP {
+		t.Fatalf("first Init failed or did not add engram: res=%+v err=%v", r1, err)
+	}
+	if r2, err := Init(ws, InitOptions{ExcludeEngramMCP: true}); err != nil || r2.AddedEngramMCP {
+		t.Fatalf("second Init failed or kept engram: res=%+v err=%v", r2, err)
+	}
+	servers := readJSONFile(t, MCPConfigPath(ws))["mcpServers"].(map[string]any)
+	if _, ok := servers[EngramMCPKey]; ok {
+		t.Errorf("expected managed engram removed from mcp_config.json")
+	}
+	if _, ok := servers[ManagedMCPKey]; !ok {
+		t.Errorf("expected %s retained in mcp_config.json", ManagedMCPKey)
+	}
+	if m, err := LoadManifest(ws); err != nil || slices.Contains(m.ManagedMCPKeys, EngramMCPKey) {
+		t.Errorf("expected engram removed from ManagedMCPKeys, err=%v keys=%v", err, m.ManagedMCPKeys)
+	}
+
+	wsUser := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(wsUser, ".agents"), 0o755)
+	writeJSONFile(t, MCPConfigPath(wsUser), map[string]any{
+		"mcpServers": map[string]any{EngramMCPKey: map[string]any{"command": "/custom/engram"}},
+	})
+	for _, opts := range []InitOptions{{IncludeEngramMCP: true}, {ExcludeEngramMCP: true}} {
+		if _, err := Init(wsUser, opts); err != nil {
+			t.Fatalf("user Init %+v: %v", opts, err)
+		}
+	}
+	userServers := readJSONFile(t, MCPConfigPath(wsUser))["mcpServers"].(map[string]any)
+	if entry, ok := userServers[EngramMCPKey].(map[string]any); !ok || entry["command"] != "/custom/engram" {
+		t.Errorf("user-owned engram entry not preserved: %#v", userServers[EngramMCPKey])
+	}
+}
