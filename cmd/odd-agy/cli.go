@@ -678,11 +678,16 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 			return exitUsage
 		}
 		cfg.ActiveProfile = name
-		if err := config.SaveProfiles(cwd, cfg); err != nil {
+		if err := config.ValidateProfiles(cfg); err != nil {
 			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
 			return exitError
 		}
-		if _, err := installer.ApplyActiveProfileModels(cwd); err != nil {
+		if _, err := installer.ApplyProfileModels(cwd, cfg); err != nil {
+			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
+			return exitError
+		}
+		if err := config.SaveProfiles(cwd, cfg); err != nil {
+			_, _ = installer.ApplyActiveProfileModels(cwd)
 			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
 			return exitError
 		}

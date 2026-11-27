@@ -508,3 +508,134 @@ func TestSaveProfilesFailureReloadsInMemoryState(t *testing.T) {
 		t.Fatalf("in-memory explore runtime = %q after SaveProfiles failure, want %q", got, config.RuntimeAgyNative)
 	}
 }
+
+func TestPersistProfileChangeRollsBackOnApplyFailure(t *testing.T) {
+	t.Run("symlink_escape_on_profile_switch", func(t *testing.T) {
+		dir := t.TempDir()
+		home := t.TempDir()
+		opts := testOptions(home, nil, nil)
+
+		if _, err := installer.Init(dir, installer.InitOptions{
+			LookPath: opts.LookPath,
+		}); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+
+		// Configure deepseek-hybrid with custom agy-native models for both orchestrator and explore.
+		profs, err := config.LoadProfiles(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ds := profs.Profiles["deepseek-hybrid"]
+		ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high"}
+		ds.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
+		profs.Profiles["deepseek-hybrid"] = ds
+		if err := config.SaveProfiles(dir, profs); err != nil {
+			t.Fatal(err)
+		}
+
+		beforeProfiles, err := os.ReadFile(config.ProfilesPath(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		orchPath := filepath.Join(dir, ".agents", "agents", "odd-orchestrator.md")
+		beforeOrch, err := os.ReadFile(orchPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Replace gentle-ai-explore.md with a symlink pointing outside the workspace.
+		outsideDir := t.TempDir()
+		outsideFile := filepath.Join(outsideDir, "outside.md")
+		const sentinel = "---\nname: outside\nmodel: original\n---\n\nbody\n"
+		if err := os.WriteFile(outsideFile, []byte(sentinel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		explorePath := filepath.Join(dir, ".agents", "agents", "gentle-ai-explore.md")
+		if err := os.Remove(explorePath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideFile, explorePath); err != nil {
+			t.Fatal(err)
+		}
+
+		m := NewModel(dir, opts)
+		// Navigate to Active Profile (item 2) -> Enter -> move down to deepseek-hybrid -> Enter.
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+		if m.errMsg == "" {
+			t.Fatalf("expected errMsg when ApplyProfileModels fails on symlink escape")
+		}
+		if m.profiles.ActiveProfile != "agy-oauth" {
+			t.Fatalf("in-memory ActiveProfile = %q after failure, want agy-oauth", m.profiles.ActiveProfile)
+		}
+		afterProfiles, err := os.ReadFile(config.ProfilesPath(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(afterProfiles) != string(beforeProfiles) {
+			t.Fatalf("profiles.json on disk mutated after ApplyProfileModels failure")
+		}
+		afterOrch, err := os.ReadFile(orchPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(afterOrch) != string(beforeOrch) {
+			t.Fatalf("odd-orchestrator.md partially modified despite preflight failure")
+		}
+		if got, _ := os.ReadFile(outsideFile); string(got) != sentinel {
+			t.Fatalf("external symlink target mutated: %q", string(got))
+		}
+	})
+
+	t.Run("corrupted_manifest_on_role_model_edit", func(t *testing.T) {
+		dir := t.TempDir()
+		home := t.TempDir()
+		opts := testOptions(home, nil, nil)
+
+		if _, err := installer.Init(dir, installer.InitOptions{
+			LookPath: opts.LookPath,
+		}); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+
+		beforeProfiles, err := os.ReadFile(config.ProfilesPath(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(installer.ManifestPath(dir), []byte("{corrupt manifest"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		m := NewModel(dir, opts)
+		// Navigate to Roles Editor (item 3) -> Enter -> edit orchestrator model -> Enter.
+		for i := 0; i < 3; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		m = sendKey(t, m, keyRune('m'))
+		for i := 0; i < 10; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+		}
+		m = sendText(t, m, "gemini-3.8-flash-high")
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+		if m.errMsg == "" {
+			t.Fatalf("expected errMsg when manifest is corrupted")
+		}
+		if got := m.profiles.Profiles[m.profiles.ActiveProfile].Roles[config.RoleOrchestrator].Model; got != "inherit" {
+			t.Fatalf("in-memory orchestrator model = %q after failure, want inherit", got)
+		}
+		afterProfiles, err := os.ReadFile(config.ProfilesPath(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(afterProfiles) != string(beforeProfiles) {
+			t.Fatalf("profiles.json on disk mutated despite corrupted manifest")
+		}
+	})
+}

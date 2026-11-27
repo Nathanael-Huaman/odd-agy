@@ -656,13 +656,19 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) persistProfileChange(baseStatus string) error {
-	if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
+	if err := config.ValidateProfiles(m.profiles); err != nil {
 		m.reload()
 		m.errMsg = err.Error()
 		return err
 	}
-	updated, err := installer.ApplyActiveProfileModels(m.cwd)
+	updated, err := installer.ApplyProfileModels(m.cwd, m.profiles)
 	if err != nil {
+		m.reload()
+		m.errMsg = err.Error()
+		return err
+	}
+	if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
+		_, _ = installer.ApplyActiveProfileModels(m.cwd)
 		m.reload()
 		m.errMsg = err.Error()
 		return err

@@ -1442,3 +1442,165 @@ func TestSyncPreservesEmbeddedDefaultsWhenProfilesMissing(t *testing.T) {
 	}
 }
 
+func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
+	t.Run("dir_symlink_escape_rejected_with_zero_writes", func(t *testing.T) {
+		ws := t.TempDir()
+		if _, err := Init(ws, InitOptions{
+			LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+		}); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+
+		outsideDir := t.TempDir()
+		outsideOrch := filepath.Join(outsideDir, "odd-orchestrator.md")
+		const sentinel = "---\nname: odd-orchestrator\nmodel: original\n---\n\nbody\n"
+		if err := os.WriteFile(outsideOrch, []byte(sentinel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		agentsDir := filepath.Join(ws, ".agents", "agents")
+		if err := os.RemoveAll(agentsDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideDir, agentsDir); err != nil {
+			t.Fatal(err)
+		}
+
+		profs, err := config.LoadProfiles(ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := profs.Profiles[profs.ActiveProfile]
+		p.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high"}
+		profs.Profiles[profs.ActiveProfile] = p
+
+		if _, err := ApplyProfileModels(ws, profs); err == nil {
+			t.Fatalf("expected ApplyProfileModels to reject symlinked .agents/agents directory")
+		}
+		if got, err := os.ReadFile(outsideOrch); err != nil || string(got) != sentinel {
+			t.Fatalf("external dir symlink target mutated: got=%q err=%v", string(got), err)
+		}
+	})
+
+	t.Run("two_phase_zero_partial_writes_on_later_symlink", func(t *testing.T) {
+		ws := t.TempDir()
+		if _, err := Init(ws, InitOptions{
+			LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+		}); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+
+		orchPath := filepath.Join(ws, ".agents", "agents", "odd-orchestrator.md")
+		beforeOrch, err := os.ReadFile(orchPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeManifest, err := os.ReadFile(ManifestPath(ws))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		outsideFile := filepath.Join(t.TempDir(), "outside.md")
+		const sentinel = "---\nname: outside\nmodel: original\n---\n\nbody\n"
+		if err := os.WriteFile(outsideFile, []byte(sentinel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		explorePath := filepath.Join(ws, ".agents", "agents", "gentle-ai-explore.md")
+		if err := os.Remove(explorePath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideFile, explorePath); err != nil {
+			t.Fatal(err)
+		}
+
+		profs, err := config.LoadProfiles(ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := profs.Profiles[profs.ActiveProfile]
+		p.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high"}
+		p.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
+		profs.Profiles[profs.ActiveProfile] = p
+
+		if _, err := ApplyProfileModels(ws, profs); err == nil {
+			t.Fatalf("expected ApplyProfileModels to fail on symlinked explore file")
+		}
+		if afterOrch, _ := os.ReadFile(orchPath); string(afterOrch) != string(beforeOrch) {
+			t.Fatalf("odd-orchestrator.md was modified despite later symlink error")
+		}
+		if afterManifest, _ := os.ReadFile(ManifestPath(ws)); string(afterManifest) != string(beforeManifest) {
+			t.Fatalf("manifest was modified despite symlink error")
+		}
+		if got, _ := os.ReadFile(outsideFile); string(got) != sentinel {
+			t.Fatalf("external symlink target was mutated: %q", string(got))
+		}
+	})
+
+	t.Run("crlf_line_endings_preserved", func(t *testing.T) {
+		ws := t.TempDir()
+		if _, err := Init(ws, InitOptions{
+			LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+		}); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+
+		workerRel := ".agents/agents/gentle-ai-worker.md"
+		workerPath := filepath.Join(ws, filepath.FromSlash(workerRel))
+		lfBytes, err := os.ReadFile(workerPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		crlfBytes := []byte(strings.ReplaceAll(string(lfBytes), "\n", "\r\n"))
+		if err := os.WriteFile(workerPath, crlfBytes, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := LoadManifest(ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifest.Files[workerRel] = sha256Prefixed(crlfBytes)
+		if err := saveManifest(ws, manifest); err != nil {
+			t.Fatal(err)
+		}
+
+		profs, err := config.LoadProfiles(ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := profs.Profiles[profs.ActiveProfile]
+		p.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4-6"}
+		profs.Profiles[profs.ActiveProfile] = p
+		if err := config.SaveProfiles(ws, profs); err != nil {
+			t.Fatal(err)
+		}
+
+		updated, err := ApplyActiveProfileModels(ws)
+		if err != nil {
+			t.Fatalf("ApplyActiveProfileModels: %v", err)
+		}
+		if updated != 1 {
+			t.Fatalf("updated = %d, want 1", updated)
+		}
+
+		gotBytes, err := os.ReadFile(workerPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fm, _, err := assets.ParseFrontmatter(gotBytes)
+		if err != nil {
+			t.Fatalf("ParseFrontmatter after CRLF update: %v", err)
+		}
+		if fm.Model != "claude-sonnet-4-6" {
+			t.Fatalf("worker model = %q, want claude-sonnet-4-6", fm.Model)
+		}
+		if !strings.Contains(string(gotBytes), "model: claude-sonnet-4-6\r\n") {
+			t.Fatalf("expected CRLF after updated model line")
+		}
+		// Ensure zero bare LF (every \n must be preceded by \r).
+		stripped := strings.ReplaceAll(string(gotBytes), "\r\n", "")
+		if strings.Contains(stripped, "\n") {
+			t.Fatalf("found bare LF in CRLF-preserved file")
+		}
+	})
+}
+

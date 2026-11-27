@@ -412,15 +412,43 @@ func replaceFrontmatterModel(data []byte, model string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
-// ApplyActiveProfileModels syncs YAML frontmatter model lines in existing .agents/agents/*.md
-// files to match the active profile in .agents/odd/profiles.json, updating manifest hashes
-// only for files whose previous on-disk hash matched the manifest.
+// ApplyActiveProfileModels loads .agents/odd/profiles.json and delegates to ApplyProfileModels.
 func ApplyActiveProfileModels(workspaceRoot string) (int, error) {
 	ws, err := validateWorkspaceRoot(workspaceRoot)
 	if err != nil {
 		return 0, err
 	}
 
+	profs, err := config.LoadProfiles(ws)
+	if err != nil {
+		return 0, fmt.Errorf("load profiles: %w", err)
+	}
+	return ApplyProfileModels(ws, profs)
+}
+
+// ApplyProfileModels syncs YAML frontmatter model lines in existing .agents/agents/*.md
+// files to match the active profile in profs, updating manifest hashes only for files
+// whose previous on-disk hash matched the manifest.
+//
+// Phase 1 (preflight, zero disk writes) validates profs, manifest, and all contained paths
+// and computes planned updates in memory. Phase 2 commits pending writes and manifest updates.
+func ApplyProfileModels(workspaceRoot string, profs config.ProfilesConfig) (int, error) {
+	ws, err := validateWorkspaceRoot(workspaceRoot)
+	if err != nil {
+		return 0, err
+	}
+
+	if err := config.ValidateProfiles(profs); err != nil {
+		return 0, fmt.Errorf("validate profiles: %w", err)
+	}
+	activeProf, ok := profs.Profiles[profs.ActiveProfile]
+	if !ok {
+		return 0, fmt.Errorf("active profile %q not found", profs.ActiveProfile)
+	}
+
+	if _, err := resolveContainedPath(ws, ManifestRelPath); err != nil {
+		return 0, err
+	}
 	if _, err := os.Stat(ManifestPath(ws)); errors.Is(err, os.ErrNotExist) {
 		return 0, nil
 	} else if err != nil {
@@ -430,15 +458,6 @@ func ApplyActiveProfileModels(workspaceRoot string) (int, error) {
 	manifest, err := LoadManifest(ws)
 	if err != nil {
 		return 0, err
-	}
-
-	profs, err := config.LoadProfiles(ws)
-	if err != nil {
-		return 0, fmt.Errorf("load profiles: %w", err)
-	}
-	activeProf, ok := profs.Profiles[profs.ActiveProfile]
-	if !ok {
-		return 0, fmt.Errorf("active profile %q not found", profs.ActiveProfile)
 	}
 
 	agentAssets, err := assets.Agents()
