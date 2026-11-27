@@ -3,14 +3,18 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
+	"github.com/Nathanael-Huaman/odd-agy/internal/installer"
 	"github.com/Nathanael-Huaman/odd-agy/internal/version"
 )
 
@@ -382,5 +386,212 @@ func TestProfileTestAndProvidersHardening(t *testing.T) {
 	code, out, _ = runCLI(t, dir, "profile", "providers")
 	if code != 1 || !strings.Contains(out, "invalid") {
 		t.Fatalf("profile providers invalid env => code=%d out=%q, want code=1", code, out)
+	}
+}
+
+func TestLaunchCommand(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	origLookPath := lookPath
+	origRunner := runExternalCmd
+	defer func() {
+		lookPath = origLookPath
+		runExternalCmd = origRunner
+	}()
+
+	var called bool
+	var gotDir, gotBin string
+	var gotArgs []string
+	nextExit := 0
+
+	lookPath = func(bin string) (string, error) {
+		if bin == "agy" {
+			return "/usr/local/bin/agy", nil
+		}
+		return "", errors.New("not found")
+	}
+	runExternalCmd = func(workDir string, _ io.Reader, _, _ io.Writer, name string, args ...string) int {
+		called = true
+		gotDir = workDir
+		gotBin = name
+		gotArgs = append([]string(nil), args...)
+		return nextExit
+	}
+
+	// 1. Fails clearly when not initialized yet.
+	code, _, errOut := runCLI(t, dir, "launch")
+	if code != 1 || !strings.Contains(errOut, "odd-agy init") {
+		t.Fatalf("launch before init => code=%d err=%q, want code=1 instructing odd-agy init", code, errOut)
+	}
+	if called {
+		t.Fatalf("expected agy not to be invoked before init")
+	}
+
+	// Initialize workspace.
+	code, _, errOut = runCLI(t, dir, "init")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+	absSettings, err := filepath.Abs(installer.SessionSettingsPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Default launch passes --agent odd-orchestrator --settings <abs>
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch default => code=%d err=%q", code, errOut)
+	}
+	if !called || gotDir != dir || gotBin != "/usr/local/bin/agy" {
+		t.Fatalf("unexpected runner call: called=%t dir=%q bin=%q", called, gotDir, gotBin)
+	}
+	wantDefault := []string{"--agent", "odd-orchestrator", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantDefault) {
+		t.Fatalf("default launch args = %v, want %v", gotArgs, wantDefault)
+	}
+
+	// 3. Custom --agent and extra args after --
+	called = false
+	code, _, errOut = runCLI(t, dir, "launch", "--agent=custom-agent", "--", "--model", "flash", "-p", "hello")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch custom => code=%d err=%q", code, errOut)
+	}
+	wantCustom := []string{"--agent", "custom-agent", "--settings", absSettings, "--model", "flash", "-p", "hello"}
+	if !reflect.DeepEqual(gotArgs, wantCustom) {
+		t.Fatalf("custom launch args = %v, want %v", gotArgs, wantCustom)
+	}
+
+	// 4. --no-agent omits --agent
+	called = false
+	code, _, errOut = runCLI(t, dir, "launch", "--no-agent", "--", "--resume")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch --no-agent => code=%d err=%q", code, errOut)
+	}
+	wantNoAgent := []string{"--settings", absSettings, "--resume"}
+	if !reflect.DeepEqual(gotArgs, wantNoAgent) {
+		t.Fatalf("no-agent launch args = %v, want %v", gotArgs, wantNoAgent)
+	}
+
+	// 5. Propagates exact exit code from agy.
+	nextExit = 7
+	code, _, _ = runCLI(t, dir, "launch")
+	if code != 7 {
+		t.Fatalf("launch exit propagation => code=%d, want 7", code)
+	}
+	nextExit = 0
+
+	// 6. Unknown flag before -- exits 2 without invoking agy; --cwd after -- is passed verbatim to agy.
+	called = false
+	code, _, errOut = runCLI(t, dir, "launch", "--unknown-flag")
+	if code != 2 || errOut == "" || called {
+		t.Fatalf("launch unknown flag => code=%d err=%q called=%t", code, errOut, called)
+	}
+
+	called = false
+	code, _, errOut = runCLI(t, dir, "launch", "--agent", "")
+	if code != 2 || errOut == "" || called {
+		t.Fatalf("launch empty agent => code=%d err=%q called=%t", code, errOut, called)
+	}
+
+	called = false
+	otherDir := t.TempDir()
+	code, _, errOut = runCLI(t, otherDir, "--cwd", dir, "launch", "--", "--cwd", "/pass-through")
+	if code != 0 || errOut != "" || !called || gotDir != dir {
+		t.Fatalf("launch --cwd before & after -- => code=%d err=%q called=%t dir=%q", code, errOut, called, gotDir)
+	}
+	wantPassThrough := []string{"--agent", "odd-orchestrator", "--settings", absSettings, "--cwd", "/pass-through"}
+	if !reflect.DeepEqual(gotArgs, wantPassThrough) {
+		t.Fatalf("pass-through launch args = %v, want %v", gotArgs, wantPassThrough)
+	}
+
+	// 7. Missing agy on PATH fails clearly.
+	lookPath = func(string) (string, error) {
+		return "", errors.New("executable file not found")
+	}
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 1 || !strings.Contains(errOut, "agy") {
+		t.Fatalf("launch missing agy => code=%d err=%q", code, errOut)
+	}
+
+	// Zero writes to ~/.gemini/
+	if _, err := os.Stat(filepath.Join(fakeHome, ".gemini")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("launch/init wrote ~/.gemini unexpectedly: err=%v", err)
+	}
+}
+
+func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	// Without --allow-mcp, ~/.gemini/ stays untouched.
+	code, _, errOut := runCLI(t, dir, "init")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+	if _, err := os.Stat(filepath.Join(fakeHome, ".gemini")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("init without --allow-mcp touched ~/.gemini: err=%v", err)
+	}
+
+	// permissions with no args defaults to status.
+	code, out, errOut := runCLI(t, dir, "permissions")
+	if code != 0 || errOut != "" || !strings.Contains(out, "disabled") {
+		t.Fatalf("permissions default status => code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// permissions status reports disabled.
+	code, out, errOut = runCLI(t, dir, "permissions", "status")
+	if code != 0 || errOut != "" || !strings.Contains(out, "disabled") {
+		t.Fatalf("permissions status => code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// init --allow-mcp grants global MCP rules.
+	code, out, errOut = runCLI(t, dir, "init", "--allow-mcp")
+	if code != 0 || errOut != "" || !strings.Contains(out, "globalMCP=enabled") {
+		t.Fatalf("init --allow-mcp => code=%d out=%q err=%q", code, out, errOut)
+	}
+	enabled, err := installer.CheckGlobalMCPPermissions(fakeHome)
+	if err != nil || !enabled {
+		t.Fatalf("CheckGlobalMCPPermissions after init --allow-mcp = (%t, %v)", enabled, err)
+	}
+
+	// permissions status reports enabled.
+	code, out, errOut = runCLI(t, dir, "permissions", "status")
+	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") {
+		t.Fatalf("permissions status enabled => code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	// permissions revoke-mcp removes rules.
+	code, out, errOut = runCLI(t, dir, "permissions", "revoke-mcp")
+	if code != 0 || errOut != "" || !strings.Contains(out, "revoked") {
+		t.Fatalf("permissions revoke-mcp => code=%d out=%q err=%q", code, out, errOut)
+	}
+	enabled, err = installer.CheckGlobalMCPPermissions(fakeHome)
+	if err != nil || enabled {
+		t.Fatalf("CheckGlobalMCPPermissions after revoke-mcp = (%t, %v)", enabled, err)
+	}
+
+	// permissions allow-mcp re-grants rules.
+	code, out, errOut = runCLI(t, dir, "permissions", "allow-mcp")
+	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") {
+		t.Fatalf("permissions allow-mcp => code=%d out=%q err=%q", code, out, errOut)
+	}
+	enabled, err = installer.CheckGlobalMCPPermissions(fakeHome)
+	if err != nil || !enabled {
+		t.Fatalf("CheckGlobalMCPPermissions after allow-mcp = (%t, %v)", enabled, err)
+	}
+
+	// Invalid permissions subcommand exits 2.
+	code, _, errOut = runCLI(t, dir, "permissions", "bogus")
+	if code != 2 || errOut == "" {
+		t.Fatalf("permissions bogus => code=%d err=%q, want code=2", code, errOut)
+	}
+
+	// Help text includes launch and permissions.
+	code, helpOut, _ := runCLI(t, dir, "--help")
+	if code != 0 || !strings.Contains(helpOut, "launch") || !strings.Contains(helpOut, "permissions") || !strings.Contains(helpOut, "--allow-mcp") {
+		t.Fatalf("help missing new commands:\n%s", helpOut)
 	}
 }

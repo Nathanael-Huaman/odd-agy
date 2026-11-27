@@ -191,6 +191,9 @@ func checkManagedFiles(ws string) Check {
 			}
 		}
 	}
+	if _, ok := manifest.Files[SessionSettingsRelPath]; !ok {
+		missing = append(missing, SessionSettingsRelPath)
+	}
 
 	if len(missing) > 0 {
 		return Check{

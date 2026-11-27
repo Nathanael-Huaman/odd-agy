@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
+	"github.com/Nathanael-Huaman/odd-agy/internal/installer"
 	"github.com/Nathanael-Huaman/odd-agy/internal/llm"
 )
 
@@ -280,5 +281,45 @@ func TestProjectActionsInitDoctorAndUninstallConfirmation(t *testing.T) {
 	m = sendKey(t, m, keyRune('y'))
 	if _, err := os.Stat(filepath.Join(dir, ".agents", "odd", ".managed-manifest.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected manifest to be removed after confirming uninstall, stat err=%v", err)
+	}
+}
+
+func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	m := NewModel(dir, testOptions(home, nil, nil))
+
+	// Navigate to Item 5: Project Actions
+	for i := 0; i < 5; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if !strings.Contains(m.View(), "Allow MCP globally (~/.gemini)") {
+		t.Fatalf("expected Allow MCP globally action in Project Actions:\n%s", m.View())
+	}
+
+	// Move down to Item 4: Allow MCP globally (~/.gemini)
+	for i := 0; i < 4; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	enabled, err := installer.CheckGlobalMCPPermissions(home)
+	if err != nil || !enabled {
+		t.Fatalf("CheckGlobalMCPPermissions after TUI grant = (%t, %v)", enabled, err)
+	}
+	if !strings.Contains(m.View(), "Revoke global MCP rule") {
+		t.Fatalf("expected Revoke global MCP rule label after grant:\n%s", m.View())
+	}
+
+	// Toggle again -> Revoke global MCP rule
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	enabled, err = installer.CheckGlobalMCPPermissions(home)
+	if err != nil || enabled {
+		t.Fatalf("CheckGlobalMCPPermissions after TUI revoke = (%t, %v)", enabled, err)
+	}
+	if !strings.Contains(m.View(), "Allow MCP globally (~/.gemini)") {
+		t.Fatalf("expected Allow MCP globally label after revoke:\n%s", m.View())
 	}
 }

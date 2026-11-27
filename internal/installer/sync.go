@@ -76,18 +76,39 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 	}
 
 	// Plan all asset actions and detect conflicts BEFORE writing anything.
-	actions := make([]plannedAssetAction, 0, len(allAssets))
-	expectedSet := make(map[string]bool, len(allAssets))
+	sessBytes, err := sessionSettingsBytes()
+	if err != nil {
+		return SyncResult{}, err
+	}
+
+	type desiredManagedFile struct {
+		relSlash string
+		content  []byte
+	}
+	desiredFiles := make([]desiredManagedFile, 0, len(allAssets)+1)
+	for _, af := range allAssets {
+		desiredFiles = append(desiredFiles, desiredManagedFile{
+			relSlash: ".agents/" + af.RelPath,
+			content:  af.Content,
+		})
+	}
+	desiredFiles = append(desiredFiles, desiredManagedFile{
+		relSlash: SessionSettingsRelPath,
+		content:  sessBytes,
+	})
+
+	actions := make([]plannedAssetAction, 0, len(desiredFiles))
+	expectedSet := make(map[string]bool, len(desiredFiles))
 	var conflicts []string
 
-	for _, af := range allAssets {
-		relSlash := ".agents/" + af.RelPath
+	for _, df := range desiredFiles {
+		relSlash := df.relSlash
 		expectedSet[relSlash] = true
 		diskPath, err := resolveContainedPath(ws, relSlash)
 		if err != nil {
 			return SyncResult{}, err
 		}
-		newHash := sha256PrefixedHex(af.Content)
+		newHash := sha256PrefixedHex(df.content)
 		manifestHash, inManifest := manifest.Files[relSlash]
 
 		diskBytes, err := os.ReadFile(diskPath)
@@ -96,7 +117,7 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 				actions = append(actions, plannedAssetAction{
 					relSlash: relSlash,
 					diskPath: diskPath,
-					content:  af.Content,
+					content:  df.content,
 					newHash:  newHash,
 					kind:     actionCreate,
 				})
@@ -110,7 +131,7 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 			actions = append(actions, plannedAssetAction{
 				relSlash: relSlash,
 				diskPath: diskPath,
-				content:  af.Content,
+				content:  df.content,
 				newHash:  newHash,
 				kind:     actionUnchanged,
 			})
@@ -120,7 +141,7 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 			actions = append(actions, plannedAssetAction{
 				relSlash: relSlash,
 				diskPath: diskPath,
-				content:  af.Content,
+				content:  df.content,
 				newHash:  newHash,
 				kind:     actionUpdate,
 			})
@@ -131,7 +152,7 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 		actions = append(actions, plannedAssetAction{
 			relSlash: relSlash,
 			diskPath: diskPath,
-			content:  af.Content,
+			content:  df.content,
 			newHash:  newHash,
 			kind:     actionConflict,
 		})

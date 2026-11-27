@@ -252,8 +252,11 @@ func TestInitCreatesAssetsConfigAndMergesHooksAndMCP(t *testing.T) {
 	if manifest.Version != version.Version {
 		t.Errorf("manifest.Version = %q, want %q", manifest.Version, version.Version)
 	}
-	if len(manifest.Files) != len(allAssets) {
-		t.Errorf("manifest.Files len = %d, want %d", len(manifest.Files), len(allAssets))
+	if len(manifest.Files) != len(allAssets)+1 {
+		t.Errorf("manifest.Files len = %d, want %d", len(manifest.Files), len(allAssets)+1)
+	}
+	if _, ok := manifest.Files[SessionSettingsRelPath]; !ok {
+		t.Errorf("manifest.Files missing %s", SessionSettingsRelPath)
 	}
 	if !slices.Contains(manifest.ManagedHookKeys, "odd-agy") {
 		t.Errorf("manifest.ManagedHookKeys = %v, want odd-agy", manifest.ManagedHookKeys)
@@ -833,5 +836,245 @@ func TestInitExcludeEngramRemovesPreviouslyManagedEntry(t *testing.T) {
 	userServers := readJSONFile(t, MCPConfigPath(wsUser))["mcpServers"].(map[string]any)
 	if entry, ok := userServers[EngramMCPKey].(map[string]any); !ok || entry["command"] != "/custom/engram" {
 		t.Errorf("user-owned engram entry not preserved: %#v", userServers[EngramMCPKey])
+	}
+}
+
+func TestInitSyncUninstallManageSessionSettingsWithoutTouchingHome(t *testing.T) {
+	ws := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Never touches ~/.gemini/
+	if _, err := os.Stat(filepath.Join(fakeHome, ".gemini")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected ~/.gemini not to exist after Init, err=%v", err)
+	}
+
+	sessPath := SessionSettingsPath(ws)
+	doc := readJSONFile(t, sessPath)
+	perms, ok := doc["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("permissions missing or wrong type in %s: %#v", sessPath, doc)
+	}
+	allow, _ := perms["allow"].([]any)
+	ask, _ := perms["ask"].([]any)
+	if len(allow) != 1 || allow[0] != "mcp(odd-agy/*)" {
+		t.Fatalf("permissions.allow = %#v, want [mcp(odd-agy/*)]", allow)
+	}
+	if len(ask) != 1 || ask[0] != "mcp(odd-agy/odd_review_consent)" {
+		t.Fatalf("permissions.ask = %#v, want [mcp(odd-agy/odd_review_consent)]", ask)
+	}
+
+	manifest, err := LoadManifest(ws)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	rawSess, err := os.ReadFile(sessPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Files[SessionSettingsRelPath] != sha256Prefixed(rawSess) {
+		t.Fatalf("manifest hash mismatch for %s", SessionSettingsRelPath)
+	}
+
+	// Delete session settings -> Sync recreates it.
+	if err := os.Remove(sessPath); err != nil {
+		t.Fatal(err)
+	}
+	syncRes, err := Sync(ws, SyncOptions{})
+	if err != nil {
+		t.Fatalf("Sync recreate: %v", err)
+	}
+	if !slices.Contains(syncRes.Created, SessionSettingsRelPath) {
+		t.Fatalf("expected %s in Sync Created, got %v", SessionSettingsRelPath, syncRes.Created)
+	}
+	if _, err := os.Stat(sessPath); err != nil {
+		t.Fatalf("session settings not recreated by Sync: %v", err)
+	}
+
+	// User-edited session settings causes Sync conflict without Force, and backs up + restores with Force.
+	if err := os.WriteFile(sessPath, []byte(`{"permissions":{"allow":[]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refusedRes, err := Sync(ws, SyncOptions{Force: false})
+	if err == nil || !slices.Contains(refusedRes.Conflicts, SessionSettingsRelPath) {
+		t.Fatalf("expected conflict for edited %s, got err=%v conflicts=%v", SessionSettingsRelPath, err, refusedRes.Conflicts)
+	}
+	forcedRes, err := Sync(ws, SyncOptions{Force: true})
+	if err != nil {
+		t.Fatalf("forced Sync failed: %v", err)
+	}
+	if len(forcedRes.BackedUp) != 1 {
+		t.Fatalf("expected 1 backup on forced Sync, got %v", forcedRes.BackedUp)
+	}
+
+	// Uninstall removes unmodified session settings.
+	unRes, err := Uninstall(ws)
+	if err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if !slices.Contains(unRes.Removed, SessionSettingsRelPath) {
+		t.Fatalf("expected %s in Uninstall Removed, got %v", SessionSettingsRelPath, unRes.Removed)
+	}
+	if _, err := os.Stat(sessPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected %s removed after Uninstall, err=%v", sessPath, err)
+	}
+}
+
+func TestGlobalMCPPermissionsGrantCheckAndRevoke(t *testing.T) {
+	fakeHome := t.TempDir()
+	settingsPath := GlobalSettingsPath(fakeHome)
+
+	// Missing file -> Check false, Revoke no-op.
+	enabled, err := CheckGlobalMCPPermissions(fakeHome)
+	if err != nil || enabled {
+		t.Fatalf("initial CheckGlobalMCPPermissions = (%t, %v), want (false, nil)", enabled, err)
+	}
+	rev0, err := RevokeGlobalMCPPermissions(fakeHome)
+	if err != nil || rev0.Changed || rev0.Enabled {
+		t.Fatalf("Revoke on missing = %+v, err=%v", rev0, err)
+	}
+
+	// Seed existing settings.json with custom keys and rules.
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := map[string]any{
+		"theme": "dark",
+		"nested": map[string]any{
+			"keep": true,
+		},
+		"permissions": map[string]any{
+			"allow": []string{"Bash(ls)"},
+			"ask":   []string{"Bash(git push)"},
+			"deny":  []string{"Bash(rm -rf *)"},
+		},
+	}
+	writeJSONFile(t, settingsPath, original)
+	origBytes, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Grant creates backup, preserves existing keys/rules, sets 0600.
+	grant1, err := GrantGlobalMCPPermissions(fakeHome)
+	if err != nil {
+		t.Fatalf("GrantGlobalMCPPermissions: %v", err)
+	}
+	if !grant1.Changed || !grant1.Enabled || grant1.BackupPath == "" {
+		t.Fatalf("unexpected grant1 result: %+v", grant1)
+	}
+	if !strings.HasPrefix(grant1.BackupPath, settingsPath+".odd-agy.bak.") {
+		t.Fatalf("unexpected backup path: %q", grant1.BackupPath)
+	}
+	bakBytes, err := os.ReadFile(grant1.BackupPath)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(bakBytes) != string(origBytes) {
+		t.Fatalf("backup mismatch:\ngot:\n%s\nwant:\n%s", bakBytes, origBytes)
+	}
+
+	info, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("settings.json perm = %o, want 0600", info.Mode().Perm())
+	}
+
+	doc := readJSONFile(t, settingsPath)
+	if doc["theme"] != "dark" {
+		t.Errorf("theme lost: %#v", doc["theme"])
+	}
+	if nested, ok := doc["nested"].(map[string]any); !ok || nested["keep"] != true {
+		t.Errorf("nested lost: %#v", doc["nested"])
+	}
+	perms := doc["permissions"].(map[string]any)
+	if gotAllow := perms["allow"].([]any); len(gotAllow) != 2 || gotAllow[0] != "Bash(ls)" || gotAllow[1] != "mcp(odd-agy/*)" {
+		t.Errorf("allow = %#v", gotAllow)
+	}
+	if gotAsk := perms["ask"].([]any); len(gotAsk) != 2 || gotAsk[0] != "Bash(git push)" || gotAsk[1] != "mcp(odd-agy/odd_review_consent)" {
+		t.Errorf("ask = %#v", gotAsk)
+	}
+	if gotDeny := perms["deny"].([]any); len(gotDeny) != 1 || gotDeny[0] != "Bash(rm -rf *)" {
+		t.Errorf("deny = %#v", gotDeny)
+	}
+
+	enabled, err = CheckGlobalMCPPermissions(fakeHome)
+	if err != nil || !enabled {
+		t.Fatalf("CheckGlobalMCPPermissions after grant = (%t, %v)", enabled, err)
+	}
+
+	// Idempotent second grant does not duplicate rules.
+	grant2, err := GrantGlobalMCPPermissions(fakeHome)
+	if err != nil {
+		t.Fatalf("second GrantGlobalMCPPermissions: %v", err)
+	}
+	if grant2.Changed || !grant2.Enabled {
+		t.Fatalf("expected idempotent grant2 Changed=false Enabled=true, got %+v", grant2)
+	}
+	doc2 := readJSONFile(t, settingsPath)
+	perms2 := doc2["permissions"].(map[string]any)
+	if len(perms2["allow"].([]any)) != 2 || len(perms2["ask"].([]any)) != 2 {
+		t.Fatalf("duplicate rules added on second grant: %#v", perms2)
+	}
+
+	// Revoke removes only the two odd-agy rules cleanly.
+	rev1, err := RevokeGlobalMCPPermissions(fakeHome)
+	if err != nil {
+		t.Fatalf("RevokeGlobalMCPPermissions: %v", err)
+	}
+	if !rev1.Changed || rev1.Enabled {
+		t.Fatalf("unexpected rev1 result: %+v", rev1)
+	}
+
+	doc3 := readJSONFile(t, settingsPath)
+	if doc3["theme"] != "dark" {
+		t.Errorf("theme lost after revoke")
+	}
+	perms3 := doc3["permissions"].(map[string]any)
+	if gotAllow := perms3["allow"].([]any); len(gotAllow) != 1 || gotAllow[0] != "Bash(ls)" {
+		t.Errorf("allow after revoke = %#v", gotAllow)
+	}
+	if gotAsk := perms3["ask"].([]any); len(gotAsk) != 1 || gotAsk[0] != "Bash(git push)" {
+		t.Errorf("ask after revoke = %#v", gotAsk)
+	}
+	if gotDeny := perms3["deny"].([]any); len(gotDeny) != 1 || gotDeny[0] != "Bash(rm -rf *)" {
+		t.Errorf("deny after revoke = %#v", gotDeny)
+	}
+
+	enabled, err = CheckGlobalMCPPermissions(fakeHome)
+	if err != nil || enabled {
+		t.Fatalf("CheckGlobalMCPPermissions after revoke = (%t, %v)", enabled, err)
+	}
+
+	// Idempotent second revoke.
+	rev2, err := RevokeGlobalMCPPermissions(fakeHome)
+	if err != nil || rev2.Changed || rev2.Enabled {
+		t.Fatalf("second RevokeGlobalMCPPermissions = %+v, err=%v", rev2, err)
+	}
+
+	// Fresh home without pre-existing settings.json -> Grant works without backup, Revoke removes cleanly.
+	freshHome := t.TempDir()
+	grantFresh, err := GrantGlobalMCPPermissions(freshHome)
+	if err != nil {
+		t.Fatalf("Grant on fresh home: %v", err)
+	}
+	if !grantFresh.Changed || !grantFresh.Enabled || grantFresh.BackupPath != "" {
+		t.Fatalf("unexpected fresh grant: %+v", grantFresh)
+	}
+	revFresh, err := RevokeGlobalMCPPermissions(freshHome)
+	if err != nil || !revFresh.Changed || revFresh.Enabled {
+		t.Fatalf("unexpected fresh revoke: %+v, err=%v", revFresh, err)
+	}
+	freshDoc := readJSONFile(t, GlobalSettingsPath(freshHome))
+	if _, hasPerms := freshDoc["permissions"]; hasPerms {
+		t.Fatalf("expected empty permissions key pruned on fresh revoke, got %#v", freshDoc)
 	}
 }

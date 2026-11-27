@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,7 +27,26 @@ const (
 	exitUsage = 2
 )
 
-var runTUI = tui.Run
+var (
+	runTUI         = tui.Run
+	lookPath       = exec.LookPath
+	runExternalCmd = func(dir string, stdin io.Reader, stdout, stderr io.Writer, name string, args ...string) int {
+		cmd := exec.Command(name, args...)
+		cmd.Dir = dir
+		cmd.Stdin = stdin
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		if err := cmd.Run(); err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr.ExitCode()
+			}
+			fmt.Fprintf(stderr, "odd-agy launch: %v\n", err)
+			return exitError
+		}
+		return exitOK
+	}
+)
 
 // Run executes the CLI using os.Stdin as standard input.
 func Run(args []string, stdout, stderr io.Writer, cwd string) int {
@@ -80,6 +101,10 @@ func RunWithIO(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 		return runDoctor(rest, stdout, stderr, targetCwd)
 	case "uninstall":
 		return runUninstall(rest, stdout, stderr, targetCwd)
+	case "launch":
+		return runLaunch(rest, stdin, stdout, stderr, targetCwd)
+	case "permissions":
+		return runPermissions(rest, stdout, stderr)
 	case "hook":
 		return runHook(rest, stdin, stdout, stderr)
 	case "mcp":
@@ -105,6 +130,10 @@ func extractCwdFlag(args []string, defaultCwd string) ([]string, string, error) 
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+		if arg == "--" {
+			pos = append(pos, args[i:]...)
+			break
+		}
 		if arg == "--cwd" {
 			if i+1 >= len(args) {
 				return nil, "", fmt.Errorf("--cwd requires a directory argument")
@@ -154,10 +183,15 @@ func parseValueFlag(args []string, idx int, name string) (string, int, bool, err
 
 func runInit(args []string, stdout, stderr io.Writer, cwd string) int {
 	var opts installer.InitOptions
+	allowMCP := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--force" {
 			opts.Force = true
+			continue
+		}
+		if arg == "--allow-mcp" {
+			allowMCP = true
 			continue
 		}
 		if val, nextIdx, matched, err := parseValueFlag(args, i, "--mode"); matched {
@@ -204,6 +238,16 @@ func runInit(args []string, stdout, stderr io.Writer, cwd string) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "odd-agy init: %v\n", err)
 		return exitError
+	}
+	if allowMCP {
+		permRes, err := installer.GrantGlobalMCPPermissions("")
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy init --allow-mcp: %v\n", err)
+			return exitError
+		}
+		fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t globalMCP=enabled settings=%s)\n",
+			len(res.InstalledFiles), res.ManifestPath, res.PreservedConfig, res.AddedEngramMCP, permRes.SettingsPath)
+		return exitOK
 	}
 	fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t)\n",
 		len(res.InstalledFiles), res.ManifestPath, res.PreservedConfig, res.AddedEngramMCP)
@@ -273,6 +317,121 @@ func runUninstall(args []string, stdout, stderr io.Writer, cwd string) int {
 	fmt.Fprintf(stdout, "uninstall complete: %d removed, %d updated, %d preserved\n",
 		len(res.Removed), len(res.Updated), len(res.Preserved))
 	return exitOK
+}
+
+func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd string) int {
+	agentName := "odd-orchestrator"
+	noAgent := false
+	var extraArgs []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			extraArgs = append(extraArgs, args[i+1:]...)
+			break
+		}
+		if arg == "--no-agent" {
+			noAgent = true
+			continue
+		}
+		if val, nextIdx, matched, err := parseValueFlag(args, i, "--agent"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy launch: %v\n", err)
+				return exitUsage
+			}
+			if strings.TrimSpace(val) == "" {
+				fmt.Fprintf(stderr, "odd-agy launch: --agent requires a non-empty name\n")
+				return exitUsage
+			}
+			agentName = val
+			i = nextIdx
+			continue
+		}
+		fmt.Fprintf(stderr, "odd-agy launch: unknown or unexpected argument %q (pass extra agy args after '--')\n", arg)
+		return exitUsage
+	}
+
+	settingsPath := installer.SessionSettingsPath(cwd)
+	info, err := os.Stat(settingsPath)
+	if err != nil || info.IsDir() {
+		fmt.Fprintf(stderr, "odd-agy launch: missing %s (run 'odd-agy init' first)\n", installer.SessionSettingsRelPath)
+		return exitError
+	}
+	absSettings, err := filepath.Abs(settingsPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "odd-agy launch: resolve settings path: %v\n", err)
+		return exitError
+	}
+
+	agyBin, err := lookPath("agy")
+	if err != nil {
+		fmt.Fprintf(stderr, "odd-agy launch: agy binary not found on PATH: %v\n", err)
+		return exitError
+	}
+
+	agyArgs := make([]string, 0, 4+len(extraArgs))
+	if !noAgent {
+		agyArgs = append(agyArgs, "--agent", agentName)
+	}
+	agyArgs = append(agyArgs, "--settings", absSettings)
+	agyArgs = append(agyArgs, extraArgs...)
+
+	return runExternalCmd(cwd, stdin, stdout, stderr, agyBin, agyArgs...)
+}
+
+func runPermissions(args []string, stdout, stderr io.Writer) int {
+	sub := "status"
+	if len(args) > 1 {
+		fmt.Fprintf(stderr, "odd-agy permissions: expected at most 1 argument, got %d\n", len(args))
+		return exitUsage
+	}
+	if len(args) == 1 {
+		sub = args[0]
+	}
+
+	switch sub {
+	case "status":
+		enabled, err := installer.CheckGlobalMCPPermissions("")
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy permissions status: %v\n", err)
+			return exitError
+		}
+		state := "disabled"
+		if enabled {
+			state = "enabled"
+		}
+		fmt.Fprintf(stdout, "global MCP permissions: %s (%s)\n", state, installer.GlobalSettingsPath(""))
+		return exitOK
+
+	case "allow-mcp":
+		res, err := installer.GrantGlobalMCPPermissions("")
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy permissions allow-mcp: %v\n", err)
+			return exitError
+		}
+		if res.BackupPath != "" {
+			fmt.Fprintf(stdout, "global MCP permissions enabled (settings=%s changed=%t backup=%s)\n",
+				res.SettingsPath, res.Changed, res.BackupPath)
+		} else {
+			fmt.Fprintf(stdout, "global MCP permissions enabled (settings=%s changed=%t)\n",
+				res.SettingsPath, res.Changed)
+		}
+		return exitOK
+
+	case "revoke-mcp":
+		res, err := installer.RevokeGlobalMCPPermissions("")
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy permissions revoke-mcp: %v\n", err)
+			return exitError
+		}
+		fmt.Fprintf(stdout, "global MCP permissions revoked (settings=%s changed=%t)\n",
+			res.SettingsPath, res.Changed)
+		return exitOK
+
+	default:
+		fmt.Fprintf(stderr, "odd-agy permissions: invalid subcommand %q (expected \"status\", \"allow-mcp\", or \"revoke-mcp\")\n", sub)
+		return exitUsage
+	}
 }
 
 func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -658,7 +817,10 @@ Commands:
   ui                                        Launch interactive Bubble Tea TUI (default when no command is given)
   init [--mode=local|standalone]            Install .agents/ rules, agents, skills, hooks, and MCP config
        [--delegation=full-delegation|organic]
-       [--profile=agy-oauth] [--binary=...] [--force]
+       [--profile=agy-oauth] [--binary=...] [--allow-mcp] [--force]
+  launch [--agent=<name>] [--no-agent] [-- <extra agy args...>]
+                                            Launch Antigravity CLI with project-scoped .agents/odd/agy-session-settings.json
+  permissions [status|allow-mcp|revoke-mcp] Manage optional global ~/.gemini/antigravity-cli/settings.json MCP rule
   sync [--binary=...] [--force]             Refresh managed .agents/ files against manifest
   doctor                                    Run workspace, CLI, provider, and collision diagnostics
   uninstall                                 Remove managed .agents/ files and hook/MCP entries

@@ -52,9 +52,10 @@ type Model struct {
 	cwd  string
 	opts Options
 
-	cfg       config.Config
-	profiles  config.ProfilesConfig
-	installed bool
+	cfg              config.Config
+	profiles         config.ProfilesConfig
+	installed        bool
+	globalMCPAllowed bool
 
 	screen        screenKind
 	cursor        int
@@ -122,6 +123,11 @@ func (m *Model) reload() {
 		m.installed = true
 	} else {
 		m.installed = false
+	}
+	if allowed, err := installer.CheckGlobalMCPPermissions(m.opts.HomeDir); err == nil {
+		m.globalMCPAllowed = allowed
+	} else {
+		m.globalMCPAllowed = false
 	}
 
 	cfg, err := config.LoadConfig(m.cwd)
@@ -367,7 +373,7 @@ func (m Model) maxCursorIndex() int {
 		}
 		return len(m.providerNames) - 1
 	case screenActions:
-		return 3
+		return 4
 	default:
 		return 0
 	}
@@ -634,6 +640,31 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 		m.confirmUninstall = true
 		m.errMsg = ""
 		m.statusMsg = "Confirm uninstall of managed .agents/ files"
+
+	case 4: // Toggle global MCP permissions (~/.gemini/antigravity-cli/settings.json)
+		if m.globalMCPAllowed {
+			res, err := installer.RevokeGlobalMCPPermissions(m.opts.HomeDir)
+			if err != nil {
+				m.errMsg = err.Error()
+				return m, nil
+			}
+			m.reload()
+			m.errMsg = ""
+			m.statusMsg = fmt.Sprintf("Revoked global MCP permission (%s)", res.SettingsPath)
+		} else {
+			res, err := installer.GrantGlobalMCPPermissions(m.opts.HomeDir)
+			if err != nil {
+				m.errMsg = err.Error()
+				return m, nil
+			}
+			m.reload()
+			m.errMsg = ""
+			if res.BackupPath != "" {
+				m.statusMsg = fmt.Sprintf("Allowed MCP globally (backup: %s)", res.BackupPath)
+			} else {
+				m.statusMsg = fmt.Sprintf("Allowed MCP globally (%s)", res.SettingsPath)
+			}
+		}
 	}
 	return m, nil
 }
