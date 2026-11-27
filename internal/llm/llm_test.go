@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1284,5 +1285,327 @@ func TestValueAndIsolatedEnv(t *testing.T) {
 			t.Fatalf("expected read_file(%q) to be blocked, got: %s", blockedPath, out)
 		}
 	}
+}
+
+func TestChatCompletionsSendsStreamFalse(t *testing.T) {
+	var rawBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &rawBody); err != nil {
+			t.Fatalf("unmarshal body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    "json-1",
+			"model": "gpt-4.1",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": "ok"},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.Client())
+	ep := config.ResolvedEndpoint{
+		BaseURL: srv.URL + "/v1",
+	}
+	resp, err := client.ChatCompletions(context.Background(), ep, ChatRequest{
+		Model:    "gpt-4.1",
+		Messages: []Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletions: %v", err)
+	}
+	if resp.Choices[0].Message.Content != "ok" {
+		t.Fatalf("content = %q, want ok", resp.Choices[0].Message.Content)
+	}
+	streamVal, exists := rawBody["stream"]
+	if !exists {
+		t.Fatalf("expected request JSON to include explicit \"stream\": false, got body: %+v", rawBody)
+	}
+	streamBool, ok := streamVal.(bool)
+	if !ok || streamBool {
+		t.Fatalf("expected request JSON \"stream\" to be false, got %#v", streamVal)
+	}
+}
+
+func TestChatCompletionsSSEReasoningAndTextChunks(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		sseBody     string
+	}{
+		{
+			name:        "text/event-stream with CRLF, comments, multi-line data, implicit assistant role",
+			contentType: "text/event-stream; charset=utf-8",
+			sseBody: ": keepalive\r\n" +
+				"event: message\r\n" +
+				"id: 1\r\n" +
+				"retry: 1000\r\n\r\n" +
+				"data: {\"id\":\"chatcmpl-sse-1\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"first thought \"}}]}\r\n\r\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"second thought\",\"content\":\"Hello \"}}]}\r\n\r\n" +
+				// Multi-line data event joined by \n
+				"data: {\"choices\":[{\"index\":0,\n" +
+				"data: \"delta\":{\"content\":\"world!\"},\"finish_reason\":\"stop\"}],\n" +
+				"data: \"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}}\r\n\r\n" +
+				"data: [DONE]\r\n\r\n",
+		},
+		{
+			name:        "mislabelled application/json starting with data:",
+			contentType: "application/json",
+			sseBody: "data: {\"id\":\"chatcmpl-sse-1\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"first thought second thought\",\"content\":\"Hello \"}}]}\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name:        "mislabelled application/json starting with SSE comment and final message chunk",
+			contentType: "application/json",
+			sseBody: ": ping\n\n" +
+				"data: {\"id\":\"chatcmpl-sse-1\",\"model\":\"gemini-2.5-pro\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"first thought second thought\"}}]}\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello world!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7,\"total_tokens\":19}}\n\n" +
+				"data: [DONE]\n\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = io.WriteString(w, tc.sseBody)
+			}))
+			defer srv.Close()
+
+			client := NewClient(srv.Client())
+			resp, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+				BaseURL: srv.URL + "/v1",
+			}, ChatRequest{
+				Model:    "gemini-2.5-pro",
+				Messages: []Message{{Role: "user", Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("ChatCompletions SSE failed: %v", err)
+			}
+			if resp.ID != "chatcmpl-sse-1" {
+				t.Fatalf("resp.ID = %q, want chatcmpl-sse-1", resp.ID)
+			}
+			if resp.Model != "gemini-2.5-pro" {
+				t.Fatalf("resp.Model = %q, want gemini-2.5-pro", resp.Model)
+			}
+			if resp.Usage.PromptTokens != 12 || resp.Usage.CompletionTokens != 7 || resp.Usage.TotalTokens != 19 {
+				t.Fatalf("resp.Usage = %+v, want {12 7 19}", resp.Usage)
+			}
+			if len(resp.Choices) != 1 {
+				t.Fatalf("len(resp.Choices) = %d, want 1", len(resp.Choices))
+			}
+			ch := resp.Choices[0]
+			if ch.Message.Role != "assistant" {
+				t.Fatalf("Message.Role = %q, want assistant", ch.Message.Role)
+			}
+			if ch.Message.Content != "Hello world!" {
+				t.Fatalf("Message.Content = %q, want %q", ch.Message.Content, "Hello world!")
+			}
+			if ch.Message.ReasoningContent != "first thought second thought" {
+				t.Fatalf("Message.ReasoningContent = %q, want %q", ch.Message.ReasoningContent, "first thought second thought")
+			}
+			if ch.FinishReason != "stop" {
+				t.Fatalf("FinishReason = %q, want stop", ch.FinishReason)
+			}
+		})
+	}
+}
+
+func TestChatCompletionsSSEToolCallsReassemblyAndRunnerEndToEnd(t *testing.T) {
+	var turn atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := turn.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			// Interleaved tool_calls index 0 and index 1 across multiple chunks; index 1 omits "type".
+			stream := strings.Join([]string{
+				`data: {"id":"sse-tc-1","model":"cc/claude-opus-4-6","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"need two files","tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"read_","arguments":"{\"path\":"}}]}}]}`,
+				``,
+				`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"READ"}}]}}]}`,
+				``,
+				`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"\"src/app.go\"}"}}]}}]}`,
+				``,
+				`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"ME.md\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":15,"completion_tokens":10,"total_tokens":25}}`,
+				``,
+				`data: [DONE]`,
+				``,
+			}, "\n")
+			_, _ = io.WriteString(w, stream)
+			return
+		}
+
+		// Turn 2: verify runner sent the reassembled tool call results back and return final SSE text.
+		bodyBytes, _ := io.ReadAll(r.Body)
+		bodyStr := string(bodyBytes)
+		if !strings.Contains(bodyStr, "func Value() int") || !strings.Contains(bodyStr, "# Demo") {
+			t.Fatalf("turn 2 did not receive executed tool outputs from reassembled SSE tool_calls: %s", bodyStr)
+		}
+		stream := strings.Join([]string{
+			`data: {"id":"sse-tc-2","model":"cc/claude-opus-4-6","choices":[{"index":0,"delta":{"role":"assistant","content":"Read both "}}]}`,
+			``,
+			`data: {"choices":[{"index":0,"delta":{"content":"files cleanly."},"finish_reason":"stop"}],"usage":{"prompt_tokens":30,"completion_tokens":5,"total_tokens":35}}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n")
+		_, _ = io.WriteString(w, stream)
+	}))
+	defer srv.Close()
+
+	repo := initTestGitRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "9router-hybrid"
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{
+		RepoRoot: repo,
+		Client:   NewClient(srv.Client()),
+		LookupEnv: func(k string) (string, bool) {
+			if k == "NINEROUTER_BASE_URL" {
+				return srv.URL + "/v1", true
+			}
+			return "", false
+		},
+	})
+
+	rec, err := runner.Run(context.Background(), RunRequest{
+		Role: "verify",
+		Task: "Read src/app.go and README.md",
+	})
+	if err != nil {
+		t.Fatalf("Runner.Run failed: %v", err)
+	}
+	if rec.Status != TaskStatusCompleted {
+		t.Fatalf("status = %q, want completed (err=%s)", rec.Status, rec.Error)
+	}
+	if rec.FinalResponse != "Read both files cleanly." {
+		t.Fatalf("FinalResponse = %q, want %q", rec.FinalResponse, "Read both files cleanly.")
+	}
+	if rec.Usage.TotalTokens != 60 {
+		t.Fatalf("Usage.TotalTokens = %d, want 60", rec.Usage.TotalTokens)
+	}
+
+	// Check the assistant message from turn 1 has both reassembled tool calls with type defaulted to "function".
+	var foundToolMsg bool
+	for _, m := range rec.Messages {
+		if m.Role == "assistant" && len(m.ToolCalls) == 2 {
+			foundToolMsg = true
+			if m.ToolCalls[0].ID != "call_0" || m.ToolCalls[0].Type != "function" ||
+				m.ToolCalls[0].Function.Name != "read_file" || m.ToolCalls[0].Function.Arguments != `{"path":"src/app.go"}` {
+				t.Fatalf("reassembled ToolCalls[0] = %+v", m.ToolCalls[0])
+			}
+			if m.ToolCalls[1].ID != "call_1" || m.ToolCalls[1].Type != "function" ||
+				m.ToolCalls[1].Function.Name != "read_file" || m.ToolCalls[1].Function.Arguments != `{"path":"README.md"}` {
+				t.Fatalf("reassembled ToolCalls[1] = %+v", m.ToolCalls[1])
+			}
+		}
+	}
+	if !foundToolMsg {
+		t.Fatalf("expected assistant message with 2 reassembled tool calls in rec.Messages: %+v", rec.Messages)
+	}
+}
+
+func TestChatCompletionsSSEErrorAndEmptyChoicesRedactAPIKey(t *testing.T) {
+	const secretKey = "sk-super-secret-leak-check"
+
+	t.Run("SSE error chunk returns BadGateway APIError with redacted apiKey", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"error\":{\"message\":\"upstream rejected key "+secretKey+" at https://user:pass@proxy.local/v1?token=abc\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n")
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		_, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: strings.Replace(srv.URL, "http://", "http://admin:pw@", 1) + "/v1?key=" + secretKey,
+			APIKey:  secretKey,
+		}, ChatRequest{Model: "m1", Messages: []Message{{Role: "user", Content: "hi"}}})
+		if err == nil {
+			t.Fatal("expected error from SSE error chunk")
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("expected *APIError, got %T: %v", err, err)
+		}
+		if apiErr.StatusCode != http.StatusBadGateway {
+			t.Fatalf("StatusCode = %d, want %d", apiErr.StatusCode, http.StatusBadGateway)
+		}
+		if strings.Contains(err.Error(), secretKey) || strings.Contains(err.Error(), "pass@") || strings.Contains(err.Error(), "token=abc") {
+			t.Fatalf("SSE error leaked secret: %v", err)
+		}
+		if !strings.Contains(err.Error(), "[REDACTED]") {
+			t.Fatalf("expected redacted marker in error: %v", err)
+		}
+	})
+
+	t.Run("SSE with no choices returns empty choices returned by redactedURL", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		_, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: strings.Replace(srv.URL, "http://", "http://admin:pw@", 1) + "/v1?key=" + secretKey,
+			APIKey:  secretKey,
+		}, ChatRequest{Model: "m1", Messages: []Message{{Role: "user", Content: "hi"}}})
+		if err == nil {
+			t.Fatal("expected error for empty SSE choices")
+		}
+		if !strings.HasPrefix(err.Error(), "empty choices returned by ") {
+			t.Fatalf("err = %q, want prefix 'empty choices returned by '", err.Error())
+		}
+		if strings.Contains(err.Error(), secretKey) || strings.Contains(err.Error(), "admin:pw") {
+			t.Fatalf("empty choices error leaked URL credentials or key: %v", err)
+		}
+	})
+
+	t.Run("PRESERVE: standard JSON empty choices and invalid JSON preserve error contract without leaking apiKey", func(t *testing.T) {
+		srvEmpty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"j1","model":"m1","choices":[]}`)
+		}))
+		defer srvEmpty.Close()
+
+		client := NewClient(srvEmpty.Client())
+		_, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: strings.Replace(srvEmpty.URL, "http://", "http://admin:pw@", 1) + "/v1?key=" + secretKey,
+			APIKey:  secretKey,
+		}, ChatRequest{Model: "m1", Messages: []Message{{Role: "user", Content: "hi"}}})
+		if err == nil || !strings.HasPrefix(err.Error(), "empty choices returned by ") {
+			t.Fatalf("empty JSON choices err = %v, want 'empty choices returned by ...'", err)
+		}
+		if strings.Contains(err.Error(), secretKey) || strings.Contains(err.Error(), "admin:pw") {
+			t.Fatalf("empty JSON choices leaked secret: %v", err)
+		}
+
+		srvBad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{not-json}`)
+		}))
+		defer srvBad.Close()
+
+		_, err = client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: strings.Replace(srvBad.URL, "http://", "http://admin:pw@", 1) + "/v1?key=" + secretKey,
+			APIKey:  secretKey,
+		}, ChatRequest{Model: "m1", Messages: []Message{{Role: "user", Content: "hi"}}})
+		if err == nil || !strings.HasPrefix(err.Error(), "decode response from ") {
+			t.Fatalf("invalid JSON err = %v, want 'decode response from ...'", err)
+		}
+		if strings.Contains(err.Error(), secretKey) || strings.Contains(err.Error(), "admin:pw") {
+			t.Fatalf("invalid JSON error leaked secret: %v", err)
+		}
+	})
 }
 

@@ -181,6 +181,7 @@ type wireChatRequest struct {
 	ToolChoice  any              `json:"tool_choice,omitempty"`
 	MaxTokens   int              `json:"max_tokens,omitempty"`
 	Temperature *float64         `json:"temperature,omitempty"`
+	Stream      bool             `json:"stream"`
 }
 
 // ChatCompletions invokes POST <BaseURL>/chat/completions with compatibility handling.
@@ -234,6 +235,7 @@ func (c *Client) ChatCompletions(ctx context.Context, ep config.ResolvedEndpoint
 		ToolChoice:  toolChoice,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
+		Stream:      false,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
@@ -276,14 +278,253 @@ func (c *Client) ChatCompletions(ctx context.Context, ep config.ResolvedEndpoint
 		}
 	}
 
-	var parsed ChatResponse
-	if err := json.Unmarshal(respBytes, &parsed); err != nil {
-		return ChatResponse{}, fmt.Errorf("decode response from %s: %w", RedactURL(endpointURL), err)
+	return decodeChatResponse(respBytes, resp.Header.Get("Content-Type"), endpointURL, ep.APIKey)
+}
+
+type sseToolCallDelta struct {
+	Index    *int             `json:"index"`
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type sseDelta struct {
+	Role             string             `json:"role"`
+	Content          string             `json:"content"`
+	ReasoningContent string             `json:"reasoning_content"`
+	ToolCalls        []sseToolCallDelta `json:"tool_calls"`
+}
+
+type sseChoice struct {
+	Index        int       `json:"index"`
+	Delta        *sseDelta `json:"delta"`
+	Message      *Message  `json:"message"`
+	FinishReason string    `json:"finish_reason"`
+}
+
+type sseChunk struct {
+	ID      string          `json:"id"`
+	Model   string          `json:"model"`
+	Choices []sseChoice     `json:"choices"`
+	Usage   *Usage          `json:"usage"`
+	Error   json.RawMessage `json:"error"`
+}
+
+func isSSEResponse(respBytes []byte, contentType string) bool {
+	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
+		return true
 	}
-	if len(parsed.Choices) == 0 {
+	trimmed := bytes.TrimSpace(respBytes)
+	return bytes.HasPrefix(trimmed, []byte("data:")) ||
+		bytes.HasPrefix(trimmed, []byte("event:")) ||
+		bytes.HasPrefix(trimmed, []byte(":"))
+}
+
+func decodeChatResponse(respBytes []byte, contentType string, endpointURL string, apiKey string) (ChatResponse, error) {
+	if !isSSEResponse(respBytes, contentType) {
+		var parsed ChatResponse
+		if err := json.Unmarshal(respBytes, &parsed); err != nil {
+			return ChatResponse{}, fmt.Errorf("decode response from %s: %s", RedactURL(endpointURL), redactError(err, apiKey))
+		}
+		if len(parsed.Choices) == 0 {
+			return ChatResponse{}, fmt.Errorf("empty choices returned by %s", RedactURL(endpointURL))
+		}
+		return parsed, nil
+	}
+
+	type choiceAcc struct {
+		choice    Choice
+		toolCalls map[int]*ToolCall
+	}
+
+	var resp ChatResponse
+	choicesByIdx := make(map[int]*choiceAcc)
+	var dataLines []string
+	stopped := false
+
+	flushEvent := func() (bool, error) {
+		if len(dataLines) == 0 {
+			return false, nil
+		}
+		payload := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+
+		trimmed := strings.TrimSpace(payload)
+		if trimmed == "" {
+			return false, nil
+		}
+		if trimmed == "[DONE]" {
+			return true, nil
+		}
+
+		var chunk sseChunk
+		if err := json.Unmarshal([]byte(trimmed), &chunk); err != nil {
+			return false, fmt.Errorf("decode response from %s: %s", RedactURL(endpointURL), redactError(err, apiKey))
+		}
+
+		errBytes := bytes.TrimSpace(chunk.Error)
+		if len(errBytes) > 0 && string(errBytes) != "null" {
+			msg := string(errBytes)
+			if len(msg) > maxErrorBodyBytes {
+				msg = msg[:maxErrorBodyBytes] + "..."
+			}
+			return false, &APIError{
+				StatusCode: http.StatusBadGateway,
+				Message:    redactText(msg, apiKey),
+			}
+		}
+
+		if chunk.ID != "" {
+			resp.ID = chunk.ID
+		}
+		if chunk.Model != "" {
+			resp.Model = chunk.Model
+		}
+		if chunk.Usage != nil {
+			resp.Usage = *chunk.Usage
+		}
+
+		for _, sc := range chunk.Choices {
+			acc, exists := choicesByIdx[sc.Index]
+			if !exists {
+				acc = &choiceAcc{
+					choice:    Choice{Index: sc.Index},
+					toolCalls: make(map[int]*ToolCall),
+				}
+				choicesByIdx[sc.Index] = acc
+			}
+			if sc.FinishReason != "" {
+				acc.choice.FinishReason = sc.FinishReason
+			}
+			if sc.Delta != nil {
+				d := sc.Delta
+				if d.Role != "" {
+					acc.choice.Message.Role = d.Role
+				}
+				if d.Content != "" {
+					acc.choice.Message.Content += d.Content
+				}
+				if d.ReasoningContent != "" {
+					acc.choice.Message.ReasoningContent += d.ReasoningContent
+				}
+				if acc.choice.Message.Role == "" && (d.Content != "" || d.ReasoningContent != "" || len(d.ToolCalls) > 0) {
+					acc.choice.Message.Role = "assistant"
+				}
+				for i, tc := range d.ToolCalls {
+					tcIdx := i
+					if tc.Index != nil {
+						tcIdx = *tc.Index
+					}
+					tca, ok := acc.toolCalls[tcIdx]
+					if !ok {
+						tca = &ToolCall{}
+						acc.toolCalls[tcIdx] = tca
+					}
+					if tc.ID != "" {
+						tca.ID = tc.ID
+					}
+					if tc.Type != "" {
+						tca.Type = tc.Type
+					}
+					tca.Function.Name += tc.Function.Name
+					tca.Function.Arguments += tc.Function.Arguments
+				}
+			}
+			if sc.Message != nil {
+				m := sc.Message
+				if m.Role != "" {
+					acc.choice.Message.Role = m.Role
+				}
+				if m.Content != "" {
+					acc.choice.Message.Content = m.Content
+				}
+				if m.ReasoningContent != "" {
+					acc.choice.Message.ReasoningContent = m.ReasoningContent
+				}
+				if len(m.ToolCalls) > 0 {
+					acc.toolCalls = make(map[int]*ToolCall, len(m.ToolCalls))
+					for i, tc := range m.ToolCalls {
+						cp := tc
+						if cp.Type == "" {
+							cp.Type = "function"
+						}
+						acc.toolCalls[i] = &cp
+					}
+				}
+				if acc.choice.Message.Role == "" && (m.Content != "" || m.ReasoningContent != "" || len(m.ToolCalls) > 0) {
+					acc.choice.Message.Role = "assistant"
+				}
+			}
+		}
+
+		return false, nil
+	}
+
+	raw := strings.ReplaceAll(string(respBytes), "\r\n", "\n")
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			done, err := flushEvent()
+			if err != nil {
+				return ChatResponse{}, err
+			}
+			if done {
+				stopped = true
+				break
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			val := strings.TrimPrefix(line, "data:")
+			val = strings.TrimPrefix(val, " ")
+			dataLines = append(dataLines, val)
+			continue
+		}
+		if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") || strings.HasPrefix(line, "retry:") {
+			continue
+		}
+	}
+	if !stopped && len(dataLines) > 0 {
+		if _, err := flushEvent(); err != nil {
+			return ChatResponse{}, err
+		}
+	}
+
+	if len(choicesByIdx) == 0 {
 		return ChatResponse{}, fmt.Errorf("empty choices returned by %s", RedactURL(endpointURL))
 	}
-	return parsed, nil
+
+	indices := make([]int, 0, len(choicesByIdx))
+	for idx := range choicesByIdx {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+
+	resp.Choices = make([]Choice, 0, len(indices))
+	for _, idx := range indices {
+		acc := choicesByIdx[idx]
+		if len(acc.toolCalls) > 0 {
+			tcIndices := make([]int, 0, len(acc.toolCalls))
+			for tcIdx := range acc.toolCalls {
+				tcIndices = append(tcIndices, tcIdx)
+			}
+			sort.Ints(tcIndices)
+			acc.choice.Message.ToolCalls = make([]ToolCall, 0, len(tcIndices))
+			for _, tcIdx := range tcIndices {
+				tc := *acc.toolCalls[tcIdx]
+				if tc.Type == "" {
+					tc.Type = "function"
+				}
+				acc.choice.Message.ToolCalls = append(acc.choice.Message.ToolCalls, tc)
+			}
+		}
+		resp.Choices = append(resp.Choices, acc.choice)
+	}
+
+	return resp, nil
 }
 
 // ProbeProvider checks live reachability of a provider using <baseUrl>/models
