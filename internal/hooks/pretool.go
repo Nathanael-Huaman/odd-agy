@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +21,26 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 	cfg, err := config.LoadConfig(workspace)
 	if err != nil {
 		return PreToolUseOutput{}, err
+	}
+
+	if mcpTool, isCallMCP, ok := resolveOddAgyMCPTool(in.ToolCall.Name, in.ToolCall.Args); ok {
+		switch mcpTool {
+		case "odd_review_consent":
+			return PreToolUseOutput{
+				Decision: DecisionForceAsk,
+				Reason:   "RDD review consent requires explicit human approval (granted or declined).",
+			}, nil
+		case "todo", "odd_review_assess", "odd_review_scope", "odd_review_status", "odd_external_profiles", "odd_external_status":
+			return PreToolUseOutput{Decision: DecisionAutoApprove}, nil
+		case "odd_review_mode":
+			if mcpArgs, argsOK := extractMCPToolArgs(in.ToolCall.Args, isCallMCP); argsOK {
+				action := strings.ToLower(strings.TrimSpace(getStringArg(mcpArgs, "action")))
+				if action == "" || action == "status" {
+					return PreToolUseOutput{Decision: DecisionAutoApprove}, nil
+				}
+			}
+		}
+		return PreToolUseOutput{Decision: DecisionAllow}, nil
 	}
 
 	toolName := strings.ToLower(strings.TrimSpace(in.ToolCall.Name))
@@ -1113,6 +1134,63 @@ func lookupArg(args map[string]any, key string) (any, bool) {
 		}
 	}
 	return nil, false
+}
+
+func resolveOddAgyMCPTool(rawToolName string, args map[string]any) (toolName string, isCallMCPTool bool, ok bool) {
+	lower := strings.ToLower(strings.TrimSpace(rawToolName))
+	switch {
+	case strings.HasPrefix(lower, "odd-agy/"):
+		name := strings.TrimSpace(strings.TrimPrefix(lower, "odd-agy/"))
+		if name != "" {
+			return name, false, true
+		}
+	case strings.HasPrefix(lower, "mcp_odd-agy_"):
+		name := strings.TrimSpace(strings.TrimPrefix(lower, "mcp_odd-agy_"))
+		if name != "" {
+			return name, false, true
+		}
+	case lower == "call_mcp_tool":
+		server := strings.ToLower(strings.TrimSpace(getStringArg(args, "ServerName")))
+		if server == "" {
+			server = strings.ToLower(strings.TrimSpace(getStringArg(args, "server_name")))
+		}
+		if server == "odd-agy" {
+			name := strings.ToLower(strings.TrimSpace(getStringArg(args, "ToolName")))
+			if name == "" {
+				name = strings.ToLower(strings.TrimSpace(getStringArg(args, "tool_name")))
+			}
+			if name != "" {
+				return name, true, true
+			}
+		}
+	}
+	return "", false, false
+}
+
+func extractMCPToolArgs(args map[string]any, isCallMCPTool bool) (map[string]any, bool) {
+	if !isCallMCPTool {
+		return args, true
+	}
+	raw, exists := lookupArg(args, "Arguments")
+	if !exists || raw == nil {
+		return args, true
+	}
+	switch v := raw.(type) {
+	case map[string]any:
+		return v, true
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" || trimmed == "{}" {
+			return map[string]any{}, true
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+			return nil, false
+		}
+		return parsed, true
+	default:
+		return nil, false
+	}
 }
 
 func getStringArg(args map[string]any, key string) string {

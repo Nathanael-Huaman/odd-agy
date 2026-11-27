@@ -149,7 +149,7 @@ func TestInitCreatesAssetsConfigAndMergesHooksAndMCP(t *testing.T) {
 			cmd: "./node_modules/.bin/odd-agy hook SessionStart",
 		},
 		"PreToolUse": {
-			matcher: "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|send_message|run_command|view_file",
+			matcher: "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|send_message|run_command|view_file|mcp_odd-agy_.*|odd-agy/.*|call_mcp_tool",
 			cmd:     "./node_modules/.bin/odd-agy hook PreToolUse",
 		},
 		"PostToolUse": {
@@ -175,6 +175,14 @@ func TestInitCreatesAssetsConfigAndMergesHooksAndMCP(t *testing.T) {
 		if want.matcher != "" {
 			if gotMatcher, _ := entry["matcher"].(string); gotMatcher != want.matcher {
 				t.Errorf("hooks.json %s matcher = %q, want %q", event, gotMatcher, want.matcher)
+			}
+			if event == "PreToolUse" {
+				gotMatcher, _ := entry["matcher"].(string)
+				for _, sub := range []string{"odd-agy/.*", "mcp_odd-agy_.*", "call_mcp_tool"} {
+					if !strings.Contains(gotMatcher, sub) {
+						t.Errorf("hooks.json PreToolUse matcher %q missing %q", gotMatcher, sub)
+					}
+				}
 			}
 		} else if _, hasMatcher := entry["matcher"]; hasMatcher {
 			t.Errorf("hooks.json %s unexpectedly has matcher", event)

@@ -11,7 +11,9 @@ RDD ensures significant diffs are reviewed against an **immutable SHA-256 frozen
 
 1. **`odd_review_mode`**: Inspect or toggle project RDD mode (`status` | `enable` | `disable`).
 2. **`odd_review_assess`**: Inspect live diff or committed `baseRef` range, optionally pass `escalate: {item: 1..6, reason}` per High-Risk rubric, and compute risk tier + `reviewDue`.
-3. **`odd_review_start`**: Freeze the exact candidate diff and touched file contents under `.git/odd-agy/candidates/<lineageId>/` with a SHA-256 manifest. Select applicable 4R lenses (`risk`, `resilience`, `readability`, `reliability`) with a clear `lensesReason`, and obtain explicit human consent (`granted` | `declined`) before admitting findings.
+3. **`odd_review_start` & `odd_review_consent`**: Freeze the exact candidate diff and touched file contents under `.git/odd-agy/candidates/<lineageId>/` with a SHA-256 manifest, selecting applicable 4R lenses (`risk`, `resilience`, `readability`, `reliability`) with a clear `lensesReason`.
+   - **NEVER** call `odd_review_consent` on your own or assume approval.
+   - After `odd_review_start` returns `consent_required`, **ALWAYS** ask the human via `ask_question` with choices `granted` and `declined`, and call `odd_review_consent` only with their literal answer.
 4. **`odd_review_scope`**: Read-only paginated view of the frozen candidate verified against SHA-256 digests. All review lenses and the refuter MUST inspect the candidate exclusively through `odd_review_scope` — never the live worktree.
 5. **`odd_review_submit`**: Submit structured verdicts from the selected 4R lens agents (`review-risk`, `review-resilience`, `review-readability`, `review-reliability`) and the `review-refuter` batch.
    - Candidate-caused severe blockers open at most **1 bounded correction** budget.

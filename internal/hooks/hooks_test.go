@@ -1167,6 +1167,117 @@ func TestPreToolUseDeniesDanglingSymlinkInsideSymlinkedExternalDir(t *testing.T)
 	}
 }
 
+func TestPreToolUse_MCPAutoApproveAndConsentForceAsk(t *testing.T) {
+	repo := initTestRepo(t)
+
+	autoApproveCases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"slash_todo", "odd-agy/todo", map[string]any{"action": "list"}},
+		{"mcp_prefix_assess", "mcp_odd-agy_odd_review_assess", map[string]any{}},
+		{"call_mcp_tool_scope", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_review_scope"}},
+		{"slash_status", "odd-agy/odd_review_status", nil},
+		{"mcp_prefix_ext_profiles", "mcp_odd-agy_odd_external_profiles", nil},
+		{"call_mcp_tool_ext_status", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_external_status"}},
+		{"slash_mode_omitted", "odd-agy/odd_review_mode", map[string]any{}},
+		{"slash_mode_status", "odd-agy/odd_review_mode", map[string]any{"action": "status"}},
+		{"call_mcp_tool_mode_status_in_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  map[string]any{"action": "status"},
+		}},
+		{"call_mcp_tool_mode_status_json_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  `{"action":"status"}`,
+		}},
+		{"call_mcp_tool_mode_omitted", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+		}},
+	}
+
+	for _, tc := range autoApproveCases {
+		t.Run("auto_approve_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-mcp", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionAutoApprove {
+				t.Fatalf("expected %q for %s, got %+v", DecisionAutoApprove, tc.name, out)
+			}
+		})
+	}
+
+	forceAskCases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"slash_consent", "odd-agy/odd_review_consent", map[string]any{"consent": "granted"}},
+		{"mcp_prefix_consent", "mcp_odd-agy_odd_review_consent", map[string]any{"consent": "granted"}},
+		{"call_mcp_tool_consent", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_review_consent"}},
+	}
+
+	for _, tc := range forceAskCases {
+		t.Run("force_ask_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-mcp", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionForceAsk {
+				t.Fatalf("expected %q for %s, got %+v", DecisionForceAsk, tc.name, out)
+			}
+			if out.Reason != "RDD review consent requires explicit human approval (granted or declined)." {
+				t.Fatalf("unexpected force_ask reason %q", out.Reason)
+			}
+		})
+	}
+
+	allowCases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"mode_disable_slash", "odd-agy/odd_review_mode", map[string]any{"action": "disable"}},
+		{"mode_enable_mcp_prefix", "mcp_odd-agy_odd_review_mode", map[string]any{"action": "enable"}},
+		{"mode_disable_call_mcp_tool_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  map[string]any{"action": "disable"},
+		}},
+		{"mode_disable_call_mcp_tool_json_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  `{"action":"disable"}`,
+		}},
+		{"odd_review_start", "odd-agy/odd_review_start", map[string]any{}},
+		{"odd_review_submit", "mcp_odd-agy_odd_review_submit", map[string]any{}},
+		{"odd_review_ack", "odd-agy/odd_review_ack", map[string]any{}},
+		{"odd_external_run", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_external_run"}},
+		{"engram_slash", "engram/mem_save", map[string]any{"title": "test"}},
+		{"engram_mcp_prefix", "mcp_engram_mem_save", map[string]any{"title": "test"}},
+		{"engram_call_mcp_tool", "call_mcp_tool", map[string]any{"ServerName": "engram", "ToolName": "mem_save"}},
+	}
+
+	for _, tc := range allowCases {
+		t.Run("allow_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-mcp", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionAllow {
+				t.Fatalf("expected %q for %s, got %+v", DecisionAllow, tc.name, out)
+			}
+		})
+	}
+}
+
 func TestDispatch_Errors(t *testing.T) {
 	var out bytes.Buffer
 	if err := Dispatch("UnknownEvent", strings.NewReader("{}"), &out); err == nil {

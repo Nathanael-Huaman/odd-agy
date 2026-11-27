@@ -19,12 +19,13 @@ const (
 	EventPreInvocation = "PreInvocation"
 	EventStop          = "Stop"
 
-	DecisionAllow    = "allow"
-	DecisionAuto     = "auto_approve"
-	DecisionDeny     = "deny"
-	DecisionAsk      = "ask"
-	DecisionForceAsk = "force_ask"
-	DecisionContinue = "continue"
+	DecisionAllow       = "allow"
+	DecisionAutoApprove = "auto_approve"
+	DecisionAuto        = DecisionAutoApprove
+	DecisionDeny        = "deny"
+	DecisionAsk         = "ask"
+	DecisionForceAsk    = "force_ask"
+	DecisionContinue    = "continue"
 )
 
 // CommonInput holds the shared Antigravity hook stdin fields.

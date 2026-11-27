@@ -14,7 +14,7 @@ import (
 
 const (
 	ManifestRelPath    = ".agents/odd/.managed-manifest.json"
-	preToolUseMatcher  = "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|send_message|run_command|view_file"
+	preToolUseMatcher  = "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|send_message|run_command|view_file|mcp_odd-agy_.*|odd-agy/.*|call_mcp_tool"
 	postToolUseMatcher = "write_to_file|replace_file_content|multi_replace_file_content|invoke_subagent|run_command"
 )
 

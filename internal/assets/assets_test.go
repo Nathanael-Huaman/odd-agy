@@ -178,9 +178,23 @@ func TestRulesContractAndBudget(t *testing.T) {
 
 	// Verify key semantic content in always_on rules
 	core := string(byPath["rules/odd-01-core.md"].Content)
-	for _, needle := range []string{"Authorize", "Explore", "Resolve", "Classify", "Track", "Implement", "Close", "odd/tasks/", "High-Risk"} {
+	for _, needle := range []string{"Authorize", "Explore", "Resolve", "Classify", "Track", "Implement", "Close", "odd/tasks/", "High-Risk", "Organic Driven Development", "reviewDue: false"} {
 		if !strings.Contains(core, needle) {
 			t.Errorf("odd-01-core.md missing %q", needle)
+		}
+	}
+	if strings.Contains(core, "Objective-Driven") {
+		t.Errorf("odd-01-core.md must not say Objective-Driven")
+	}
+	lowerCore := strings.ToLower(core)
+	if !strings.Contains(lowerCore, "small") || !strings.Contains(lowerCore, "must not") {
+		t.Errorf("odd-01-core.md must explicitly forbid creating odd/tasks/ for small tasks")
+	}
+
+	rddRule := string(byPath["rules/odd-05-rdd.md"].Content)
+	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined"} {
+		if !strings.Contains(rddRule, needle) {
+			t.Errorf("odd-05-rdd.md missing %q", needle)
 		}
 	}
 
@@ -230,6 +244,12 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 	}
 	if slices.Contains(orchFM.Tools, "replace_file_content") || slices.Contains(orchFM.Tools, "multi_replace_file_content") {
 		t.Errorf("odd-orchestrator must omit replace_file_content and multi_replace_file_content")
+	}
+	orchAgent := string(byPath["agents/odd-orchestrator.md"].Content)
+	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined"} {
+		if !strings.Contains(orchAgent, needle) {
+			t.Errorf("odd-orchestrator.md missing %q", needle)
+		}
 	}
 
 	for _, writerPath := range []string{"agents/gentle-ai-worker.md", "agents/jd-fix-agent.md"} {
