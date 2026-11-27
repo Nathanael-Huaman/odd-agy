@@ -42,6 +42,10 @@ func (m Model) View() string {
 		m.renderProfiles(&b)
 	case screenRoles:
 		m.renderRoles(&b)
+	case screenModelPicker:
+		m.renderModelPicker(&b)
+	case screenEffortPicker:
+		m.renderEffortPicker(&b)
 	case screenProviders:
 		m.renderProviders(&b)
 	case screenActions:
@@ -146,12 +150,51 @@ func (m Model) renderRoles(b *strings.Builder) {
 		if prov == "" {
 			prov = "-"
 		}
-		line := fmt.Sprintf("%-18s %-12s %-18s %s", role, route.Runtime, prov, route.Model)
+		effort := route.Effort
+		if effort == "" {
+			effort = "default"
+		}
+		line := fmt.Sprintf("%-18s %-12s %-18s %-26s %s", role, route.Runtime, prov, route.Model, effort)
 		b.WriteString(renderCursorLine(i == m.cursor, line))
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')
-	b.WriteString(mutedStyle.Render("[t/enter] toggle runtime  [p] cycle provider  [m] edit model  [esc] back  [q] quit"))
+	b.WriteString(mutedStyle.Render("[t] toggle runtime  [p] cycle provider  [m] model  [e] effort  [esc] back  [q] quit"))
+	b.WriteByte('\n')
+}
+
+func (m Model) renderModelPicker(b *strings.Builder) {
+	b.WriteString(fmt.Sprintf("Select Model for %s (%s):\n", m.pickerRole, m.profiles.ActiveProfile))
+	catalog := m.agyModels
+	if !m.agyModelsLoaded {
+		catalog = fallbackAgyModels
+	}
+	opts := m.buildModelPickerOptions(catalog)
+	for i, opt := range opts {
+		var line string
+		if opt.isCustom {
+			line = opt.label
+		} else if opt.label != "" {
+			line = fmt.Sprintf("%-26s %s", opt.id, opt.label)
+		} else {
+			line = opt.id
+		}
+		b.WriteString(renderCursorLine(i == m.cursor, line))
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("[up/down] move  [enter] select  [esc] cancel  [q] quit"))
+	b.WriteByte('\n')
+}
+
+func (m Model) renderEffortPicker(b *strings.Builder) {
+	b.WriteString(fmt.Sprintf("Select Effort for %s (%s):\n", m.pickerRole, m.profiles.ActiveProfile))
+	for i, opt := range effortPickerOptions {
+		b.WriteString(renderCursorLine(i == m.cursor, opt.label))
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("[up/down] move  [enter] select  [esc] cancel  [q] quit"))
 	b.WriteByte('\n')
 }
 

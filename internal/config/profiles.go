@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -20,6 +21,14 @@ const (
 
 	RoleOrchestrator = "orchestrator"
 )
+
+// ValidEfforts enumerates the accepted RoleRoute.Effort values (empty string means default/inherit).
+var ValidEfforts = []string{"", "low", "medium", "high", "xhigh", "max"}
+
+// IsValidEffort reports whether v is an accepted effort level for a role route.
+func IsValidEffort(v string) bool {
+	return slices.Contains(ValidEfforts, v)
+}
 
 // AllRoles enumerates every orchestrator/subagent/review role supported by odd-agy profiles.
 var AllRoles = []string{
@@ -83,6 +92,7 @@ type RoleRoute struct {
 	Runtime  string       `json:"runtime"`
 	Provider string       `json:"provider,omitempty"`
 	Model    string       `json:"model"`
+	Effort   string       `json:"effort,omitempty"`
 	Fallback []RoleTarget `json:"fallback,omitempty"`
 }
 
@@ -277,6 +287,12 @@ func ValidateProfiles(cfg ProfilesConfig) error {
 				Model:    route.Model,
 			}); err != nil {
 				return fmt.Errorf("profile %q role %q: %w", profName, roleName, err)
+			}
+			if hasControlChar(route.Effort) {
+				return fmt.Errorf("profile %q role %q: effort must not contain control characters or newlines", profName, roleName)
+			}
+			if !IsValidEffort(route.Effort) {
+				return fmt.Errorf("profile %q role %q: invalid effort %q (must be empty or one of low, medium, high, xhigh, max)", profName, roleName, route.Effort)
 			}
 			for i, fb := range route.Fallback {
 				if roleName == RoleOrchestrator && fb.Runtime != RuntimeAgyNative {

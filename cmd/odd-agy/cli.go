@@ -382,7 +382,8 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 	}
 
 	var orchestratorModel string
-	if !noAgent && agentName == "odd-orchestrator" && !hasModelFlag(extraArgs) {
+	var orchestratorEffort string
+	if !noAgent && agentName == "odd-orchestrator" && (!hasModelFlag(extraArgs) || !hasEffortFlag(extraArgs)) {
 		if _, err := os.Stat(config.ProfilesPath(cwd)); err == nil {
 			profs, err := config.LoadProfiles(cwd)
 			if err != nil {
@@ -391,9 +392,18 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 			}
 			if prof, ok := profs.Profiles[profs.ActiveProfile]; ok {
 				ra := prof.Roles[config.RoleOrchestrator]
-				model := strings.TrimSpace(ra.Model)
-				if ra.Runtime == config.RuntimeAgyNative && model != "" && model != "inherit" {
-					orchestratorModel = model
+				if ra.Runtime == config.RuntimeAgyNative {
+					if !hasModelFlag(extraArgs) {
+						model := strings.TrimSpace(ra.Model)
+						if model != "" && model != "inherit" {
+							orchestratorModel = model
+						}
+					}
+					if !hasEffortFlag(extraArgs) {
+						if effort := strings.TrimSpace(ra.Effort); effort != "" {
+							orchestratorEffort = effort
+						}
+					}
 				}
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -402,11 +412,14 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 		}
 	}
 
-	agyArgs := make([]string, 0, 6+len(extraArgs))
+	agyArgs := make([]string, 0, 8+len(extraArgs))
 	if !noAgent {
 		agyArgs = append(agyArgs, "--agent", agentName)
 		if orchestratorModel != "" {
 			agyArgs = append(agyArgs, "--model", orchestratorModel)
+		}
+		if orchestratorEffort != "" {
+			agyArgs = append(agyArgs, "--effort", orchestratorEffort)
 		}
 	}
 	agyArgs = append(agyArgs, "--settings", absSettings)
@@ -418,6 +431,15 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 func hasModelFlag(args []string) bool {
 	for _, a := range args {
 		if a == "--model" || strings.HasPrefix(a, "--model=") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEffortFlag(args []string) bool {
+	for _, a := range args {
+		if a == "--effort" || strings.HasPrefix(a, "--effort=") {
 			return true
 		}
 	}
@@ -654,6 +676,9 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 				fmt.Fprintf(stdout, "  %-20s runtime=%s provider=%s model=%s", role, route.Runtime, route.Provider, route.Model)
 			} else {
 				fmt.Fprintf(stdout, "  %-20s runtime=%s model=%s", role, route.Runtime, route.Model)
+			}
+			if route.Effort != "" {
+				fmt.Fprintf(stdout, " effort=%s", route.Effort)
 			}
 			if len(route.Fallback) > 0 {
 				fb := route.Fallback[0]

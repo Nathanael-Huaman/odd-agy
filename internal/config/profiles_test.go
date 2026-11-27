@@ -388,6 +388,73 @@ func TestLoadProfilesBackfillsMissingOrchestrator(t *testing.T) {
 	}
 }
 
+func TestRoleRouteEffortValidationAndBackwardsCompat(t *testing.T) {
+	wantValid := []string{"", "low", "medium", "high", "xhigh", "max"}
+	if !slices.Equal(ValidEfforts, wantValid) {
+		t.Fatalf("ValidEfforts = %v, want %v", ValidEfforts, wantValid)
+	}
+	for _, v := range wantValid {
+		if !IsValidEffort(v) {
+			t.Errorf("IsValidEffort(%q) = false, want true", v)
+		}
+	}
+	for _, bad := range []string{"ultra", "HIGH", " low", "low ", "low\n", "high\x00", "default"} {
+		if IsValidEffort(bad) {
+			t.Errorf("IsValidEffort(%q) = true, want false", bad)
+		}
+	}
+
+	// Valid effort values pass ValidateProfiles and round-trip through Save/Load.
+	dir := t.TempDir()
+	cfg := DefaultProfilesConfig()
+	prof := cfg.Profiles["agy-oauth"]
+	r := prof.Roles[RoleOrchestrator]
+	r.Effort = "xhigh"
+	prof.Roles[RoleOrchestrator] = r
+	w := prof.Roles["worker"]
+	w.Effort = "max"
+	prof.Roles["worker"] = w
+	cfg.Profiles["agy-oauth"] = prof
+
+	if err := SaveProfiles(dir, cfg); err != nil {
+		t.Fatalf("SaveProfiles with valid efforts error: %v", err)
+	}
+	raw, err := os.ReadFile(ProfilesPath(dir))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"effort": "xhigh"`) {
+		t.Fatalf("expected effort field serialized in profiles.json:\n%s", string(raw))
+	}
+	// Omitted when empty (explore has Effort == "").
+	loaded, err := LoadProfiles(dir)
+	if err != nil {
+		t.Fatalf("LoadProfiles: %v", err)
+	}
+	if got := loaded.Profiles["agy-oauth"].Roles[RoleOrchestrator].Effort; got != "xhigh" {
+		t.Fatalf("loaded orchestrator Effort = %q, want xhigh", got)
+	}
+	if got := loaded.Profiles["agy-oauth"].Roles["worker"].Effort; got != "max" {
+		t.Fatalf("loaded worker Effort = %q, want max", got)
+	}
+	if got := loaded.Profiles["agy-oauth"].Roles["explore"].Effort; got != "" {
+		t.Fatalf("loaded explore Effort = %q, want empty", got)
+	}
+
+	// Invalid effort values and control chars are rejected by ValidateProfiles.
+	for _, bad := range []string{"ultra", "HIGH", "low\n", "high\r", "med\x00"} {
+		badCfg := DefaultProfilesConfig()
+		bp := badCfg.Profiles["agy-oauth"]
+		br := bp.Roles["worker"]
+		br.Effort = bad
+		bp.Roles["worker"] = br
+		badCfg.Profiles["agy-oauth"] = bp
+		if err := ValidateProfiles(badCfg); err == nil {
+			t.Fatalf("ValidateProfiles(effort=%q) expected error, got nil", bad)
+		}
+	}
+}
+
 func TestRoleAgentRelPath(t *testing.T) {
 	want := map[string]string{
 		RoleOrchestrator:     ".agents/agents/odd-orchestrator.md",

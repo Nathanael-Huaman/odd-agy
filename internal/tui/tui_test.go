@@ -146,8 +146,8 @@ func TestRolesEditorToggleRuntimeProviderAndModel(t *testing.T) {
 		t.Fatalf("expected all roles in editor view:\n%s", m.View())
 	}
 
-	// Cursor is on role 0 ("orchestrator"). Toggling or cycling provider must keep it on agy-native.
-	for _, k := range []tea.KeyMsg{keyRune('t'), {Type: tea.KeyEnter}, {Type: tea.KeySpace}, keyRune('p')} {
+	// Cursor is on role 0 ("orchestrator"). Toggling runtime or cycling provider must keep it on agy-native.
+	for _, k := range []tea.KeyMsg{keyRune('t'), {Type: tea.KeySpace}, keyRune('p')} {
 		m = sendKey(t, m, k)
 		if !strings.Contains(m.View(), "orchestrator always runs on agy-native (press [m] to edit its model)") {
 			t.Fatalf("expected orchestrator guard status after key %v:\n%s", k, m.View())
@@ -162,7 +162,7 @@ func TestRolesEditorToggleRuntimeProviderAndModel(t *testing.T) {
 		}
 	}
 
-	// Pressing 'm' on agy-native orchestrator shows Antigravity model IDs/aliases hint.
+	// Pressing 'm' or Enter on agy-native orchestrator opens the vertical Model Picker listing Antigravity models.
 	m = sendKey(t, m, keyRune('m'))
 	hintView := m.View()
 	for _, wantID := range []string{
@@ -174,9 +174,10 @@ func TestRolesEditorToggleRuntimeProviderAndModel(t *testing.T) {
 		"gemini-4-hydrogen-high",
 		"claude-sonnet-4-6",
 		"claude-opus-4-6-thinking",
+		"Custom model ID...",
 	} {
 		if !strings.Contains(hintView, wantID) {
-			t.Fatalf("expected Antigravity model hint %q in view:\n%s", wantID, hintView)
+			t.Fatalf("expected Antigravity model %q in model picker view:\n%s", wantID, hintView)
 		}
 	}
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
@@ -386,24 +387,22 @@ func TestRolesEditorAndProfileSwitchSyncAgentFrontmatterAndDoctor(t *testing.T) 
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 
-	// Edit orchestrator (role 0) model -> gemini-3.8-flash-high
+	// Edit orchestrator (role 0) model via Model Picker -> gemini-3.8-flash-high (fallback index 6)
 	m = sendKey(t, m, keyRune('m'))
-	for i := 0; i < 20; i++ {
-		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+	for i := 0; i < 6; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	}
-	m = sendText(t, m, "gemini-3.8-flash-high")
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !strings.Contains(m.View(), ".agents/agents/*.md") || !strings.Contains(m.View(), "odd-agy launch") {
 		t.Fatalf("expected agent sync + restart odd-agy launch status after orchestrator edit:\n%s", m.View())
 	}
 
-	// Move down to explore (role 1) and edit model -> gemini-3.8-flash-low
+	// Move down to explore (role 1) and edit model via Model Picker -> gemini-3.8-flash-low (starts at index 1 "flash", move down 7 to index 8)
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	m = sendKey(t, m, keyRune('m'))
-	for i := 0; i < 20; i++ {
-		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+	for i := 0; i < 7; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	}
-	m = sendText(t, m, "gemini-3.8-flash-low")
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !strings.Contains(m.View(), ".agents/agents/*.md") || !strings.Contains(m.View(), "odd-agy launch") {
 		t.Fatalf("expected agent sync + restart odd-agy launch status after explore edit:\n%s", m.View())
@@ -612,23 +611,23 @@ func TestPersistProfileChangeRollsBackOnApplyFailure(t *testing.T) {
 		}
 
 		m := NewModel(dir, opts)
-		// Navigate to Roles Editor (item 3) -> Enter -> edit orchestrator model -> Enter.
+		// Navigate to Roles Editor (item 3) -> Enter -> pick gemini-3.8-flash-high (index 6) in Model Picker -> Enter.
 		for i := 0; i < 3; i++ {
 			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 		}
 		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 		m = sendKey(t, m, keyRune('m'))
-		for i := 0; i < 10; i++ {
-			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+		for i := 0; i < 6; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 		}
-		m = sendText(t, m, "gemini-3.8-flash-high")
 		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 
 		if m.errMsg == "" {
 			t.Fatalf("expected errMsg when manifest is corrupted")
 		}
-		if got := m.profiles.Profiles[m.profiles.ActiveProfile].Roles[config.RoleOrchestrator].Model; got != "inherit" {
-			t.Fatalf("in-memory orchestrator model = %q after failure, want inherit", got)
+		orch := m.profiles.Profiles[m.profiles.ActiveProfile].Roles[config.RoleOrchestrator]
+		if orch.Model != "inherit" || orch.Effort != "" {
+			t.Fatalf("in-memory orchestrator = %+v after failure, want model=inherit effort=\"\"", orch)
 		}
 		afterProfiles, err := os.ReadFile(config.ProfilesPath(dir))
 		if err != nil {
@@ -638,4 +637,281 @@ func TestPersistProfileChangeRollsBackOnApplyFailure(t *testing.T) {
 			t.Fatalf("profiles.json on disk mutated despite corrupted manifest")
 		}
 	})
+}
+
+func TestParseAgyModelsOutputAndLazyCaching(t *testing.T) {
+	raw := strings.Join([]string{
+		"Fetching available models...",
+		"",
+		"gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)",
+		"bad id with spaces\tInvalid",
+		"ctrl\x07char\tInvalid Ctrl",
+		"gemini-3.8-flash-low\tGemini 3.8 Flash (Low)",
+		"no-tab-line",
+	}, "\n")
+	parsed := parseAgyModelsOutput(raw)
+	if len(parsed) != 2 {
+		t.Fatalf("parsed %d models (%+v), want 2", len(parsed), parsed)
+	}
+	if parsed[0].ID != "gemini-4-hydrogen-high" || parsed[0].Label != "Gemini 4 Hydrogen (High)" {
+		t.Fatalf("parsed[0] = %+v", parsed[0])
+	}
+	if parsed[1].ID != "gemini-3.8-flash-low" || parsed[1].Label != "Gemini 3.8 Flash (Low)" {
+		t.Fatalf("parsed[1] = %+v", parsed[1])
+	}
+
+	// Fallback returns known Antigravity models when agy is unavailable.
+	fallback := defaultListAgyModels(func(string) (string, error) {
+		return "", os.ErrNotExist
+	})
+	if len(fallback) != 10 {
+		t.Fatalf("fallback len = %d, want 10", len(fallback))
+	}
+	wantFallbackIDs := []string{
+		"gemini-4-hydrogen-high",
+		"gemini-4-hydrogen-xhigh",
+		"gemini-4-hydrogen-medium",
+		"gemini-4-hydrogen-low",
+		"gemini-3.8-flash-high",
+		"gemini-3.8-flash-medium",
+		"gemini-3.8-flash-low",
+		"claude-sonnet-4-6",
+		"claude-opus-4-6-thinking",
+		"gpt-oss-120b-medium",
+	}
+	for i, id := range wantFallbackIDs {
+		if fallback[i].ID != id {
+			t.Errorf("fallback[%d].ID = %q, want %q", i, fallback[i].ID, id)
+		}
+	}
+
+	// Lazy & cached once per TUI session (NewModel does not call ListAgyModels).
+	dir := t.TempDir()
+	home := t.TempDir()
+	calls := 0
+	opts := testOptions(home, nil, nil)
+	opts.ListAgyModels = func() []AgyModelOption {
+		calls++
+		return []AgyModelOption{
+			{ID: "gemini-3.8-flash-high", Label: "Gemini 3.8 Flash (High)"},
+			{ID: "claude-sonnet-4-6", Label: "Claude Sonnet 4.6"},
+		}
+	}
+	m := NewModel(dir, opts)
+	if calls != 0 {
+		t.Fatalf("NewModel called ListAgyModels %d times, want 0 (must be lazy)", calls)
+	}
+
+	// Open Roles Editor -> open Model Picker twice -> ListAgyModels called once.
+	for i := 0; i < 3; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = sendKey(t, m, keyRune('m'))
+	if calls != 1 {
+		t.Fatalf("ListAgyModels calls after first picker open = %d, want 1", calls)
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	m = sendKey(t, m, keyRune('m'))
+	if calls != 1 {
+		t.Fatalf("ListAgyModels calls after second picker open = %d, want 1 (cached)", calls)
+	}
+}
+
+func TestRolesEditorModelPicker(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	opts := testOptions(home, nil, nil)
+	opts.ListAgyModels = func() []AgyModelOption {
+		return []AgyModelOption{
+			{ID: "gemini-3.8-flash-high", Label: "Gemini 3.8 Flash (High)"},
+			{ID: "gemini-3.8-flash-low", Label: "Gemini 3.8 Flash (Low)"},
+			{ID: "claude-sonnet-4-6", Label: "Claude Sonnet 4.6"},
+		}
+	}
+	if _, err := installer.Init(dir, installer.InitOptions{LookPath: opts.LookPath}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	m := NewModel(dir, opts)
+	// Navigate to Roles Editor (index 3).
+	for i := 0; i < 3; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	rolesView := m.View()
+	if !strings.Contains(rolesView, "default") || !strings.Contains(rolesView, "[m] model") || !strings.Contains(rolesView, "[e] effort") {
+		t.Fatalf("Roles Editor missing effort column or footer hints:\n%s", rolesView)
+	}
+
+	// Pressing Enter on orchestrator opens screenModelPicker.
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	pickerView := m.View()
+	for _, want := range []string{"inherit", "flash", "gemini-3.8-flash-high", "claude-sonnet-4-6", "Custom model ID..."} {
+		if !strings.Contains(pickerView, want) {
+			t.Fatalf("model picker missing %q:\n%s", want, pickerView)
+		}
+	}
+
+	// Pressing Esc cancels without changing model or cursor role.
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if strings.Contains(m.View(), "Custom model ID...") {
+		t.Fatalf("expected Esc to return from model picker to roles editor:\n%s", m.View())
+	}
+	profs, _ := config.LoadProfiles(dir)
+	if got := profs.Profiles[profs.ActiveProfile].Roles[config.RoleOrchestrator].Model; got != "inherit" {
+		t.Fatalf("orchestrator model changed after Esc: %q", got)
+	}
+
+	// Open with 'm' -> pick claude-sonnet-4-6 (index 4: 0=inherit, 1=flash, 2=3.8-high, 3=3.8-low, 4=claude-sonnet-4-6).
+	m = sendKey(t, m, keyRune('m'))
+	for i := 0; i < 4; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	profs, _ = config.LoadProfiles(dir)
+	orch := profs.Profiles[profs.ActiveProfile].Roles[config.RoleOrchestrator]
+	if orch.Model != "claude-sonnet-4-6" || orch.Effort != "" {
+		t.Fatalf("orchestrator after picking claude-sonnet-4-6 = %+v, want model=claude-sonnet-4-6 effort=\"\"", orch)
+	}
+
+	// Re-open with 'm': cursor must pre-position on claude-sonnet-4-6 (index 4); move up 2 to gemini-3.8-flash-high (index 2) and Enter.
+	m = sendKey(t, m, keyRune('m'))
+	if m.cursor != 4 {
+		t.Fatalf("model picker cursor pre-position = %d, want 4 (claude-sonnet-4-6)", m.cursor)
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	profs, _ = config.LoadProfiles(dir)
+	orch = profs.Profiles[profs.ActiveProfile].Roles[config.RoleOrchestrator]
+	if orch.Model != "gemini-3.8-flash-high" || orch.Effort != "high" {
+		t.Fatalf("orchestrator after picking gemini-3.8-flash-high = %+v, want model=gemini-3.8-flash-high effort=high", orch)
+	}
+
+	// Select "Custom model ID..." (last item, index 5) -> opens free-text inputRoleModel.
+	m = sendKey(t, m, keyRune('m'))
+	for i := 0; i < 5; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.inputMode != inputRoleModel {
+		t.Fatalf("expected inputRoleModel after selecting Custom model ID..., got inputMode=%v", m.inputMode)
+	}
+	for i := 0; i < 30; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = sendText(t, m, "my-custom-agy-model")
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	profs, _ = config.LoadProfiles(dir)
+	orch = profs.Profiles[profs.ActiveProfile].Roles[config.RoleOrchestrator]
+	if orch.Model != "my-custom-agy-model" || orch.Effort != "high" {
+		t.Fatalf("orchestrator after custom model = %+v, want model=my-custom-agy-model effort=high preserved", orch)
+	}
+}
+
+func TestRolesEditorEffortPicker(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	opts := testOptions(home, nil, nil)
+	opts.ListAgyModels = func() []AgyModelOption {
+		return []AgyModelOption{
+			{ID: "gemini-3.8-flash-high", Label: "Gemini 3.8 Flash (High)"},
+			{ID: "gemini-3.8-flash-medium", Label: "Gemini 3.8 Flash (Medium)"},
+			{ID: "gemini-3.8-flash-low", Label: "Gemini 3.8 Flash (Low)"},
+			{ID: "claude-sonnet-4-6", Label: "Claude Sonnet 4.6"},
+		}
+	}
+	if _, err := installer.Init(dir, installer.InitOptions{LookPath: opts.LookPath}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Pre-set explore to gemini-3.8-flash-high + effort high.
+	profs, err := config.LoadProfiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ap := profs.Profiles[profs.ActiveProfile]
+	ap.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high", Effort: "high"}
+	profs.Profiles[profs.ActiveProfile] = ap
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewModel(dir, opts)
+	// Navigate to Roles Editor (index 3) -> down to explore (index 1).
+	for i := 0; i < 3; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+
+	// Open Effort Picker with 'e'. Pre-positioned on "high" (index 3: 0=default, 1=low, 2=medium, 3=high, 4=xhigh, 5=max).
+	m = sendKey(t, m, keyRune('e'))
+	ev := m.View()
+	for _, want := range []string{"default", "low", "medium", "high", "xhigh", "max"} {
+		if !strings.Contains(ev, want) {
+			t.Fatalf("effort picker missing %q:\n%s", want, ev)
+		}
+	}
+	if m.cursor != 3 {
+		t.Fatalf("effort picker cursor = %d, want 3 (high)", m.cursor)
+	}
+
+	// Esc cancels without changes.
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	profs, _ = config.LoadProfiles(dir)
+	if got := profs.Profiles[profs.ActiveProfile].Roles["explore"].Effort; got != "high" {
+		t.Fatalf("effort changed after Esc: %q", got)
+	}
+
+	// Open 'e', move up twice to "low" (index 1) and Enter -> switches both Effort="low" AND Model="gemini-3.8-flash-low".
+	m = sendKey(t, m, keyRune('e'))
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	profs, _ = config.LoadProfiles(dir)
+	exp := profs.Profiles[profs.ActiveProfile].Roles["explore"]
+	if exp.Effort != "low" || exp.Model != "gemini-3.8-flash-low" {
+		t.Fatalf("explore after picking low effort = %+v, want effort=low model=gemini-3.8-flash-low", exp)
+	}
+	// Verify agent frontmatter was synced too.
+	expBytes, err := os.ReadFile(filepath.Join(dir, ".agents", "agents", "gentle-ai-explore.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm, _, err := assets.ParseFrontmatter(expBytes)
+	if err != nil || fm.Model != "gemini-3.8-flash-low" {
+		t.Fatalf("gentle-ai-explore.md model = %q (err=%v), want gemini-3.8-flash-low", fm.Model, err)
+	}
+
+	// Pick "max" (not in gemini-3.8-flash-* catalog) -> Effort="max", Model stays "gemini-3.8-flash-low".
+	m = sendKey(t, m, keyRune('e'))
+	for i := 0; i < 4; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	profs, _ = config.LoadProfiles(dir)
+	exp = profs.Profiles[profs.ActiveProfile].Roles["explore"]
+	if exp.Effort != "max" || exp.Model != "gemini-3.8-flash-low" {
+		t.Fatalf("explore after picking max effort = %+v, want effort=max model=gemini-3.8-flash-low", exp)
+	}
+
+	// Toggle explore to external-mcp and pick effort "medium" -> Effort="medium", external model unchanged.
+	m = sendKey(t, m, keyRune('t'))
+	m = sendKey(t, m, keyRune('e'))
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	profs, _ = config.LoadProfiles(dir)
+	exp = profs.Profiles[profs.ActiveProfile].Roles["explore"]
+	if exp.Runtime != config.RuntimeExternalMCP || exp.Effort != "medium" {
+		t.Fatalf("external-mcp explore after picking medium effort = %+v", exp)
+	}
 }

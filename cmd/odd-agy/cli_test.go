@@ -1106,3 +1106,156 @@ func TestLaunchModelInjectionEdgeCases(t *testing.T) {
 	}
 }
 
+func TestLaunchEffortInjectionAndProfileShow(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	origLookPath := lookPath
+	origRunner := runExternalCmd
+	defer func() {
+		lookPath = origLookPath
+		runExternalCmd = origRunner
+	}()
+
+	var gotArgs []string
+	lookPath = func(bin string) (string, error) {
+		if bin == "agy" {
+			return "/usr/local/bin/agy", nil
+		}
+		return "", errors.New("not found")
+	}
+	runExternalCmd = func(_ string, _ io.Reader, _, _ io.Writer, _ string, args ...string) int {
+		gotArgs = append([]string(nil), args...)
+		return 0
+	}
+
+	code, _, errOut := runCLI(t, dir, "init")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+	absSettings, err := filepath.Abs(installer.SessionSettingsPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set orchestrator model=claude-sonnet-4-6, effort=high.
+	profs, err := config.LoadProfiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := profs.Profiles[profs.ActiveProfile]
+	active.Roles[config.RoleOrchestrator] = config.RoleRoute{
+		Runtime: config.RuntimeAgyNative,
+		Model:   "claude-sonnet-4-6",
+		Effort:  "high",
+	}
+	w := active.Roles["worker"]
+	w.Effort = "xhigh"
+	active.Roles["worker"] = w
+	profs.Profiles[profs.ActiveProfile] = active
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. profile show includes effort=<val> only for roles with non-empty effort.
+	code, showOut, errOut := runCLI(t, dir, "profile", "show")
+	if code != 0 || errOut != "" {
+		t.Fatalf("profile show => code=%d err=%q", code, errOut)
+	}
+	if !strings.Contains(showOut, "effort=high") || !strings.Contains(showOut, "effort=xhigh") {
+		t.Fatalf("profile show missing effort=<val>:\n%s", showOut)
+	}
+	for _, line := range strings.Split(showOut, "\n") {
+		if strings.Contains(line, "explore ") && strings.Contains(line, "effort=") {
+			t.Fatalf("explore has empty effort and should not print effort=: %q", line)
+		}
+	}
+
+	// 2. Default launch injects --model and --effort.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch => code=%d err=%q", code, errOut)
+	}
+	wantBoth := []string{"--agent", "odd-orchestrator", "--model", "claude-sonnet-4-6", "--effort", "high", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantBoth) {
+		t.Fatalf("launch args = %v, want %v", gotArgs, wantBoth)
+	}
+
+	// 3. Explicit --model suppresses --model injection but still injects --effort.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--", "--model", "flash")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch -- --model flash => code=%d err=%q", code, errOut)
+	}
+	wantEffortOnly := []string{"--agent", "odd-orchestrator", "--effort", "high", "--settings", absSettings, "--model", "flash"}
+	if !reflect.DeepEqual(gotArgs, wantEffortOnly) {
+		t.Fatalf("launch with explicit --model args = %v, want %v", gotArgs, wantEffortOnly)
+	}
+
+	// 4. Explicit --effort <val> suppresses --effort injection (still injects --model).
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--", "--effort", "low")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch -- --effort low => code=%d err=%q", code, errOut)
+	}
+	wantModelOnly := []string{"--agent", "odd-orchestrator", "--model", "claude-sonnet-4-6", "--settings", absSettings, "--effort", "low"}
+	if !reflect.DeepEqual(gotArgs, wantModelOnly) {
+		t.Fatalf("launch with explicit --effort args = %v, want %v", gotArgs, wantModelOnly)
+	}
+
+	// 5. Explicit --effort=<val> suppresses --effort injection.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--", "--effort=medium")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch -- --effort=medium => code=%d err=%q", code, errOut)
+	}
+	wantExplicitEq := []string{"--agent", "odd-orchestrator", "--model", "claude-sonnet-4-6", "--settings", absSettings, "--effort=medium"}
+	if !reflect.DeepEqual(gotArgs, wantExplicitEq) {
+		t.Fatalf("launch with --effort= args = %v, want %v", gotArgs, wantExplicitEq)
+	}
+
+	// 6. --no-agent suppresses --effort injection.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--no-agent")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch --no-agent => code=%d err=%q", code, errOut)
+	}
+	wantNoAgent := []string{"--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantNoAgent) {
+		t.Fatalf("launch --no-agent args = %v, want %v", gotArgs, wantNoAgent)
+	}
+
+	// 7. Custom --agent=<other> suppresses --effort injection.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--agent=custom-agent")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch --agent=custom-agent => code=%d err=%q", code, errOut)
+	}
+	wantCustom := []string{"--agent", "custom-agent", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantCustom) {
+		t.Fatalf("launch --agent=custom-agent args = %v, want %v", gotArgs, wantCustom)
+	}
+
+	// 8. Empty orchestrator effort suppresses --effort injection.
+	active.Roles[config.RoleOrchestrator] = config.RoleRoute{
+		Runtime: config.RuntimeAgyNative,
+		Model:   "inherit",
+		Effort:  "",
+	}
+	profs.Profiles[profs.ActiveProfile] = active
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatal(err)
+	}
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch empty effort => code=%d err=%q", code, errOut)
+	}
+	wantDefault := []string{"--agent", "odd-orchestrator", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantDefault) {
+		t.Fatalf("launch empty effort args = %v, want %v", gotArgs, wantDefault)
+	}
+}
+
