@@ -63,10 +63,12 @@ type Model struct {
 	cwd  string
 	opts Options
 
-	cfg              config.Config
-	profiles         config.ProfilesConfig
-	installed        bool
-	globalMCPAllowed bool
+	cfg                 config.Config
+	profiles            config.ProfilesConfig
+	installed           bool
+	globalMCPAllowed    bool
+	globalMCPRegistered bool
+	globalMCPCommand    string
 
 	screen        screenKind
 	cursor        int
@@ -143,6 +145,13 @@ func (m *Model) reload() {
 		m.globalMCPAllowed = allowed
 	} else {
 		m.globalMCPAllowed = false
+	}
+	if registered, cmd, err := installer.GlobalMCPServerRegistered(m.opts.HomeDir); err == nil {
+		m.globalMCPRegistered = registered
+		m.globalMCPCommand = cmd
+	} else {
+		m.globalMCPRegistered = false
+		m.globalMCPCommand = ""
 	}
 
 	cfg, err := config.LoadConfig(m.cwd)
@@ -818,28 +827,30 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 		m.errMsg = ""
 		m.statusMsg = "Confirm uninstall of managed .agents/ files"
 
-	case 4: // Toggle global MCP permissions (~/.gemini/antigravity-cli/settings.json)
-		if m.globalMCPAllowed {
-			res, err := installer.RevokeGlobalMCPPermissions(m.opts.HomeDir)
+	case 4: // Toggle global MCP permissions + registration (~/.gemini/)
+		if m.globalMCPAllowed && m.globalMCPRegistered {
+			permRes, regRes, err := installer.DisableGlobalMCP(m.opts.HomeDir)
 			if err != nil {
+				m.reload()
 				m.errMsg = err.Error()
 				return m, nil
 			}
 			m.reload()
 			m.errMsg = ""
-			m.statusMsg = fmt.Sprintf("Revoked global MCP permission (%s)", res.SettingsPath)
+			m.statusMsg = fmt.Sprintf("Revoked global MCP permission & registration (%s, %s)", permRes.SettingsPath, regRes.ConfigPath)
 		} else {
-			res, err := installer.GrantGlobalMCPPermissions(m.opts.HomeDir)
+			permRes, regRes, err := installer.EnableGlobalMCP(m.opts.HomeDir, installer.ResolveBinaryPath(""))
 			if err != nil {
+				m.reload()
 				m.errMsg = err.Error()
 				return m, nil
 			}
 			m.reload()
 			m.errMsg = ""
-			if res.BackupPath != "" {
-				m.statusMsg = fmt.Sprintf("Allowed MCP globally (backup: %s)", res.BackupPath)
+			if permRes.BackupPath != "" || regRes.BackupPath != "" {
+				m.statusMsg = fmt.Sprintf("Allowed & registered MCP globally (backups created; %s, %s)", permRes.SettingsPath, regRes.ConfigPath)
 			} else {
-				m.statusMsg = fmt.Sprintf("Allowed MCP globally (%s)", res.SettingsPath)
+				m.statusMsg = fmt.Sprintf("Allowed & registered MCP globally (%s, %s)", permRes.SettingsPath, regRes.ConfigPath)
 			}
 		}
 	}

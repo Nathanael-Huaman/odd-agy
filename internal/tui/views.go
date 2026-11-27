@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
+	"github.com/Nathanael-Huaman/odd-agy/internal/installer"
 	"github.com/Nathanael-Huaman/odd-agy/internal/llm"
 	"github.com/Nathanael-Huaman/odd-agy/internal/version"
 )
@@ -265,8 +266,8 @@ func (m Model) renderProviders(b *strings.Builder) {
 
 func (m Model) renderActions(b *strings.Builder) {
 	globalMCPAction := "Allow MCP globally (~/.gemini)"
-	if m.globalMCPAllowed {
-		globalMCPAction = "Revoke global MCP rule"
+	if m.globalMCPAllowed && m.globalMCPRegistered {
+		globalMCPAction = "Revoke global MCP rule & registration"
 	}
 	actions := []string{
 		"Init (.agents/)",
@@ -280,6 +281,19 @@ func (m Model) renderActions(b *strings.Builder) {
 		b.WriteString(renderCursorLine(i == m.cursor, act))
 		b.WriteByte('\n')
 	}
+
+	b.WriteByte('\n')
+	permState := "disabled"
+	if m.globalMCPAllowed {
+		permState = "enabled"
+	}
+	regState := "not registered"
+	if m.globalMCPRegistered {
+		regState = fmt.Sprintf("registered (command=%s)", m.globalMCPCommand)
+	}
+	b.WriteString("Global ~/.gemini/ Status:\n")
+	b.WriteString(fmt.Sprintf("  Permissions (%s): %s\n", installer.GlobalSettingsPath(m.opts.HomeDir), permState))
+	b.WriteString(fmt.Sprintf("  MCP server  (%s): %s\n", installer.GlobalMCPConfigPath(m.opts.HomeDir), regState))
 
 	if m.doctorReport != nil {
 		b.WriteByte('\n')

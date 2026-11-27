@@ -550,7 +550,7 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 		t.Fatalf("permissions status => code=%d out=%q err=%q", code, out, errOut)
 	}
 
-	// init --allow-mcp grants global MCP rules.
+	// init --allow-mcp grants global MCP permissions AND registers global MCP server.
 	code, out, errOut = runCLI(t, dir, "init", "--allow-mcp")
 	if code != 0 || errOut != "" || !strings.Contains(out, "globalMCP=enabled") {
 		t.Fatalf("init --allow-mcp => code=%d out=%q err=%q", code, out, errOut)
@@ -559,14 +559,18 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 	if err != nil || !enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after init --allow-mcp = (%t, %v)", enabled, err)
 	}
+	reg, cmd, err := installer.GlobalMCPServerRegistered(fakeHome)
+	if err != nil || !reg || cmd == "" {
+		t.Fatalf("GlobalMCPServerRegistered after init --allow-mcp = (%t, %q, %v)", reg, cmd, err)
+	}
 
-	// permissions status reports enabled.
+	// permissions status reports both enabled and registered.
 	code, out, errOut = runCLI(t, dir, "permissions", "status")
-	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") {
+	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") || !strings.Contains(out, "registered") {
 		t.Fatalf("permissions status enabled => code=%d out=%q err=%q", code, out, errOut)
 	}
 
-	// permissions revoke-mcp removes rules.
+	// permissions revoke-mcp removes both rules and registration (PRESERVE).
 	code, out, errOut = runCLI(t, dir, "permissions", "revoke-mcp")
 	if code != 0 || errOut != "" || !strings.Contains(out, "revoked") {
 		t.Fatalf("permissions revoke-mcp => code=%d out=%q err=%q", code, out, errOut)
@@ -575,8 +579,12 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 	if err != nil || enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after revoke-mcp = (%t, %v)", enabled, err)
 	}
+	reg, _, err = installer.GlobalMCPServerRegistered(fakeHome)
+	if err != nil || reg {
+		t.Fatalf("GlobalMCPServerRegistered after revoke-mcp = (%t, %v)", reg, err)
+	}
 
-	// permissions allow-mcp re-grants rules.
+	// permissions allow-mcp re-grants both (PRESERVE).
 	code, out, errOut = runCLI(t, dir, "permissions", "allow-mcp")
 	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") {
 		t.Fatalf("permissions allow-mcp => code=%d out=%q err=%q", code, out, errOut)
@@ -584,6 +592,40 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 	enabled, err = installer.CheckGlobalMCPPermissions(fakeHome)
 	if err != nil || !enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after allow-mcp = (%t, %v)", enabled, err)
+	}
+	reg, _, err = installer.GlobalMCPServerRegistered(fakeHome)
+	if err != nil || !reg {
+		t.Fatalf("GlobalMCPServerRegistered after allow-mcp = (%t, %v)", reg, err)
+	}
+
+	// permissions disable & enable --binary=<path>.
+	code, out, errOut = runCLI(t, dir, "permissions", "disable")
+	if code != 0 || errOut != "" || !strings.Contains(out, "revoked") {
+		t.Fatalf("permissions disable => code=%d out=%q err=%q", code, out, errOut)
+	}
+	if enabled, _ := installer.CheckGlobalMCPPermissions(fakeHome); enabled {
+		t.Fatalf("expected permissions disabled after disable")
+	}
+	if reg, _, _ := installer.GlobalMCPServerRegistered(fakeHome); reg {
+		t.Fatalf("expected MCP unregistered after disable")
+	}
+
+	code, out, errOut = runCLI(t, dir, "permissions", "enable", "--binary=/custom/odd-agy")
+	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") || !strings.Contains(out, "/custom/odd-agy") {
+		t.Fatalf("permissions enable --binary => code=%d out=%q err=%q", code, out, errOut)
+	}
+	if enabled, _ := installer.CheckGlobalMCPPermissions(fakeHome); !enabled {
+		t.Fatalf("expected permissions enabled after enable")
+	}
+	if reg, regCmd, _ := installer.GlobalMCPServerRegistered(fakeHome); !reg || regCmd != "/custom/odd-agy" {
+		t.Fatalf("GlobalMCPServerRegistered after enable --binary = (%t, %q), want (true, /custom/odd-agy)", reg, regCmd)
+	}
+
+	// permissions status reports disabled when unregistered.
+	_, _, _ = runCLI(t, dir, "permissions", "disable")
+	code, out, errOut = runCLI(t, dir, "permissions", "status")
+	if code != 0 || errOut != "" || !strings.Contains(out, "disabled") || !strings.Contains(out, "unregistered") {
+		t.Fatalf("permissions status disabled => code=%d out=%q err=%q", code, out, errOut)
 	}
 
 	// Invalid permissions subcommand exits 2.
@@ -1373,6 +1415,169 @@ func TestProfileTestAndProvidersUseStoredSecrets(t *testing.T) {
 	if strings.Contains(out, storedSecret) {
 		t.Fatalf("profile test leaked stored secret: %q", out)
 	}
+}
+
+func TestLaunchWarnsWhenExternalMCPActiveAndUnregistered(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	origLookPath := lookPath
+	origRunner := runExternalCmd
+	defer func() {
+		lookPath = origLookPath
+		runExternalCmd = origRunner
+	}()
+	lookPath = func(bin string) (string, error) {
+		if bin == "agy" {
+			return "/usr/local/bin/agy", nil
+		}
+		return "", errors.New("not found")
+	}
+	runExternalCmd = func(_ string, _ io.Reader, _, _ io.Writer, _ string, _ ...string) int {
+		return 0
+	}
+
+	code, _, errOut := runCLI(t, dir, "init", "--profile=deepseek-hybrid")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+
+	// Unregistered external-mcp profile emits single helpful note to stderr before launching agy.
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 {
+		t.Fatalf("launch => code=%d err=%q", code, errOut)
+	}
+	wantNote := `note: active profile "deepseek-hybrid" uses external-mcp roles, but "odd-agy" is not registered in ~/.gemini/config/mcp_config.json. Run "odd-agy permissions enable" or "agy mcp add odd-agy odd-agy mcp" first.` + "\n"
+	if errOut != wantNote {
+		t.Fatalf("launch warning stderr = %q, want %q", errOut, wantNote)
+	}
+
+	// Registering odd-agy silences the warning.
+	if _, err := installer.RegisterGlobalMCPServer(fakeHome, "odd-agy"); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch after registration => code=%d err=%q (want empty stderr)", code, errOut)
+	}
+
+	// Malformed global mcp_config.json (err != nil) still emits the stderr note.
+	mcpPath := installer.GlobalMCPConfigPath(fakeHome)
+	if err := os.WriteFile(mcpPath, []byte(`{"mcpServers": `), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 {
+		t.Fatalf("launch with invalid mcp_config.json => code=%d err=%q", code, errOut)
+	}
+	if errOut != wantNote {
+		t.Fatalf("launch warning stderr on invalid mcp_config.json = %q, want %q", errOut, wantNote)
+	}
+}
+
+func TestPermissionsRejectedSymlinkLeavesSettingsUnchanged(t *testing.T) {
+	t.Run("enable_mcp_config_symlink_leaves_settings_unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+
+		settingsPath := installer.GlobalSettingsPath(fakeHome)
+		if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		const settingsOrig = "{\n  \"theme\": \"dark\"\n}\n"
+		if err := os.WriteFile(settingsPath, []byte(settingsOrig), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		outside := t.TempDir()
+		outsideMCP := filepath.Join(outside, "outside-mcp.json")
+		const mcpSentinel = `{"mcpServers":{"keep":{"command":"x"}}}` + "\n"
+		if err := os.WriteFile(outsideMCP, []byte(mcpSentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mcpPath := installer.GlobalMCPConfigPath(fakeHome)
+		if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideMCP, mcpPath); err != nil {
+			t.Fatal(err)
+		}
+
+		code, _, errOut := runCLI(t, dir, "permissions", "enable")
+		if code != exitError || errOut == "" {
+			t.Fatalf("permissions enable with mcp_config.json symlink => code=%d err=%q, want exitError", code, errOut)
+		}
+		if got, _ := os.ReadFile(settingsPath); string(got) != settingsOrig {
+			t.Fatalf("settings.json mutated despite mcp_config.json symlink rejection:\ngot:\n%s\nwant:\n%s", string(got), settingsOrig)
+		}
+		if matches, _ := filepath.Glob(settingsPath + ".odd-agy.bak.*"); len(matches) != 0 {
+			t.Fatalf("unexpected settings backups created: %v", matches)
+		}
+		if got, _ := os.ReadFile(outsideMCP); string(got) != mcpSentinel {
+			t.Fatalf("external symlink target mutated: %q", string(got))
+		}
+	})
+
+	t.Run("disable_mcp_config_symlink_leaves_settings_unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+
+		if _, err := installer.GrantGlobalMCPPermissions(fakeHome); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := installer.GlobalSettingsPath(fakeHome)
+		settingsOrig, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		outside := t.TempDir()
+		outsideMCP := filepath.Join(outside, "outside-mcp.json")
+		const mcpSentinel = `{"mcpServers":{"odd-agy":{"command":"odd-agy","args":["mcp"],"disabled":false}}}` + "\n"
+		if err := os.WriteFile(outsideMCP, []byte(mcpSentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mcpPath := installer.GlobalMCPConfigPath(fakeHome)
+		if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideMCP, mcpPath); err != nil {
+			t.Fatal(err)
+		}
+
+		code, _, errOut := runCLI(t, dir, "permissions", "disable")
+		if code != exitError || errOut == "" {
+			t.Fatalf("permissions disable with mcp_config.json symlink => code=%d err=%q, want exitError", code, errOut)
+		}
+		if got, _ := os.ReadFile(settingsPath); !bytes.Equal(got, settingsOrig) {
+			t.Fatalf("settings.json mutated despite mcp_config.json symlink rejection:\ngot:\n%s\nwant:\n%s", string(got), string(settingsOrig))
+		}
+		if got, _ := os.ReadFile(outsideMCP); string(got) != mcpSentinel {
+			t.Fatalf("external symlink target mutated: %q", string(got))
+		}
+	})
+
+	t.Run("enable_gemini_dir_symlink_rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+
+		outside := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(fakeHome, ".gemini")); err != nil {
+			t.Fatal(err)
+		}
+
+		code, _, errOut := runCLI(t, dir, "permissions", "enable")
+		if code != exitError || errOut == "" {
+			t.Fatalf("permissions enable with ~/.gemini symlink => code=%d err=%q, want exitError", code, errOut)
+		}
+		if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+			t.Fatalf("writes escaped through ~/.gemini symlink: %v", entries)
+		}
+	})
 }
 
 
