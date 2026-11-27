@@ -72,6 +72,22 @@ func isVerifierRole(role string) bool {
 	return strings.ToLower(strings.TrimSpace(role)) == "gentle-ai-verify"
 }
 
+func profileRoleForSubagent(agentName string) string {
+	switch strings.ToLower(strings.TrimSpace(agentName)) {
+	case "gentle-ai-explore", "explore":
+		return "explore"
+	case "gentle-ai-worker", "worker":
+		return "worker"
+	case "gentle-ai-verify", "verify":
+		return "verify"
+	case "jd-judge-a", "jd-judge-b", "jd-fix-agent",
+		"review-risk", "review-resilience", "review-readability", "review-reliability", "review-refuter":
+		return strings.ToLower(strings.TrimSpace(agentName))
+	default:
+		return ""
+	}
+}
+
 func isBranchWorkspace(ws string) bool {
 	return strings.EqualFold(strings.TrimSpace(ws), "branch")
 }
@@ -91,6 +107,34 @@ func checkInvokeSubagent(workspace string, cfg config.Config, in PreToolUseInput
 			Decision: DecisionDeny,
 			Reason:   "invoke_subagent requires a non-empty Subagents array",
 		}, nil
+	}
+
+	if profs, err := config.LoadProfiles(workspace); err == nil {
+		if pf, ok := profs.Profiles[profs.ActiveProfile]; ok {
+			for _, entry := range entries {
+				profileRole := profileRoleForSubagent(entry.effectiveRole())
+				if profileRole == "" {
+					continue
+				}
+				ra, ok := pf.Roles[profileRole]
+				if !ok || ra.Runtime != config.RuntimeExternalMCP {
+					continue
+				}
+				if strings.Contains(strings.ToLower(entry.Prompt), "fallback_to_native") {
+					continue
+				}
+				model := ra.Model
+				if model == "" {
+					if prov, hasProv := profs.Providers[ra.Provider]; hasProv {
+						model = prov.DefaultModel
+					}
+				}
+				return PreToolUseOutput{
+					Decision: DecisionDeny,
+					Reason:   fmt.Sprintf("Active profile %q routes role %q to external-mcp (%s/%s). Call MCP tool odd-agy/odd_external_run with role=%q instead of invoke_subagent (only fall back to native invoke_subagent after odd_external_run returns fallback_to_native and mention fallback_to_native in the prompt).", profs.ActiveProfile, profileRole, ra.Provider, model, profileRole),
+				}, nil
+			}
+		}
 	}
 
 	type parsedWriter struct {
