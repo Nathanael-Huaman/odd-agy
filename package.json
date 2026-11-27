@@ -17,9 +17,10 @@
   ],
   "scripts": {
     "build": "node scripts/build-binaries.mjs",
-    "test": "pnpm run test:go && pnpm run test:wrapper",
-    "test:go": "go test -v ./...",
-    "test:wrapper": "go test -v ./cmd/odd-agy -run TestWrapper"
+    "test": "go test -count=1 ./... && node scripts/build-binaries.mjs && node bin/odd-agy.mjs --version",
+    "test:go": "go test -count=1 ./...",
+    "test:wrapper": "go test -v ./cmd/odd-agy -run TestWrapper",
+    "test:e2e": "go test -v -count=1 ./tests/e2e/..."
   },
   "keywords": [
     "antigravity",

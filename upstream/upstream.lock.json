@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-04-20T00:00:00Z",
+  "repos": [
+    {
+      "name": "Gentleman-Programming/gentle-shell",
+      "ref": "v5.0.0",
+      "rawBaseUrl": "https://raw.githubusercontent.com/Gentleman-Programming/gentle-shell",
+      "apiBaseUrl": "https://api.github.com/repos/Gentleman-Programming/gentle-shell"
+    },
+    {
+      "name": "Gentleman-Programming/gentle-ai",
+      "ref": "v5.0.0",
+      "rawBaseUrl": "https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai",
+      "apiBaseUrl": "https://api.github.com/repos/Gentleman-Programming/gentle-ai"
+    }
+  ],
+  "entries": [
+    {
+      "id": "gentle-shell-orchestrator",
+      "repo": "Gentleman-Programming/gentle-shell",
+      "path": "assets/orchestrator.md",
+      "category": "prompts-and-skills",
+      "sha256": "sha256:6b21a508f3d28ef9a9660a56fd3cb63150e2df3f8d77a580aa04a0f8f478d6a1",
+      "localTargets": [
+        "internal/assets/files/rules/odd-01-core.md",
+        "internal/assets/files/rules/odd-02-orchestrator.md"
+      ]
+    },
+    {
+      "id": "gentle-shell-full-delegation-card",
+      "repo": "Gentleman-Programming/gentle-shell",
+      "path": "assets/orchestrator-full-delegation-card.md",
+      "category": "prompts-and-skills",
+      "sha256": "sha256:9f76c74a4d4c8c9c7f8fb9a06ec4b3f74d44c54cc3cb77f7d99ef53c8824c1b2",
+      "localTargets": [
+        "internal/assets/files/rules/odd-02-orchestrator.md",
+        "internal/assets/files/agents/odd-orchestrator.md"
+      ]
+    },
+    {
+      "id": "gentle-shell-agents",
+      "repo": "Gentleman-Programming/gentle-shell",
+      "path": "assets/agents/",
+      "category": "prompts-and-skills",
+      "sha256": "sha256:7d14d6321ec3422b180e8f53f4cb2f9397c46f6b4b09b57482f1fd0d0f3a9e8c",
+      "localTargets": [
+        "internal/assets/files/agents/"
+      ]
+    },
+    {
+      "id": "gentle-shell-skills",
+      "repo": "Gentleman-Programming/gentle-shell",
+      "path": "skills/",
+      "category": "prompts-and-skills",
+      "sha256": "sha256:2f5b102612b1653c8be8b6a35e9d33e231ec33e3457b47154ff92f20b1514d43",
+      "localTargets": [
+        "internal/assets/files/skills/"
+      ]
+    },
+    {
+      "id": "gentle-shell-bounded-writer-admission",
+      "repo": "Gentleman-Programming/gentle-shell",
+      "path": "lib/bounded-writer-admission.ts",
+      "category": "enforcement-code",
+      "sha256": "sha256:3c979b80963e9f9d60f47b7d42989e895f3c86f6b48272b85016cb82f04e84c5",
+      "localTargets": [
+        "internal/hooks/admission.go"
+      ]
+    },
+    {
+      "id": "gentle-shell-verifier-admission",
+      "repo": "Gentleman-Programming/gentle-shell",
+      "path": "lib/verifier-admission.ts",
+      "category": "enforcement-code",
+      "sha256": "sha256:4d1130e19184d7280d7e39321b55240cb99a742b5b6b593c828f141fb18a4319",
+      "localTargets": [
+        "internal/hooks/admission.go"
+      ]
+    },
+    {
+      "id": "gentle-ai-review-provider-contract",
+      "repo": "Gentleman-Programming/gentle-ai",
+      "path": "contracts/review-provider-contract-mirror/",
+      "category": "enforcement-code",
+      "sha256": "sha256:8e5a7c0b7a4b929d3f3c7e5b68913a9b3556d3c1a2e711f48e2964f9d7392e0b",
+      "localTargets": [
+        "internal/rdd/engine.go",
+        "internal/mcp/server.go"
+      ]
+    }
+  ]
+}

@@ -7,5 +7,5 @@ func main() {
 	if err != nil {
 		cwd = "."
 	}
-	os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr, cwd))
+	os.Exit(RunWithIO(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, cwd))
 }
