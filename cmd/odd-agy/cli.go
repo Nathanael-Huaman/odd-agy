@@ -321,6 +321,7 @@ func runUninstall(args []string, stdout, stderr io.Writer, cwd string) int {
 
 func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd string) int {
 	agentName := "odd-orchestrator"
+	agentExplicit := false
 	noAgent := false
 	var extraArgs []string
 
@@ -344,10 +345,16 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 				return exitUsage
 			}
 			agentName = val
+			agentExplicit = true
 			i = nextIdx
 			continue
 		}
 		fmt.Fprintf(stderr, "odd-agy launch: unknown or unexpected argument %q (pass extra agy args after '--')\n", arg)
+		return exitUsage
+	}
+
+	if noAgent && agentExplicit {
+		fmt.Fprintf(stderr, "odd-agy launch: --agent and --no-agent cannot be used together\n")
 		return exitUsage
 	}
 

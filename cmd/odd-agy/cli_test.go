@@ -595,3 +595,51 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 		t.Fatalf("help missing new commands:\n%s", helpOut)
 	}
 }
+
+func TestLaunchRejectsConflictingAgentAndNoAgentFlags(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	origLookPath := lookPath
+	origRunner := runExternalCmd
+	defer func() {
+		lookPath = origLookPath
+		runExternalCmd = origRunner
+	}()
+
+	called := false
+	lookPath = func(bin string) (string, error) {
+		if bin == "agy" {
+			return "/usr/local/bin/agy", nil
+		}
+		return "", errors.New("not found")
+	}
+	runExternalCmd = func(_ string, _ io.Reader, _, _ io.Writer, _ string, _ ...string) int {
+		called = true
+		return 0
+	}
+
+	code, _, errOut := runCLI(t, dir, "init")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+
+	cases := [][]string{
+		{"launch", "--agent", "custom", "--no-agent"},
+		{"launch", "--no-agent", "--agent=custom"},
+	}
+	for _, args := range cases {
+		called = false
+		code, out, errOut := runCLI(t, dir, args...)
+		if code != exitUsage {
+			t.Fatalf("args %v => code=%d (out=%q err=%q), want exitUsage=%d", args, code, out, errOut, exitUsage)
+		}
+		if !strings.Contains(errOut, "--agent") || !strings.Contains(errOut, "--no-agent") {
+			t.Fatalf("args %v => stderr=%q, want clear conflicting flags message", args, errOut)
+		}
+		if called {
+			t.Fatalf("args %v => agy must NOT be invoked when flags conflict", args)
+		}
+	}
+}

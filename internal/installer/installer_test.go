@@ -1078,3 +1078,78 @@ func TestGlobalMCPPermissionsGrantCheckAndRevoke(t *testing.T) {
 		t.Fatalf("expected empty permissions key pruned on fresh revoke, got %#v", freshDoc)
 	}
 }
+
+func TestGlobalMCPPermissionsInvalidSettingsRemainByteIdentical(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "malformed_json",
+			raw:  `{"theme": "dark", "permissions": `,
+		},
+		{
+			name: "non_object_permissions",
+			raw:  "{\n  \"theme\": \"dark\",\n  \"permissions\": \"invalid\"\n}\n",
+		},
+		{
+			name: "non_array_permissions_allow",
+			raw:  "{\n  \"theme\": \"dark\",\n  \"permissions\": {\n    \"allow\": {\"mcp\": true}\n  }\n}\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeHome := t.TempDir()
+			settingsPath := GlobalSettingsPath(fakeHome)
+			if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(settingsPath, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := GrantGlobalMCPPermissions(fakeHome); err == nil {
+				t.Fatalf("expected GrantGlobalMCPPermissions to fail on %s", tc.name)
+			}
+			afterGrant, err := os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(afterGrant) != tc.raw {
+				t.Fatalf("Grant modified invalid settings.json:\ngot:\n%s\nwant:\n%s", afterGrant, tc.raw)
+			}
+
+			if _, err := RevokeGlobalMCPPermissions(fakeHome); err == nil {
+				t.Fatalf("expected RevokeGlobalMCPPermissions to fail on %s", tc.name)
+			}
+			afterRevoke, err := os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(afterRevoke) != tc.raw {
+				t.Fatalf("Revoke modified invalid settings.json:\ngot:\n%s\nwant:\n%s", afterRevoke, tc.raw)
+			}
+
+			if _, err := CheckGlobalMCPPermissions(fakeHome); err == nil {
+				t.Fatalf("expected CheckGlobalMCPPermissions to fail on %s", tc.name)
+			}
+			afterCheck, err := os.ReadFile(settingsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(afterCheck) != tc.raw {
+				t.Fatalf("Check modified invalid settings.json:\ngot:\n%s\nwant:\n%s", afterCheck, tc.raw)
+			}
+
+			// Also verify no backup files were created on failed Grant.
+			matches, err := filepath.Glob(settingsPath + ".odd-agy.bak.*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(matches) != 0 {
+				t.Fatalf("expected no backup files on failed Grant, got %v", matches)
+			}
+		})
+	}
+}
