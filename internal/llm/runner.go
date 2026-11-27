@@ -967,6 +967,7 @@ func (r *Runner) toolRunShell(role string, allowedSurfaces []string, command str
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = r.repoRoot
+	cmd.Env = sanitizedShellEnv()
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -990,6 +991,23 @@ func (r *Runner) toolRunShell(role string, allowedSurfaces []string, command str
 		"exitCode": exitCode,
 		"output":   out,
 	})
+}
+
+var allowedShellEnvVars = map[string]bool{
+	"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+	"LANG": true, "TERM": true, "TZ": true, "GOPATH": true, "GOMODCACHE": true,
+	"GOCACHE": true, "GOROOT": true, "NODE_ENV": true, "PNPM_HOME": true,
+	"NO_COLOR": true, "CI": true, "TMPDIR": true,
+}
+
+func sanitizedShellEnv() []string {
+	out := make([]string, 0)
+	for _, entry := range os.Environ() {
+		if k, _, ok := strings.Cut(entry, "="); ok && (allowedShellEnvVars[k] || strings.HasPrefix(k, "LC_")) {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 func (r *Runner) toolWriteFile(allowedSurfaces []string, rel, content string) string {
@@ -1401,6 +1419,9 @@ func extractCommandSubstitutions(s string) ([]string, error) {
 		if inSingle {
 			continue
 		}
+		if ch == '$' || ch == '`' {
+			return nil, fmt.Errorf("blocked shell expansion %q", ch)
+		}
 		if ch == '`' {
 			end := i + 1
 			for end < len(s) {
@@ -1651,70 +1672,31 @@ func validateShellSegment(role string, allowedSurfaces []string, repoRoot, realR
 		return nil
 	}
 
-	// 2. Skip leading VAR=VALUE assignments (while still validating path-like RHS values).
+	// 2. Reject leading VAR=VALUE assignments and unwrap `command` prefix.
 	idx := 0
-	for idx < len(seg.words) && isEnvAssignment(seg.words[idx]) {
-		if eq := strings.IndexByte(seg.words[idx], '='); eq >= 0 {
-			varName := seg.words[idx][:eq]
-			rhs := seg.words[idx][eq+1:]
-			allowEnvTemp := varName == "TMPDIR" || varName == "TMP" || varName == "TEMP"
-			if err := validateShellArgPath(repoRoot, realRoot, rhs, allowEnvTemp); err != nil {
-				return err
-			}
-		}
+	for idx < len(seg.words) && filepath.Base(seg.words[idx]) == "command" {
 		idx++
+		for idx < len(seg.words) && strings.HasPrefix(seg.words[idx], "-") {
+			idx++
+		}
 	}
 	if idx >= len(seg.words) {
 		return nil
 	}
-
-	// Unwrap `command` / `env` prefixes.
-	for idx < len(seg.words) {
-		base := filepath.Base(seg.words[idx])
-		if base == "command" {
-			idx++
-			continue
-		}
-		if base == "env" {
-			idx++
-			for idx < len(seg.words) && (strings.HasPrefix(seg.words[idx], "-") || isEnvAssignment(seg.words[idx])) {
-				if isEnvAssignment(seg.words[idx]) {
-					if eq := strings.IndexByte(seg.words[idx], '='); eq >= 0 {
-						varName := seg.words[idx][:eq]
-						rhs := seg.words[idx][eq+1:]
-						allowEnvTemp := varName == "TMPDIR" || varName == "TMP" || varName == "TEMP"
-						if err := validateShellArgPath(repoRoot, realRoot, rhs, allowEnvTemp); err != nil {
-							return err
-						}
-					}
-				}
-				idx++
-			}
-			continue
-		}
-		break
-	}
-	if idx >= len(seg.words) {
-		return nil
+	if isEnvAssignment(seg.words[idx]) {
+		return fmt.Errorf("blocked shell variable assignment %q", seg.words[idx])
 	}
 
 	cmdWord := seg.words[idx]
 	cmdBase := filepath.Base(cmdWord)
 	args := seg.words[idx+1:]
 
-	if cmdBase == "eval" {
-		return validateShellCommandDepth(role, allowedSurfaces, repoRoot, strings.Join(args, " "), depth+1)
-	}
-
-	// Nested shell invocation (`sh -c ...`, `bash -c ...`, `zsh -c ...`).
-	if cmdBase == "sh" || cmdBase == "bash" || cmdBase == "zsh" || cmdBase == "dash" {
-		for i := 0; i < len(args); i++ {
-			if args[i] == "-c" && i+1 < len(args) {
-				if err := validateShellCommandDepth(role, allowedSurfaces, repoRoot, args[i+1], depth+1); err != nil {
-					return err
-				}
-			}
-		}
+	switch cmdBase {
+	case "sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh",
+		"eval", "source", ".", "exec",
+		"awk", "gawk", "mawk", "nawk", "xargs", "perl", "sed",
+		"env", "printenv", "set", "export", "declare":
+		return fmt.Errorf("blocked shell command %q", cmdBase)
 	}
 
 	// 3. Git subcommand & global-flag enforcement.
@@ -1732,9 +1714,6 @@ func validateShellSegment(role string, allowedSurfaces []string, repoRoot, realR
 	// 5. Inspect all arguments (and command word itself) for outside-root paths or sensitive files.
 	if err := validateShellArgPath(repoRoot, realRoot, cmdWord, false); err != nil {
 		return err
-	}
-	if cmdBase == "echo" || cmdBase == "printf" {
-		return nil
 	}
 	for i, a := range args {
 		if isPatternOrScriptArg(cmdBase, args, i) {
@@ -1795,15 +1774,22 @@ func isEnvAssignment(w string) bool {
 	return true
 }
 
+func isBlockedGitExecFlag(a string) bool {
+	for _, p := range []string{"--config-env", "--exec-path", "--upload-pack", "--receive-pack"} {
+		if a == p || strings.HasPrefix(a, p+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 func validateGitInvocation(repoRoot, realRoot string, args []string) error {
 	valueFlags := map[string]bool{
 		"-C":             true,
-		"-c":             true,
 		"--git-dir":      true,
 		"--work-tree":    true,
 		"--namespace":    true,
 		"--super-prefix": true,
-		"--config-env":   true,
 	}
 
 	i := 0
@@ -1817,6 +1803,9 @@ func validateGitInvocation(repoRoot, realRoot string, args []string) error {
 				i++
 			}
 			break
+		}
+		if a == "-c" || strings.HasPrefix(a, "-c") || isBlockedGitExecFlag(a) {
+			return fmt.Errorf("blocked git flag %q", a)
 		}
 		if valueFlags[a] {
 			if i+1 >= len(args) {
@@ -1857,6 +1846,14 @@ func validateGitInvocation(repoRoot, realRoot string, args []string) error {
 	}
 
 	rest := args[i:]
+	for _, r := range rest {
+		if r == "--" {
+			break
+		}
+		if isBlockedGitExecFlag(r) || (strings.EqualFold(subcmd, "clone") && (r == "-c" || strings.HasPrefix(r, "-c") || r == "--config" || strings.HasPrefix(r, "--config="))) {
+			return fmt.Errorf("blocked git flag %q", r)
+		}
+	}
 	switch strings.ToLower(subcmd) {
 	case "commit", "push", "rebase", "restore":
 		return fmt.Errorf("blocked git subcommand %q", subcmd)
@@ -2108,6 +2105,11 @@ func validateShellArgPath(repoRoot, realRoot, tok string, allowTemp bool) error 
 func looksLikePath(repoRoot, tok string) bool {
 	if tok == "." || tok == ".." || tok == "/dev/null" {
 		return true
+	}
+	if strings.HasPrefix(tok, "// ") && !strings.Contains(tok, "..") {
+		if _, err := os.Lstat(tok); err != nil {
+			return false
+		}
 	}
 	if strings.HasPrefix(tok, "/") || strings.HasPrefix(tok, "./") || strings.HasPrefix(tok, "../") || strings.Contains(tok, "/") || strings.Contains(tok, "\\") {
 		// Distinguish common Go import paths like github.com/a/b if not starting with /, ./, ../

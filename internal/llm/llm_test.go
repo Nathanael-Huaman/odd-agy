@@ -968,3 +968,36 @@ func TestRunnerShellSandboxBlocksAbsoluteOutsidePathInTempDir(t *testing.T) {
 		}
 	}
 }
+
+func TestRunShellRDDHardeningR1AndR2(t *testing.T) {
+	runner := NewRunner(RunnerConfig{RepoRoot: initTestGitRepo(t)})
+	for _, cmd := range []string{
+		`echo "git push" | sh`, `sh -ec "git push"`, `awk 'BEGIN{system("id")}'`,
+		`xargs rm`, `perl -e 'print 1'`, `X=..; cat $X/secret`,
+		`git -c alias.x='!id' x`, `env`, `printenv`,
+	} {
+		if out := runner.toolRunShell("worker", []string{"src/**"}, cmd); !strings.Contains(out, `"error"`) {
+			t.Fatalf("%q: expected denial, got: %s", cmd, out)
+		}
+	}
+	for _, k := range []string{"DEEPSEEK_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "MY_SECRET_TOKEN"} {
+		t.Setenv(k, "secret-"+k)
+	}
+	t.Setenv("GOPATH", "/tmp/gopath")
+	envMap := map[string]bool{}
+	for _, e := range sanitizedShellEnv() {
+		if k, _, ok := strings.Cut(e, "="); ok {
+			envMap[k] = true
+		}
+	}
+	for _, secret := range []string{"DEEPSEEK_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "MY_SECRET_TOKEN"} {
+		if envMap[secret] {
+			t.Fatalf("sanitizedShellEnv leaked %s", secret)
+		}
+	}
+	for _, safe := range []string{"PATH", "HOME", "GOPATH"} {
+		if !envMap[safe] {
+			t.Fatalf("sanitizedShellEnv dropped %s", safe)
+		}
+	}
+}
