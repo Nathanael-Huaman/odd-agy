@@ -1,0 +1,6 @@
+dist/
+*.test
+coverage.out
+.agents/odd/.state/
+node_modules/
+.DS_Store

@@ -1,0 +1,32 @@
+{
+  "name": "odd-agy",
+  "version": "0.1.0",
+  "description": "Project-scoped ODD & RDD harness for Antigravity CLI/IDE",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nathanael-Huaman/odd-agy.git"
+  },
+  "bin": {
+    "odd-agy": "bin/odd-agy.mjs"
+  },
+  "files": [
+    "bin/",
+    "dist/bin/",
+    "scripts/"
+  ],
+  "scripts": {
+    "build": "node scripts/build-binaries.mjs",
+    "test": "pnpm run test:go && pnpm run test:wrapper",
+    "test:go": "go test -v ./...",
+    "test:wrapper": "go test -v ./cmd/odd-agy -run TestWrapper"
+  },
+  "keywords": [
+    "antigravity",
+    "odd",
+    "rdd",
+    "agents",
+    "mcp"
+  ],
+  "license": "MIT"
+}
