@@ -313,3 +313,61 @@ func TestRepoUpstreamLockValid(t *testing.T) {
 		t.Fatalf("unexpected repo/entry counts: repos=%d entries=%d", len(lock.Repos), len(lock.Entries))
 	}
 }
+
+func TestR1SecurityGuards(t *testing.T) {
+	h := sha256Hex([]byte("ok"))
+	bad := makeTestLock(h, h, nil, h)
+	bad.Repos, bad.Entries[0].Repo = []RepoSource{{Name: "../escape", Ref: "v1"}}, "../escape"
+	if ValidateLock(bad) == nil {
+		t.Fatal("expected ValidateLock to reject ../escape")
+	}
+	for _, p := range []string{"../../etc/passwd", "/abs", `a\b`, "."} {
+		l := makeTestLock(h, h, nil, h)
+		if l.Entries[0].Path = p; ValidateLock(l) == nil {
+			t.Fatalf("expected ValidateLock to reject %q", p)
+		}
+	}
+	for _, u := range []string{"http://127.0.0.1", "https://evil.example.com", "https://u:p@api.github.com"} {
+		l := makeTestLock(h, h, nil, h)
+		if l.Repos[0].RawBaseURL, l.Repos[0].APIBaseURL = u, u; ValidateLock(l) == nil {
+			t.Fatalf("expected ValidateLock to reject %q", u)
+		}
+	}
+	dir := t.TempDir()
+	outside, gs, lockPath := filepath.Join(dir, "secret.txt"), filepath.Join(dir, "src", "gentle-shell"), filepath.Join(dir, "lock.json")
+	_ = os.WriteFile(outside, []byte("TOP_SECRET"), 0o600)
+	_ = os.MkdirAll(filepath.Join(gs, "assets", "agents"), 0o755)
+	writeFixtureFile(t, gs, "lib/bounded-writer-admission.ts", "ok")
+	_ = SaveLock(lockPath, makeTestLock(h, ComputeDirDigest(nil), nil, h))
+	for _, target := range []string{filepath.Join(gs, "assets", "orchestrator.md"), filepath.Join(gs, "assets", "agents", "leak.md")} {
+		if err := os.Symlink(outside, target); err != nil {
+			t.Skipf("symlink unsupported: %v", err)
+		}
+		if _, err := Check(context.Background(), lockPath, CheckOptions{SourceDir: filepath.Join(dir, "src")}); err == nil {
+			t.Fatalf("expected symlink rejection for %s", target)
+		}
+		_ = os.Remove(target)
+		writeFixtureFile(t, gs, "assets/orchestrator.md", "ok")
+	}
+	evilFetched := false
+	evilSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { evilFetched = true }))
+	defer evilSrv.Close()
+	mockSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "orchestrator.md") {
+			_, _ = w.Write([]byte("ok"))
+		} else if strings.HasSuffix(r.URL.Path, "agents") {
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"name": "w.md", "path": "assets/agents/w.md", "type": "file", "download_url": evilSrv.URL + "/meta"}})
+		} else {
+			http.Error(w, "SECRET_BODY_LEAK", http.StatusInternalServerError)
+		}
+	}))
+	defer mockSrv.Close()
+	if _, err := Check(context.Background(), lockPath, CheckOptions{BaseURL: mockSrv.URL, HTTPClient: mockSrv.Client()}); err == nil || evilFetched {
+		t.Fatalf("expected cross-host download_url rejection without fetch (fetched=%v, err=%v)", evilFetched, err)
+	}
+	for i, u := range []string{mockSrv.URL + "/boom?token=topsecret", strings.Replace(mockSrv.URL, "http://", "http://alice:superpass@", 1) + "/boom?token=topsecret"} {
+		if _, _, err := fetchBytes(context.Background(), mockSrv.Client(), u, mockSrv.URL); err == nil || strings.Contains(err.Error(), "SECRET_BODY_LEAK") || strings.Contains(err.Error(), "superpass") || strings.Contains(err.Error(), "topsecret") || (i == 0 && !strings.Contains(err.Error(), "HTTP 500")) {
+			t.Fatalf("unexpected error for %s: %v", u, err)
+		}
+	}
+}

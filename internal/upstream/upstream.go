@@ -34,6 +34,7 @@ const (
 )
 
 var sha256Pattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var repoSegPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // RepoSource identifies a tracked upstream GitHub repository and ref.
 type RepoSource struct {
@@ -188,11 +189,16 @@ func ValidateLock(lock LockFile) error {
 	repoSet := make(map[string]RepoSource, len(lock.Repos))
 	for _, r := range lock.Repos {
 		name := strings.TrimSpace(r.Name)
-		if name == "" {
-			return errors.New("repo name must not be empty")
+		if err := validateRepoName(r.Name); err != nil {
+			return err
 		}
 		if strings.TrimSpace(r.Ref) == "" {
 			return fmt.Errorf("repo %q ref must not be empty", name)
+		}
+		for _, raw := range []string{r.RawBaseURL, r.APIBaseURL} {
+			if _, err := validateRemoteURL(raw, ""); raw != "" && err != nil {
+				return fmt.Errorf("repo %q invalid base url: %w", name, err)
+			}
 		}
 		repoSet[name] = r
 	}
@@ -212,8 +218,8 @@ func ValidateLock(lock LockFile) error {
 		if _, ok := repoSet[e.Repo]; !ok {
 			return fmt.Errorf("entry %q references unknown repo %q", e.ID, e.Repo)
 		}
-		if strings.TrimSpace(e.Path) == "" {
-			return fmt.Errorf("entry %q path must not be empty", e.ID)
+		if err := validateEntryPath(e.Path); err != nil {
+			return fmt.Errorf("entry %q invalid path %q: %w", e.ID, e.Path, err)
 		}
 		switch e.Category {
 		case CategoryPromptsAndSkills, CategoryEnforcementCode:
@@ -436,6 +442,13 @@ func inspectAll(ctx context.Context, lock LockFile, opts CheckOptions) ([]inspec
 }
 
 func inspectLocalEntry(sourceDir string, entry TrackedEntry) (inspectedEntry, error) {
+	if err := errors.Join(validateRepoName(entry.Repo), validateEntryPath(entry.Path)); err != nil {
+		return inspectedEntry{}, err
+	}
+	sourceDir, err := filepath.EvalSymlinks(sourceDir)
+	if err != nil {
+		return inspectedEntry{}, fmt.Errorf("resolve sourceDir: %w", err)
+	}
 	repoShort := path.Base(entry.Repo)
 	relClean := strings.TrimSuffix(filepath.FromSlash(entry.Path), string(filepath.Separator))
 
@@ -443,16 +456,23 @@ func inspectLocalEntry(sourceDir string, entry TrackedEntry) (inspectedEntry, er
 	candidateDirect := filepath.Join(sourceDir, relClean)
 
 	target := candidateDirect
-	if _, err := os.Stat(candidateRepoScoped); err == nil {
+	if _, err := os.Lstat(candidateRepoScoped); err == nil {
 		target = candidateRepoScoped
 	}
 
-	info, err := os.Stat(target)
+	info, err := os.Lstat(target)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return missingEntry(entry), nil
 		}
-		return inspectedEntry{}, fmt.Errorf("stat %s: %w", target, err)
+		return inspectedEntry{}, fmt.Errorf("lstat %s: %w", target, err)
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		return inspectedEntry{}, fmt.Errorf("refusing symlink %s", target)
+	}
+	if rel, err := filepath.Rel(sourceDir, resolved); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return inspectedEntry{}, fmt.Errorf("path %s escapes sourceDir", target)
 	}
 
 	if strings.HasSuffix(entry.Path, "/") {
@@ -463,6 +483,9 @@ func inspectLocalEntry(sourceDir string, entry TrackedEntry) (inspectedEntry, er
 		err := filepath.WalkDir(target, func(p string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
+			}
+			if linfo, lerr := os.Lstat(p); lerr != nil || d.Type()&os.ModeSymlink != 0 || linfo.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("refusing symlink %s", p)
 			}
 			if d.IsDir() {
 				return nil
@@ -526,7 +549,7 @@ func inspectRemoteEntry(
 	if strings.HasSuffix(entry.Path, "/") {
 		rootRel := strings.TrimSuffix(entry.Path, "/")
 		files := make(map[string]string)
-		found, err := walkRemoteDir(ctx, client, rawBase, apiBase, ref, rootRel, rootRel, files)
+		found, err := walkRemoteDir(ctx, client, baseOverride, rawBase, apiBase, ref, rootRel, rootRel, files)
 		if err != nil {
 			return inspectedEntry{}, err
 		}
@@ -537,7 +560,7 @@ func inspectRemoteEntry(
 	}
 
 	fileURL := fmt.Sprintf("%s/%s/%s", rawBase, url.PathEscape(ref), strings.TrimPrefix(entry.Path, "/"))
-	data, found, err := fetchBytes(ctx, client, fileURL)
+	data, found, err := fetchBytes(ctx, client, fileURL, baseOverride)
 	if err != nil {
 		return inspectedEntry{}, err
 	}
@@ -550,12 +573,12 @@ func inspectRemoteEntry(
 func walkRemoteDir(
 	ctx context.Context,
 	client *http.Client,
-	rawBase, apiBase, ref, rootRel, currentRel string,
+	baseOverride, rawBase, apiBase, ref, rootRel, currentRel string,
 	files map[string]string,
 ) (bool, error) {
 	contentsURL := fmt.Sprintf("%s/contents/%s?ref=%s",
 		apiBase, strings.TrimPrefix(currentRel, "/"), url.QueryEscape(ref))
-	body, found, err := fetchBytes(ctx, client, contentsURL)
+	body, found, err := fetchBytes(ctx, client, contentsURL, baseOverride)
 	if err != nil {
 		return false, err
 	}
@@ -571,7 +594,7 @@ func walkRemoteDir(
 	for _, item := range items {
 		switch item.Type {
 		case "dir":
-			if _, err := walkRemoteDir(ctx, client, rawBase, apiBase, ref, rootRel, item.Path, files); err != nil {
+			if _, err := walkRemoteDir(ctx, client, baseOverride, rawBase, apiBase, ref, rootRel, item.Path, files); err != nil {
 				return false, err
 			}
 		case "file":
@@ -579,7 +602,7 @@ func walkRemoteDir(
 			if dlURL == "" {
 				dlURL = fmt.Sprintf("%s/%s/%s", rawBase, url.PathEscape(ref), strings.TrimPrefix(item.Path, "/"))
 			}
-			data, ok, err := fetchBytes(ctx, client, dlURL)
+			data, ok, err := fetchBytes(ctx, client, dlURL, baseOverride)
 			if err != nil {
 				return false, err
 			}
@@ -596,15 +619,19 @@ func walkRemoteDir(
 	return true, nil
 }
 
-func fetchBytes(ctx context.Context, client *http.Client, targetURL string) ([]byte, bool, error) {
+func fetchBytes(ctx context.Context, client *http.Client, targetURL, baseOverride string) ([]byte, bool, error) {
+	safeURL, err := validateRemoteURL(targetURL, baseOverride)
+	if err != nil {
+		return nil, false, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
-		return nil, false, fmt.Errorf("build request %s: %w", targetURL, err)
+		return nil, false, fmt.Errorf("build request %s: invalid URL", safeURL)
 	}
 	req.Header.Set("User-Agent", "odd-agy-upstream-sync")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, false, fmt.Errorf("fetch %s: %w", targetURL, err)
+		return nil, false, fmt.Errorf("fetch %s failed", safeURL)
 	}
 	defer resp.Body.Close()
 
@@ -612,14 +639,50 @@ func fetchBytes(ctx context.Context, client *http.Client, targetURL string) ([]b
 		return nil, false, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, false, fmt.Errorf("fetch %s returned HTTP %d: %s", targetURL, resp.StatusCode, strings.TrimSpace(string(msg)))
+		return nil, false, fmt.Errorf("fetch %s returned HTTP %d", safeURL, resp.StatusCode)
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, false, fmt.Errorf("read %s: %w", targetURL, err)
+		return nil, false, fmt.Errorf("read %s: %w", safeURL, err)
 	}
 	return data, true, nil
+}
+
+func validateRepoName(repo string) error {
+	if p := strings.Split(repo, "/"); len(p) != 2 || p[0] == "." || p[0] == ".." || p[1] == "." || p[1] == ".." || !repoSegPattern.MatchString(p[0]) || !repoSegPattern.MatchString(p[1]) {
+		return fmt.Errorf("invalid repo %q", repo)
+	}
+	return nil
+}
+
+func validateEntryPath(p string) error {
+	if t := strings.TrimSuffix(p, "/"); p == "" || strings.TrimSpace(p) != p || strings.HasPrefix(p, "/") || strings.Contains(p, "\\") || t == "" || t == "." || t == ".." || strings.HasPrefix(t, "../") || path.Clean(t) != t {
+		return errors.New("invalid relative path")
+	}
+	return nil
+}
+
+func validateRemoteURL(targetURL, baseOverride string) (string, error) {
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return "", errors.New("invalid remote URL")
+	}
+	hasUser := u.User != nil
+	u.User, u.RawQuery, u.Fragment = nil, "", ""
+	safe := u.String()
+	if hasUser {
+		return safe, fmt.Errorf("remote URL %s must not contain userinfo", safe)
+	}
+	if b := strings.TrimSpace(baseOverride); b != "" {
+		if bu, err := url.Parse(b); err != nil || bu.User != nil || bu.Scheme == "" || bu.Host == "" || u.Scheme != bu.Scheme || u.Host != bu.Host {
+			return safe, fmt.Errorf("remote URL %s outside baseURL", safe)
+		}
+		return safe, nil
+	}
+	if h := strings.ToLower(u.Host); !strings.EqualFold(u.Scheme, "https") || (h != "raw.githubusercontent.com" && h != "api.github.com" && h != "github.com") {
+		return safe, fmt.Errorf("remote URL %s not allowlisted", safe)
+	}
+	return safe, nil
 }
 
 func missingEntry(entry TrackedEntry) inspectedEntry {
