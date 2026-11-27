@@ -727,17 +727,24 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 			names = append(names, name)
 		}
 		sort.Strings(names)
+		lookupEnv := config.NewSecretsLookupEnv("", os.LookupEnv)
 		hasInvalid := false
 		for _, name := range names {
 			p := cfg.Providers[name]
-			ep, err := config.ResolveProviderEndpoint(p, os.LookupEnv)
+			ep, err := config.ResolveProviderEndpoint(p, lookupEnv)
 			if err != nil {
 				hasInvalid = true
 				fmt.Fprintf(stdout, "%-18s invalid (%s)\n", name, sanitizeProviderErr(p, err))
 				continue
 			}
+			keyStatus := ep.KeySource
+			if keyStatus == "env" {
+				if _, src := config.LookupSecret("", p.APIKeyEnv, os.Getenv); src == "stored" {
+					keyStatus = "stored"
+				}
+			}
 			fmt.Fprintf(stdout, "%-18s url=%s compat=%s keyEnv=%s keyStatus=%s defaultModel=%s\n",
-				name, llm.RedactURL(ep.BaseURL), ep.Compatibility, p.APIKeyEnv, ep.KeySource, p.DefaultModel)
+				name, llm.RedactURL(ep.BaseURL), ep.Compatibility, p.APIKeyEnv, keyStatus, p.DefaultModel)
 		}
 		if hasInvalid {
 			return exitError
@@ -755,7 +762,13 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 			fmt.Fprintf(stderr, "odd-agy profile test: unknown provider %q\n", name)
 			return exitUsage
 		}
-		res := llm.ProbeProvider(context.Background(), name, prov, os.LookupEnv)
+		lookupEnv := config.NewSecretsLookupEnv("", os.LookupEnv)
+		res := llm.ProbeProvider(context.Background(), name, prov, lookupEnv)
+		if res.KeySource == "env" {
+			if _, src := config.LookupSecret("", prov.APIKeyEnv, os.Getenv); src == "stored" {
+				res.KeySource = "stored"
+			}
+		}
 		if res.Error != "" {
 			fmt.Fprintf(stdout, "provider=%s reachable=%t status=%d latency=%dms url=%s keySource=%s error=%s\n",
 				res.Provider, res.Reachable, res.StatusCode, res.LatencyMS, res.RedactedURL, res.KeySource, res.Error)

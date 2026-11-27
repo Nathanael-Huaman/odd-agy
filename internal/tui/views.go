@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -54,7 +55,13 @@ func (m Model) View() string {
 
 	if m.inputMode != inputNone {
 		b.WriteByte('\n')
-		b.WriteString(focusStyle.Render(fmt.Sprintf("Edit %s (%s): %s_", m.inputLabel(), m.inputTarget, m.inputBuffer)))
+		if m.inputMode == inputProviderKey {
+			keyEnv := m.profiles.Providers[m.inputTarget].APIKeyEnv
+			masked := strings.Repeat("•", utf8.RuneCountInString(m.inputBuffer))
+			b.WriteString(focusStyle.Render(fmt.Sprintf("Set API key (%s) [empty to clear]: %s_", keyEnv, masked)))
+		} else {
+			b.WriteString(focusStyle.Render(fmt.Sprintf("Edit %s (%s): %s_", m.inputLabel(), m.inputTarget, m.inputBuffer)))
+		}
 		b.WriteByte('\n')
 		if m.inputMode == inputRoleModel {
 			if prof, ok := m.profiles.Profiles[m.profiles.ActiveProfile]; ok {
@@ -97,6 +104,8 @@ func (m Model) inputLabel() string {
 		return "provider apiKeyEnv"
 	case inputProviderModel:
 		return "provider defaultModel"
+	case inputProviderKey:
+		return "provider API key"
 	default:
 		return "value"
 	}
@@ -218,13 +227,19 @@ func (m Model) renderProviders(b *strings.Builder) {
 			keyStatus = "invalid-url"
 		} else {
 			redactedURL = llm.RedactURL(ep.BaseURL)
-			switch ep.KeySource {
+			_, src := config.LookupSecretWithEnv(m.opts.HomeDir, p.APIKeyEnv, m.opts.LookupEnv)
+			switch src {
 			case "env":
-				keyStatus = "set"
-			case "loopback-optional", "loopback-placeholder":
-				keyStatus = ep.KeySource
+				keyStatus = "env"
+			case "stored":
+				keyStatus = "stored"
 			default:
-				keyStatus = "unset"
+				switch ep.KeySource {
+				case "loopback-optional", "loopback-placeholder":
+					keyStatus = ep.KeySource
+				default:
+					keyStatus = "unset"
+				}
 			}
 		}
 
@@ -244,7 +259,7 @@ func (m Model) renderProviders(b *strings.Builder) {
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')
-	b.WriteString(mutedStyle.Render("[p/enter] probe  [u] edit baseUrl  [k] edit apiKeyEnv  [m] edit model  [esc] back  [q] quit"))
+	b.WriteString(mutedStyle.Render("[p/enter] probe  [t] test  [s] set key  [u] edit baseUrl  [k] edit apiKeyEnv  [m] edit model  [esc] back  [q] quit"))
 	b.WriteByte('\n')
 }
 

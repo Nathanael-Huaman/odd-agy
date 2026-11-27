@@ -305,6 +305,10 @@ func (c *Client) ProbeProvider(
 	providerCfg config.ProviderConfig,
 	lookupEnv func(string) (string, bool),
 ) ProbeResult {
+	usedDefaultLookup := lookupEnv == nil
+	if usedDefaultLookup {
+		lookupEnv = config.NewSecretsLookupEnv("", os.LookupEnv)
+	}
 	ep, err := config.ResolveProviderEndpoint(providerCfg, lookupEnv)
 	if err != nil {
 		return ProbeResult{
@@ -312,6 +316,11 @@ func (c *Client) ProbeProvider(
 			Reachable:   false,
 			RedactedURL: RedactURL(providerCfg.BaseURL),
 			Error:       redactError(err),
+		}
+	}
+	if usedDefaultLookup && ep.KeySource == "env" {
+		if _, src := config.LookupSecret("", providerCfg.APIKeyEnv, os.Getenv); src == "stored" {
+			ep.KeySource = "stored"
 		}
 	}
 
@@ -452,7 +461,7 @@ func ResolveRoleChain(
 	lookupEnv func(string) (string, bool),
 ) ([]ResolvedCandidate, *NativeFallback, error) {
 	if lookupEnv == nil {
-		lookupEnv = os.LookupEnv
+		lookupEnv = config.NewSecretsLookupEnv("", os.LookupEnv)
 	}
 
 	prof, ok := profiles.Profiles[profiles.ActiveProfile]

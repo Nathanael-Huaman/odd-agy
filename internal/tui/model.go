@@ -36,6 +36,7 @@ const (
 	inputProviderURL
 	inputProviderKeyEnv
 	inputProviderModel
+	inputProviderKey
 )
 
 // AgyModelOption represents a selectable Antigravity CLI model entry.
@@ -229,6 +230,15 @@ func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEnter:
+		if m.inputMode == inputProviderKey {
+			if err := m.commitProviderKey(); err != nil {
+				m.errMsg = err.Error()
+			}
+			m.inputMode = inputNone
+			m.inputBuffer = ""
+			m.inputTarget = ""
+			return m, nil
+		}
 		val := strings.TrimSpace(m.inputBuffer)
 		if err := m.commitInput(val); err != nil {
 			m.errMsg = err.Error()
@@ -299,6 +309,23 @@ func (m *Model) commitInput(val string) error {
 		}
 		m.errMsg = ""
 		m.statusMsg = fmt.Sprintf("Updated %s defaultModel to %s", m.inputTarget, val)
+	}
+	return nil
+}
+
+func (m *Model) commitProviderKey() error {
+	prov := m.profiles.Providers[m.inputTarget]
+	keyEnv := prov.APIKeyEnv
+	rawVal := m.inputBuffer
+	m.inputBuffer = ""
+	if err := config.SetSecret(m.opts.HomeDir, keyEnv, rawVal); err != nil {
+		return err
+	}
+	m.errMsg = ""
+	if strings.TrimSpace(rawVal) == "" {
+		m.statusMsg = fmt.Sprintf("Cleared stored API key for %s", keyEnv)
+	} else {
+		m.statusMsg = fmt.Sprintf("Saved API key for %s in ~/.config/odd-agy/secrets.json (0600)", keyEnv)
 	}
 	return nil
 }
@@ -697,15 +724,26 @@ func (m Model) handleProvidersKey(key string) (tea.Model, tea.Cmd) {
 	prov := m.profiles.Providers[name]
 
 	switch key {
-	case "p", "enter", " ":
+	case "p", "t", "enter", " ":
 		m.statusMsg = fmt.Sprintf("Probing %s...", name)
 		m.errMsg = ""
 		probeFn := m.opts.ProbeFunc
-		lookupEnv := m.opts.LookupEnv
+		lookupEnv := config.NewSecretsLookupEnv(m.opts.HomeDir, m.opts.LookupEnv)
 		return m, func() tea.Msg {
 			res := probeFn(context.Background(), name, prov, lookupEnv)
 			return probeResultMsg{result: res}
 		}
+
+	case "s":
+		if err := config.ValidateSecretKeyName(prov.APIKeyEnv); err != nil {
+			m.errMsg = fmt.Sprintf("Provider %s has invalid apiKeyEnv (%v); set [k] apiKeyEnv first", name, err)
+			return m, nil
+		}
+		m.inputMode = inputProviderKey
+		m.inputTarget = name
+		m.inputBuffer = ""
+		m.errMsg = ""
+		m.statusMsg = ""
 
 	case "u":
 		m.inputMode = inputProviderURL

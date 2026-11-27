@@ -1001,3 +1001,75 @@ func TestRunShellRDDHardeningR1AndR2(t *testing.T) {
 		}
 	}
 }
+
+func TestProbeProviderAndRoleChainUseStoredSecretsWhenLookupEnvNil(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+
+	const storedKey = "sk-stored-deepseek-test"
+	if err := config.SetSecret(fakeHome, "DEEPSEEK_API_KEY", storedKey); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.URL.Path == "/v1/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"deepseek-v4-pro"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	// nil lookupEnv picks up stored key from HOME/.config/odd-agy/secrets.json.
+	res := ProbeProvider(context.Background(), "deepseek", config.ProviderConfig{
+		BaseURL:       srv.URL + "/v1",
+		APIKeyEnv:     "DEEPSEEK_API_KEY",
+		Compatibility: config.CompatibilityDeepSeekThinking,
+		DefaultModel:  "deepseek-v4-pro",
+	}, nil)
+	if !res.Reachable {
+		t.Fatalf("ProbeProvider with nil lookupEnv and stored secret failed: %+v", res)
+	}
+	if gotAuth != "Bearer "+storedKey {
+		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer "+storedKey)
+	}
+	if res.KeySource != "stored" {
+		t.Fatalf("res.KeySource = %q, want stored", res.KeySource)
+	}
+
+	// Explicit lookupEnv stays hermetic (does NOT fall back to stored secret).
+	hermeticRes := ProbeProvider(context.Background(), "deepseek", config.ProviderConfig{
+		BaseURL:       srv.URL + "/v1",
+		APIKeyEnv:     "DEEPSEEK_API_KEY",
+		Compatibility: config.CompatibilityDeepSeekThinking,
+		DefaultModel:  "deepseek-v4-pro",
+	}, func(string) (string, bool) { return "", false })
+	if hermeticRes.Reachable || !hermeticRes.MissingAPIKey {
+		t.Fatalf("expected explicit empty lookupEnv to remain hermetic and report missing key, got %+v", hermeticRes)
+	}
+
+	// ResolveRoleChain with nil lookupEnv also resolves stored secret.
+	profs := config.DefaultProfilesConfig()
+	profs.ActiveProfile = "deepseek-hybrid"
+	cands, _, err := ResolveRoleChain("verify", profs, "", "", nil)
+	if err != nil {
+		t.Fatalf("ResolveRoleChain: %v", err)
+	}
+	if len(cands) == 0 || cands[0].Skipped || cands[0].Endpoint.APIKey != storedKey {
+		t.Fatalf("ResolveRoleChain did not resolve stored secret: %+v", cands)
+	}
+
+	// Explicit lookupEnv in ResolveRoleChain remains hermetic (skips missing key instead of reading stored secret).
+	hermeticCands, _, err := ResolveRoleChain("verify", profs, "", "", func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("ResolveRoleChain hermetic: %v", err)
+	}
+	if len(hermeticCands) == 0 || !hermeticCands[0].Skipped {
+		t.Fatalf("expected explicit empty lookupEnv in ResolveRoleChain to skip candidate, got %+v", hermeticCands)
+	}
+}
+
