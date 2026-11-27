@@ -105,3 +105,53 @@ func TestLoadAndSaveConfigPreservesStoredOnRejection(t *testing.T) {
 		t.Fatalf("stored config changed after rejected SaveConfig:\nbefore: %s\nafter:  %s", beforeBytes, afterBytes)
 	}
 }
+
+func TestLoadConfigPartialJSONDefaultsRDDEnabled(t *testing.T) {
+	dir := t.TempDir()
+	path := ConfigPath(dir)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	// Partial JSON omitting "rddEnabled" must safely default to true (fail-closed).
+	partial := `{
+  "schemaVersion": 1,
+  "delegationMode": "organic",
+  "installMode": "local",
+  "binaryCommand": "odd-agy"
+}
+`
+	if err := os.WriteFile(path, []byte(partial), 0o644); err != nil {
+		t.Fatalf("WriteFile partial: %v", err)
+	}
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatalf("LoadConfig partial error: %v", err)
+	}
+	if !cfg.RDDEnabled {
+		t.Fatalf("LoadConfig partial omitted rddEnabled -> got false, want true")
+	}
+	if cfg.DelegationMode != DelegationModeOrganic {
+		t.Fatalf("DelegationMode = %q, want %q", cfg.DelegationMode, DelegationModeOrganic)
+	}
+
+	// Explicit "rddEnabled": false must still be respected.
+	explicitFalse := `{
+  "schemaVersion": 1,
+  "delegationMode": "full-delegation",
+  "rddEnabled": false,
+  "installMode": "local",
+  "binaryCommand": "odd-agy"
+}
+`
+	if err := os.WriteFile(path, []byte(explicitFalse), 0o644); err != nil {
+		t.Fatalf("WriteFile explicit false: %v", err)
+	}
+	cfg2, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatalf("LoadConfig explicit false error: %v", err)
+	}
+	if cfg2.RDDEnabled {
+		t.Fatalf("LoadConfig explicit rddEnabled=false -> got true, want false")
+	}
+}

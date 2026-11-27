@@ -115,9 +115,14 @@ func Init(workspaceRoot string, opts InitOptions) (InitResult, error) {
 		prevEngramManaged = slices.Contains(prevManifest.ManagedMCPKeys, EngramMCPKey)
 	}
 
-	// Write embedded rules, agents, and skills under .agents/.
-	manifestFiles := make(map[string]string, len(allAssets))
-	installed := make([]string, 0, len(allAssets))
+	// Write embedded rules, agents, and skills under .agents/, plus session settings.
+	sessBytes, err := sessionSettingsBytes()
+	if err != nil {
+		return InitResult{}, err
+	}
+
+	manifestFiles := make(map[string]string, len(allAssets)+1)
+	installed := make([]string, 0, len(allAssets)+1)
 	for _, af := range allAssets {
 		relSlash := ".agents/" + af.RelPath
 		target, err := resolveContainedPath(ws, relSlash)
@@ -130,6 +135,16 @@ func Init(workspaceRoot string, opts InitOptions) (InitResult, error) {
 		manifestFiles[relSlash] = sha256PrefixedHex(af.Content)
 		installed = append(installed, relSlash)
 	}
+
+	sessTarget, err := resolveContainedPath(ws, SessionSettingsRelPath)
+	if err != nil {
+		return InitResult{}, err
+	}
+	if err := writeFileAtomic(sessTarget, sessBytes, 0o644); err != nil {
+		return InitResult{}, err
+	}
+	manifestFiles[SessionSettingsRelPath] = sha256PrefixedHex(sessBytes)
+	installed = append(installed, SessionSettingsRelPath)
 
 	preservedConfig := false
 	if !configExists || opts.Force {

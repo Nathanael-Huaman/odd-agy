@@ -258,15 +258,15 @@ func TestFullLifecycleConsentDeclineAndTamperAndCorrectionAndAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scope page 1 failed: %v", err)
 	}
-	// 4 changed files: .agents/odd/config.json (from Mode toggle), app.go, helper.go, odd/tasks/spec.md
-	if page1.TotalFiles != 4 || len(page1.Files) != 2 || !page1.HasMore {
+	// 3 changed files: app.go, helper.go, odd/tasks/spec.md (untracked .agents/odd/config.json is ignored)
+	if page1.TotalFiles != 3 || len(page1.Files) != 2 || !page1.HasMore {
 		t.Fatalf("unexpected page 1: total=%d len=%d hasMore=%v", page1.TotalFiles, len(page1.Files), page1.HasMore)
 	}
 	page2, err := eng.Scope(startRes.LineageID, page1.NextCursor, 2)
 	if err != nil {
 		t.Fatalf("Scope page 2 failed: %v", err)
 	}
-	if len(page2.Files) != 2 || page2.HasMore {
+	if len(page2.Files) != 1 || page2.HasMore {
 		t.Fatalf("unexpected page 2: len=%d hasMore=%v", len(page2.Files), page2.HasMore)
 	}
 	// Verify frozen content does NOT reflect live edit "999".
@@ -640,3 +640,178 @@ func TestStartRequestContextPathValidationAndPrivatePermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestUntrackedSymlinkHighRisk(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	writeFile(t, dir, "README.md", "# Readme\n", 0o644)
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "base")
+
+	docsDir := filepath.Join(dir, "docs")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	if err := os.Symlink("../README.md", filepath.Join(docsDir, "link.md")); err != nil {
+		t.Fatalf("symlink docs/link.md: %v", err)
+	}
+
+	res, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess failed: %v", err)
+	}
+	if res.NativeRisk != RiskHigh || res.Risk != RiskHigh || !res.ReviewDue {
+		t.Fatalf("untracked symlink docs/link.md expected RiskHigh and ReviewDue=true, got %+v", res)
+	}
+}
+
+func TestAssessRenamedFileCountsFullLinesWithDiffRenamesTrue(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	runGit(t, dir, "config", "diff.renames", "true")
+	writeFile(t, dir, "old.go", "package p\n\nfunc F() int {\n\treturn 42\n}\n", 0o644)
+	runGit(t, dir, "add", "old.go")
+	runGit(t, dir, "commit", "-m", "base")
+
+	runGit(t, dir, "mv", "old.go", "new.go")
+
+	res, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess failed: %v", err)
+	}
+	if len(res.ChangedPaths) != 2 {
+		t.Fatalf("ChangedPaths = %v, want 2 paths (old.go and new.go)", res.ChangedPaths)
+	}
+	if res.ChangedLines != 10 {
+		t.Fatalf("ChangedLines = %d, want 10 (5 deleted + 5 added)", res.ChangedLines)
+	}
+}
+
+func TestTamperedOrMissingRequestContextFailsClosed(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	writeFile(t, dir, "app.go", "package app\nfunc Run() int { return 1 }\n", 0o644)
+	runGit(t, dir, "add", "app.go")
+	runGit(t, dir, "commit", "-m", "base")
+
+	writeFile(t, dir, "app.go", "package app\nfunc Run() int { return 2 }\n", 0o644)
+	writeFile(t, dir, "docs/spec.md", "# Spec\nImmutable context\n", 0o644)
+
+	st, err := eng.Start(StartRequest{
+		Lenses:             []string{"risk"},
+		LensesReason:       "context integrity",
+		RequestContextPath: "docs/spec.md",
+	})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if _, err := eng.AnswerConsent(st.LineageID, "granted"); err != nil {
+		t.Fatalf("AnswerConsent failed: %v", err)
+	}
+
+	rev1Dir := filepath.Join(dir, ".git", "odd-agy", "candidates", st.LineageID, "rev-1")
+	ctxPath := filepath.Join(rev1Dir, "request-context.txt")
+	if err := os.Chmod(rev1Dir, 0o755); err != nil {
+		t.Fatalf("chmod rev1Dir: %v", err)
+	}
+	if err := os.Chmod(ctxPath, 0o644); err != nil {
+		t.Fatalf("chmod ctxPath: %v", err)
+	}
+	if err := os.WriteFile(ctxPath, []byte("tampered context\n"), 0o444); err != nil {
+		t.Fatalf("tamper request-context.txt: %v", err)
+	}
+	if _, err := eng.Scope(st.LineageID, 0, 10); err == nil {
+		t.Fatal("expected Scope to fail closed when request-context.txt was tampered with")
+	}
+
+	// Restore valid context, submit blocker -> refuter confirms -> remove request-context.txt -> ApplyCorrection must fail closed.
+	if err := os.Chmod(ctxPath, 0o644); err != nil {
+		t.Fatalf("chmod ctxPath: %v", err)
+	}
+	if err := os.WriteFile(ctxPath, []byte("# Spec\nImmutable context\n"), 0o444); err != nil {
+		t.Fatalf("restore request-context.txt: %v", err)
+	}
+	if _, err := eng.Submit(SubmitRequest{
+		LineageID: st.LineageID,
+		Lens:      "risk",
+		Findings:  []Finding{{ID: "B1", Severity: SeveritySEVERE, Causality: CausalityCandidate, Location: "app.go:2", Claim: "bug"}},
+	}); err != nil {
+		t.Fatalf("Submit risk: %v", err)
+	}
+	if _, err := eng.Submit(SubmitRequest{
+		LineageID: st.LineageID,
+		Lens:      "refuter",
+		Verdicts:  []RefuterVerdict{{FindingID: "B1", Verdict: VerdictConfirmed}},
+	}); err != nil {
+		t.Fatalf("Submit refuter: %v", err)
+	}
+	if err := os.Remove(ctxPath); err != nil {
+		t.Fatalf("remove request-context.txt: %v", err)
+	}
+	if _, err := eng.ApplyCorrection(st.LineageID); err == nil {
+		t.Fatal("expected ApplyCorrection to fail when prior revision request-context.txt is missing")
+	}
+}
+
+func TestAssessIgnoresUntrackedAgentsHarnessButTracksCommittedAgentsEdits(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	writeFile(t, dir, "README.md", "# Project\n", 0o644)
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "base")
+
+	// Simulate untracked local .agents/ and .atl/ harness files alongside a small docs note.
+	writeFile(t, dir, ".agents/hooks.json", "{}\n", 0o644)
+	writeFile(t, dir, ".agents/rules/odd-01-core.md", "# rule\n", 0o644)
+	writeFile(t, dir, ".agents/agents/odd-orchestrator.md", "# agent\n", 0o644)
+	writeFile(t, dir, ".agents/odd/config.json", "{\"rddEnabled\":true}\n", 0o644)
+	writeFile(t, dir, ".atl/state.json", "{}\n", 0o644)
+	writeFile(t, dir, "docs/note.md", "# Note\n", 0o644)
+
+	passiveRes, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess with untracked .agents and docs/note.md failed: %v", err)
+	}
+	if len(passiveRes.ChangedPaths) != 1 || passiveRes.ChangedPaths[0] != "docs/note.md" {
+		t.Fatalf("ChangedPaths = %v, want [docs/note.md]", passiveRes.ChangedPaths)
+	}
+	if passiveRes.Risk != RiskPassive || passiveRes.ReviewDue {
+		t.Fatalf("expected passive risk and ReviewDue=false, got %+v", passiveRes)
+	}
+
+	// Add a small 2-file JS change -> medium risk (not high from untracked .agents/).
+	writeFile(t, dir, "src/math.js", "export const add = (a, b) => a + b;\n", 0o644)
+	medRes, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess with src/math.js failed: %v", err)
+	}
+	if len(medRes.ChangedPaths) != 2 || medRes.ChangedPaths[0] != "docs/note.md" || medRes.ChangedPaths[1] != "src/math.js" {
+		t.Fatalf("ChangedPaths = %v, want [docs/note.md src/math.js]", medRes.ChangedPaths)
+	}
+	if medRes.Risk != RiskMedium || !medRes.ReviewDue {
+		t.Fatalf("expected RiskMedium and ReviewDue=true, got %+v", medRes)
+	}
+
+	// Commit .agents/hooks.json (tracked) while leaving other .agents/* files untracked.
+	runGit(t, dir, "add", ".agents/hooks.json", "docs/note.md", "src/math.js")
+	runGit(t, dir, "commit", "-m", "track hooks.json")
+
+	// Modify tracked .agents/hooks.json -> must be included in ChangedPaths and classified RiskHigh.
+	writeFile(t, dir, ".agents/hooks.json", "{\"PreToolUse\":[]}\n", 0o644)
+	trackedRes, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess after modifying tracked .agents/hooks.json failed: %v", err)
+	}
+	if len(trackedRes.ChangedPaths) != 1 || trackedRes.ChangedPaths[0] != ".agents/hooks.json" {
+		t.Fatalf("ChangedPaths = %v, want [.agents/hooks.json]", trackedRes.ChangedPaths)
+	}
+	if trackedRes.Risk != RiskHigh || !trackedRes.ReviewDue {
+		t.Fatalf("expected RiskHigh and ReviewDue=true for modified tracked .agents/hooks.json, got %+v", trackedRes)
+	}
+}
+
+

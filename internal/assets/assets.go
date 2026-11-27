@@ -40,7 +40,6 @@ var AllowedAntigravityTools = []string{
 	"manage_subagents",
 	"ask_question",
 	"manage_task",
-	"call_mcp_tool",
 }
 
 var requiredRules = []string{
@@ -112,6 +111,7 @@ type Frontmatter struct {
 	MainAgent             *bool
 	Subagent              *bool
 	InheritCustomizations *bool
+	InheritMcp            *bool
 	CommandExecution      string
 	Tools                 []string
 	Extra                 map[string]string
@@ -474,6 +474,12 @@ func ParseFrontmatter(data []byte) (Frontmatter, string, error) {
 				return Frontmatter{}, "", err
 			}
 			fm.InheritCustomizations = &b
+		case "inheritMcp":
+			b, err := parseYAMLBool(key, val)
+			if err != nil {
+				return Frontmatter{}, "", err
+			}
+			fm.InheritMcp = &b
 		case "tools":
 			list, err := parseInlineYAMLList(val)
 			if err != nil {

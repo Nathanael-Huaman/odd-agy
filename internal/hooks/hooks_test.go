@@ -982,6 +982,351 @@ func TestPreToolUseRDDCorrectionSecurityFixes(t *testing.T) {
 	}
 }
 
+func TestPreToolUseRunCommandCwdAwareSymlinkAndBounds(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeOrganic
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.txt")
+	writeFile(t, outsideFile, "OUTSIDE SECRET")
+	writeFile(t, filepath.Join(repo, "secret.pem"), "PRIVATE KEY")
+	writeFile(t, filepath.Join(repo, "sub", "ok.txt"), "safe")
+	writeFile(t, filepath.Join(repo, "sub", ".npmrc"), "//registry.npmjs.org/:_authToken=secret\n")
+
+	// Symlink inside sub/ pointing outside workspace and pointing to ../secret.pem.
+	if err := os.Symlink(outsideFile, filepath.Join(repo, "sub", "sub_escape_link.txt")); err != nil {
+		t.Fatalf("symlink sub_escape_link.txt: %v", err)
+	}
+	if err := os.Symlink("../secret.pem", filepath.Join(repo, "sub", "sub_secret_link.txt")); err != nil {
+		t.Fatalf("symlink sub_secret_link.txt: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outsideDir, "missing_outside.txt"), filepath.Join(repo, "sub", "sub_dangling_escape.txt")); err != nil {
+		t.Fatalf("symlink sub_dangling_escape.txt: %v", err)
+	}
+	if err := os.Symlink("ok.txt", filepath.Join(repo, "sub", "sub_ok_link.txt")); err != nil {
+		t.Fatalf("symlink sub_ok_link.txt: %v", err)
+	}
+
+	subDir := filepath.Join(repo, "sub")
+
+	deniedCases := []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "cwd_sub_escape_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_escape_link.txt"},
+		},
+		{
+			name: "cwd_sub_secret_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_secret_link.txt"},
+		},
+		{
+			name: "cwd_sub_dangling_escape_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_dangling_escape.txt"},
+		},
+		{
+			name: "cwd_sub_npmrc_auth",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat .npmrc"},
+		},
+		{
+			name: "cwd_outside_workspace",
+			args: map[string]any{"Cwd": outsideDir, "CommandLine": "cat outside.txt"},
+		},
+		{
+			name: "cwd_temp_root_outside_workspace",
+			args: map[string]any{"Cwd": os.TempDir(), "CommandLine": "ls"},
+		},
+		{
+			name: "cwd_relative_escape",
+			args: map[string]any{"Cwd": "../outside", "CommandLine": "ls"},
+		},
+		{
+			name: "cwd_sub_relative_double_dot_escape",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat ../../outside.txt"},
+		},
+	}
+
+	for _, tc := range deniedCases {
+		t.Run("deny_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{
+					ConversationID: "conv-cwd-sym",
+					WorkspacePaths: []string{repo},
+				},
+				ToolCall: ToolCall{Name: "run_command", Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionDeny {
+				t.Fatalf("expected deny for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+
+	// Preserve: benign symlink and in-workspace parent ref from Cwd=sub remain allowed.
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{
+			name: "cwd_sub_benign_symlink",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat sub_ok_link.txt"},
+		},
+		{
+			name: "cwd_sub_in_workspace_parent",
+			args: map[string]any{"Cwd": subDir, "CommandLine": "cat ../README.md"},
+		},
+	} {
+		t.Run("allow_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{
+					ConversationID: "conv-cwd-sym",
+					WorkspacePaths: []string{repo},
+				},
+				ToolCall: ToolCall{Name: "run_command", Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionAllow {
+				t.Fatalf("expected allow for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+
+	// Preserve & verify full-delegation Cwd-aware mutation checks.
+	cfg.DelegationMode = config.DelegationModeFull
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig full-delegation: %v", err)
+	}
+	var allowOddTask PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-cwd-full", WorkspacePaths: []string{repo}},
+		ToolCall: ToolCall{
+			Name: "run_command",
+			Args: map[string]any{"Cwd": filepath.Join(repo, "odd", "tasks"), "CommandLine": "echo '# feat' > feat.md"},
+		},
+	}, &allowOddTask)
+	if allowOddTask.Decision != DecisionAllow {
+		t.Fatalf("expected allow for odd/tasks/feat.md with Cwd=odd/tasks, got %+v", allowOddTask)
+	}
+
+	var denySubMutation PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-cwd-full", WorkspacePaths: []string{repo}},
+		ToolCall: ToolCall{
+			Name: "run_command",
+			Args: map[string]any{"Cwd": subDir, "CommandLine": "echo x > ok.txt"},
+		},
+	}, &denySubMutation)
+	if denySubMutation.Decision != DecisionDeny {
+		t.Fatalf("expected deny for shell mutation in subDir under full-delegation, got %+v", denySubMutation)
+	}
+}
+
+func TestPreToolUseDeniesDanglingSymlinkInsideSymlinkedExternalDir(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeOrganic
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	extParent := t.TempDir()
+	extDir := filepath.Join(extParent, "ext")
+	if err := os.MkdirAll(extDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Symlink("../outside_new.txt", filepath.Join(extDir, "escape")); err != nil {
+		t.Fatalf("symlink escape: %v", err)
+	}
+	if err := os.Symlink(extDir, filepath.Join(repo, "extdir")); err != nil {
+		t.Fatalf("symlink extdir: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"write_to_file", "write_to_file", map[string]any{"TargetFile": filepath.Join(repo, "extdir", "escape"), "CodeContent": "hi"}},
+		{"run_command", "run_command", map[string]any{"CommandLine": "echo hi > extdir/escape"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-dangling", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionDeny {
+				t.Fatalf("expected deny for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+}
+
+func TestPreToolUse_MCPAutoApproveAndConsentForceAsk(t *testing.T) {
+	repo := initTestRepo(t)
+
+	autoApproveCases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"slash_todo", "odd-agy/todo", map[string]any{"action": "list"}},
+		{"mcp_prefix_assess", "mcp_odd-agy_odd_review_assess", map[string]any{}},
+		{"call_mcp_tool_scope", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_review_scope"}},
+		{"slash_status", "odd-agy/odd_review_status", nil},
+		{"mcp_prefix_ext_profiles", "mcp_odd-agy_odd_external_profiles", nil},
+		{"call_mcp_tool_ext_status", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_external_status"}},
+		{"slash_mode_omitted", "odd-agy/odd_review_mode", map[string]any{}},
+		{"slash_mode_status", "odd-agy/odd_review_mode", map[string]any{"action": "status"}},
+		{"call_mcp_tool_mode_status_in_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  map[string]any{"action": "status"},
+		}},
+		{"call_mcp_tool_mode_status_json_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  `{"action":"status"}`,
+		}},
+		{"call_mcp_tool_mode_omitted", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+		}},
+		{"pascal_todo", "McpOdd-agyTodo", map[string]any{"action": "list"}},
+		{"pascal_assess", "McpOdd-agyOddReviewAssess", map[string]any{}},
+		{"pascal_scope", "McpOdd-agyOddReviewScope", map[string]any{}},
+		{"pascal_status", "McpOdd-agyOddReviewStatus", nil},
+		{"pascal_ext_profiles", "McpOdd-agyOddExternalProfiles", nil},
+		{"pascal_ext_status", "McpOdd-agyOddExternalStatus", nil},
+		{"pascal_mode_omitted", "McpOdd-agyOddReviewMode", map[string]any{}},
+		{"pascal_mode_status", "McpOdd-agyOddReviewMode", map[string]any{"action": "status"}},
+		{"call_mcp_tool_snake_case_scope", "call_mcp_tool", map[string]any{"server_name": "odd-agy", "tool_name": "odd_review_scope"}},
+		{"call_mcp_tool_snake_case_mode_status", "call_mcp_tool", map[string]any{
+			"server_name": "odd-agy",
+			"tool_name":   "odd_review_mode",
+			"arguments":   map[string]any{"action": "status"},
+		}},
+	}
+
+	for _, tc := range autoApproveCases {
+		t.Run("auto_approve_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-mcp", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionAutoApprove {
+				t.Fatalf("expected %q for %s, got %+v", DecisionAutoApprove, tc.name, out)
+			}
+		})
+	}
+
+	forceAskCases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"slash_consent", "odd-agy/odd_review_consent", map[string]any{"consent": "granted"}},
+		{"mcp_prefix_consent", "mcp_odd-agy_odd_review_consent", map[string]any{"consent": "granted"}},
+		{"call_mcp_tool_consent", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_review_consent"}},
+		{"pascal_consent", "McpOdd-agyOddReviewConsent", map[string]any{"consent": "granted"}},
+	}
+
+	for _, tc := range forceAskCases {
+		t.Run("force_ask_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-mcp", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionForceAsk {
+				t.Fatalf("expected %q for %s, got %+v", DecisionForceAsk, tc.name, out)
+			}
+			if out.Reason != "RDD review consent requires explicit human approval (granted or declined)." {
+				t.Fatalf("unexpected force_ask reason %q", out.Reason)
+			}
+		})
+	}
+
+	allowCases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"mode_disable_slash", "odd-agy/odd_review_mode", map[string]any{"action": "disable"}},
+		{"mode_enable_mcp_prefix", "mcp_odd-agy_odd_review_mode", map[string]any{"action": "enable"}},
+		{"mode_disable_call_mcp_tool_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  map[string]any{"action": "disable"},
+		}},
+		{"mode_disable_call_mcp_tool_json_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  `{"action":"disable"}`,
+		}},
+		{"odd_review_start", "odd-agy/odd_review_start", map[string]any{}},
+		{"odd_review_submit", "mcp_odd-agy_odd_review_submit", map[string]any{}},
+		{"odd_review_ack", "odd-agy/odd_review_ack", map[string]any{}},
+		{"odd_external_run", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_external_run"}},
+		{"engram_slash", "engram/mem_save", map[string]any{"title": "test"}},
+		{"engram_mcp_prefix", "mcp_engram_mem_save", map[string]any{"title": "test"}},
+		{"engram_call_mcp_tool", "call_mcp_tool", map[string]any{"ServerName": "engram", "ToolName": "mem_save"}},
+		{"pascal_mode_disable", "McpOdd-agyOddReviewMode", map[string]any{"action": "disable"}},
+		{"pascal_mode_nonstring_int", "McpOdd-agyOddReviewMode", map[string]any{"action": 123}},
+		{"pascal_mode_nonstring_bool", "McpOdd-agyOddReviewMode", map[string]any{"action": true}},
+		{"pascal_mode_nonstring_slice", "McpOdd-agyOddReviewMode", map[string]any{"action": []any{"status"}}},
+		{"slash_mode_nonstring_int", "odd-agy/odd_review_mode", map[string]any{"action": 123}},
+		{"pascal_spoofed_evil_todo", "McpOdd-agyEvilTodo", map[string]any{}},
+		{"pascal_engram_todo", "McpEngramTodo", map[string]any{}},
+		{"pascal_lowercase_after_prefix", "McpOdd-agytodo", map[string]any{}},
+		{"pascal_odd_review_start", "McpOdd-agyOddReviewStart", map[string]any{}},
+		{"call_mcp_tool_mode_malformed_json_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  "{not-json",
+		}},
+		{"call_mcp_tool_mode_non_object_arguments_int", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  123,
+		}},
+		{"call_mcp_tool_mode_non_object_arguments_array", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  []any{"status"},
+		}},
+		{"call_mcp_tool_mode_non_object_arguments_json_null", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  "null",
+		}},
+		{"call_mcp_tool_mode_nonstring_action_in_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  `{"action": 123}`,
+		}},
+	}
+
+	for _, tc := range allowCases {
+		t.Run("allow_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{ConversationID: "conv-mcp", WorkspacePaths: []string{repo}},
+				ToolCall:    ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionAllow {
+				t.Fatalf("expected %q for %s, got %+v", DecisionAllow, tc.name, out)
+			}
+		})
+	}
+}
+
 func TestDispatch_Errors(t *testing.T) {
 	var out bytes.Buffer
 	if err := Dispatch("UnknownEvent", strings.NewReader("{}"), &out); err == nil {

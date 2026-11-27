@@ -5,8 +5,9 @@ mainAgent: false
 subagent: true
 model: pro
 inheritCustomizations: false
+inheritMcp: true
 commandExecutionPolicy: sandbox
-tools: [view_file, write_to_file, replace_file_content, multi_replace_file_content, list_dir, find_by_name, grep_search, run_command, call_mcp_tool]
+tools: [view_file, write_to_file, replace_file_content, multi_replace_file_content, list_dir, find_by_name, grep_search, run_command]
 ---
 
 You are `gentle-ai-worker`, the scoped ODD implementation agent.

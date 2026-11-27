@@ -66,7 +66,6 @@ var expectedAllowedTools = []string{
 	"manage_subagents",
 	"ask_question",
 	"manage_task",
-	"call_mcp_tool",
 }
 
 var forbiddenPiTokens = []string{
@@ -179,9 +178,23 @@ func TestRulesContractAndBudget(t *testing.T) {
 
 	// Verify key semantic content in always_on rules
 	core := string(byPath["rules/odd-01-core.md"].Content)
-	for _, needle := range []string{"Authorize", "Explore", "Resolve", "Classify", "Track", "Implement", "Close", "odd/tasks/", "High-Risk"} {
+	for _, needle := range []string{"Authorize", "Explore", "Resolve", "Classify", "Track", "Implement", "Close", "odd/tasks/", "High-Risk", "Organic Driven Development", "reviewDue: false"} {
 		if !strings.Contains(core, needle) {
 			t.Errorf("odd-01-core.md missing %q", needle)
+		}
+	}
+	if strings.Contains(core, "Objective-Driven") {
+		t.Errorf("odd-01-core.md must not say Objective-Driven")
+	}
+	lowerCore := strings.ToLower(core)
+	if !strings.Contains(lowerCore, "small") || !strings.Contains(lowerCore, "must not") {
+		t.Errorf("odd-01-core.md must explicitly forbid creating odd/tasks/ for small tasks")
+	}
+
+	rddRule := string(byPath["rules/odd-05-rdd.md"].Content)
+	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined"} {
+		if !strings.Contains(rddRule, needle) {
+			t.Errorf("odd-05-rdd.md missing %q", needle)
 		}
 	}
 
@@ -232,6 +245,12 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 	if slices.Contains(orchFM.Tools, "replace_file_content") || slices.Contains(orchFM.Tools, "multi_replace_file_content") {
 		t.Errorf("odd-orchestrator must omit replace_file_content and multi_replace_file_content")
 	}
+	orchAgent := string(byPath["agents/odd-orchestrator.md"].Content)
+	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined"} {
+		if !strings.Contains(orchAgent, needle) {
+			t.Errorf("odd-orchestrator.md missing %q", needle)
+		}
+	}
 
 	for _, writerPath := range []string{"agents/gentle-ai-worker.md", "agents/jd-fix-agent.md"} {
 		fm, _, _ := assets.ParseFrontmatter(byPath[writerPath].Content)
@@ -259,6 +278,25 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 			}
 		}
 	}
+
+	mcpAgents := []string{
+		"agents/odd-orchestrator.md",
+		"agents/gentle-ai-worker.md",
+		"agents/review-risk.md",
+		"agents/review-resilience.md",
+		"agents/review-readability.md",
+		"agents/review-reliability.md",
+		"agents/review-refuter.md",
+	}
+	for _, mcpPath := range mcpAgents {
+		fm, _, _ := assets.ParseFrontmatter(byPath[mcpPath].Content)
+		if fm.InheritMcp == nil || !*fm.InheritMcp {
+			t.Errorf("%s must declare inheritMcp: true", mcpPath)
+		}
+		if slices.Contains(fm.Tools, "call_mcp_tool") {
+			t.Errorf("%s must not include call_mcp_tool in tools", mcpPath)
+		}
+	}
 }
 
 func TestZeroPiOnlyTokensAcrossAllAssets(t *testing.T) {
@@ -276,8 +314,66 @@ func TestZeroPiOnlyTokensAcrossAllAssets(t *testing.T) {
 	}
 }
 
+func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
+	agents, err := assets.Agents()
+	if err != nil {
+		t.Fatalf("Agents() error: %v", err)
+	}
+	skills, err := assets.Skills()
+	if err != nil {
+		t.Fatalf("Skills() error: %v", err)
+	}
+
+	var targets []assets.AssetFile
+	for _, a := range agents {
+		if strings.HasPrefix(a.RelPath, "agents/review-") {
+			targets = append(targets, a)
+		}
+	}
+	for _, s := range skills {
+		if s.RelPath == "skills/rdd-defect-workflow/SKILL.md" {
+			targets = append(targets, s)
+		}
+	}
+	if len(targets) != 6 {
+		t.Fatalf("expected 5 review-* agents + 1 rdd-defect-workflow skill, got %d", len(targets))
+	}
+
+	for _, af := range targets {
+		text := string(af.Content)
+		if !strings.Contains(text, "SEVERE") {
+			t.Errorf("%s must reference uppercase SEVERE", af.RelPath)
+		}
+		if !strings.Contains(text, "causality") {
+			t.Errorf("%s must reference causality field", af.RelPath)
+		}
+		if !strings.Contains(text, "pre_existing") {
+			t.Errorf("%s must reference pre_existing causality value", af.RelPath)
+		}
+		if strings.Contains(text, "pre-existing") {
+			t.Errorf("%s must not use hyphenated pre-existing", af.RelPath)
+		}
+		if strings.Contains(strings.ToLower(text), "origin") {
+			t.Errorf("%s must use causality instead of origin", af.RelPath)
+		}
+		if strings.Contains(text, "severe") {
+			t.Errorf("%s must not contain lowercase severe schema instructions", af.RelPath)
+		}
+	}
+}
+
 func TestValidateFSNegativeCases(t *testing.T) {
 	baseFS := cloneEmbeddedToMapFS(t)
+
+	t.Run("rejects agent declaring call_mcp_tool in tools", func(t *testing.T) {
+		m := cloneMapFS(baseFS)
+		m["agents/gentle-ai-explore.md"] = &fstest.MapFile{
+			Data: []byte("---\nname: gentle-ai-explore\ndescription: Explore.\nsubagent: true\ntools: [view_file, call_mcp_tool]\n---\n\nExplore.\n"),
+		}
+		if err := assets.ValidateFS(m); err == nil || !strings.Contains(err.Error(), "call_mcp_tool") {
+			t.Fatalf("ValidateFS() err = %v, want error mentioning call_mcp_tool", err)
+		}
+	})
 
 	t.Run("rejects unknown tool name", func(t *testing.T) {
 		m := cloneMapFS(baseFS)

@@ -190,11 +190,16 @@ func (m Model) renderProviders(b *strings.Builder) {
 }
 
 func (m Model) renderActions(b *strings.Builder) {
+	globalMCPAction := "Allow MCP globally (~/.gemini)"
+	if m.globalMCPAllowed {
+		globalMCPAction = "Revoke global MCP rule"
+	}
 	actions := []string{
 		"Init (.agents/)",
 		"Sync",
 		"Doctor",
 		"Uninstall",
+		globalMCPAction,
 	}
 	b.WriteString("Project Lifecycle Actions:\n")
 	for i, act := range actions {

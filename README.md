@@ -13,15 +13,41 @@ Distributed as a single Go binary (`odd-agy`) wrapped for `pnpm` (`github.com/Na
 ```bash
 pnpm add -D odd-agy
 pnpm exec odd-agy init
+pnpm exec odd-agy launch
 ```
 
 ### Standalone project install (`pnpm dlx`)
 
 ```bash
 pnpm dlx odd-agy init --mode=standalone
+odd-agy launch
 ```
 
-This installs project-scoped `.agents/` assets, hooks, MCP configuration, and defaults in your repository while preserving any pre-existing hooks or MCP servers in `.agents/hooks.json` and `.agents/mcp_config.json`.
+`odd-agy init` installs project-scoped `.agents/` assets, hooks, MCP configuration, `.agents/odd/agy-session-settings.json`, and defaults in your repository while preserving any pre-existing hooks or MCP servers in `.agents/hooks.json` and `.agents/mcp_config.json`—without touching `~/.gemini/`.
+
+### Recommended launch (`odd-agy launch` — zero global config)
+
+Start Antigravity CLI via `odd-agy launch` to pass `.agents/odd/agy-session-settings.json` with `--settings` and select `odd-orchestrator`:
+
+```bash
+odd-agy launch
+odd-agy launch -- --model pro
+odd-agy launch --no-agent -- --continue
+```
+
+This keeps all permission rules 100% project-scoped (`mcp(odd-agy/*)` allowed, `mcp(odd-agy/odd_review_consent)` still prompting for explicit human approval) with zero writes to `~/.gemini/`.
+
+### Optional global opt-in (`--allow-mcp` / `odd-agy permissions`)
+
+If you prefer running plain `agy` directly without `odd-agy launch`, you can optionally opt in to adding the same two MCP rules to `~/.gemini/antigravity-cli/settings.json` (creates a timestamped `.odd-agy.bak.*` backup if the file already exists and preserves all existing keys and rules):
+
+```bash
+odd-agy init --allow-mcp
+# or manage anytime:
+odd-agy permissions status
+odd-agy permissions allow-mcp
+odd-agy permissions revoke-mcp
+```
 
 ---
 
@@ -38,7 +64,9 @@ Every TUI setting has an equivalent non-interactive CLI command:
 
 | Command | Description |
 |---|---|
-| `odd-agy init [--mode=local\|standalone] [--delegation=full-delegation\|organic] [--profile=agy-oauth] [--binary=...] [--force]` | Install `.agents/` rules, agents, skills, hooks, and MCP config |
+| `odd-agy init [--mode=local\|standalone] [--delegation=full-delegation\|organic] [--profile=agy-oauth] [--binary=...] [--allow-mcp] [--force]` | Install `.agents/` rules, agents, skills, hooks, MCP config, and `.agents/odd/agy-session-settings.json` (use `--allow-mcp` only to opt into global `~/.gemini/antigravity-cli/settings.json`) |
+| `odd-agy launch [--agent=<name>] [--no-agent] [-- <extra agy args...>]` | Recommended zero-global-config launcher passing `--agent` and `--settings <abs-path-to-.agents/odd/agy-session-settings.json>` to `agy` |
+| `odd-agy permissions [status\|allow-mcp\|revoke-mcp]` | Inspect, grant, or revoke optional global `~/.gemini/antigravity-cli/settings.json` MCP permission rules |
 | `odd-agy sync [--binary=...] [--force]` | Refresh managed `.agents/` files against `.agents/odd/.managed-manifest.json` |
 | `odd-agy doctor` | Verify `agy`, `engram`, `.agents/` assets, hooks, MCP config, provider readiness, and global `~/.gemini/` collisions |
 | `odd-agy uninstall` | Remove only managed `.agents/` files and `odd-agy` hook/MCP entries, keeping user entries intact |
@@ -91,6 +119,7 @@ Running `odd-agy init` installs:
 ├── agents/             # 12 native Antigravity agents (verified Antigravity tool names only)
 ├── skills/             # 15 portable slash commands & ODD workflows (1-level depth SKILL.md)
 ├── odd/
+│   ├── agy-session-settings.json  # project-scoped MCP allow/ask rules for `odd-agy launch`
 │   ├── config.json     # delegationMode, rddEnabled, installMode, binaryCommand
 │   ├── profiles.json   # activeProfile, providers, per-role routes & fallbacks
 │   └── .managed-manifest.json

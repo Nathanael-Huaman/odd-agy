@@ -452,9 +452,15 @@ func (e *Engine) ApplyCorrection(lineageID string) (LineageStatus, error) {
 	nextRev := st.Revision + 1
 	var reqCtxBytes []byte
 	if st.RequestContextHash != "" {
-		// Copy preserved request context from revision 1 if present.
+		// Copy preserved request context from prior revision and verify its digest.
 		prevCtxPath := filepath.Join(candidateDir(gitDir, lineageID), fmt.Sprintf("rev-%d", st.Revision), "request-context.txt")
-		reqCtxBytes, _ = os.ReadFile(prevCtxPath)
+		reqCtxBytes, err = os.ReadFile(prevCtxPath)
+		if err != nil {
+			return LineageStatus{}, fmt.Errorf("read frozen request context %s: %w", prevCtxPath, err)
+		}
+		if sha256Hex(reqCtxBytes) != st.RequestContextHash {
+			return LineageStatus{}, fmt.Errorf("tamper detected: frozen request-context.txt sha256 mismatch")
+		}
 	}
 
 	manifest, manifestFileHash, err := freezeSnapshot(gitDir, lineageID, nextRev, st.BaseRef, st.CommittedOnly, st.Lenses, st.LensesReason, st.RequestContextHash, reqCtxBytes, snap)
@@ -846,7 +852,19 @@ func loadAndVerifyManifest(gitDir string, st persistedLineage) (Manifest, error)
 	}
 	manifest.ManifestSHA256 = storedHash
 
-	filesDir := filepath.Join(candDir, fmt.Sprintf("rev-%d", manifest.Revision), "files")
+	revDir := filepath.Join(candDir, fmt.Sprintf("rev-%d", manifest.Revision))
+	if manifest.RequestContextHash != "" {
+		ctxPath := filepath.Join(revDir, "request-context.txt")
+		ctxBytes, err := os.ReadFile(ctxPath)
+		if err != nil {
+			return Manifest{}, fmt.Errorf("tamper detected: missing frozen request-context.txt: %w", err)
+		}
+		if sha256Hex(ctxBytes) != manifest.RequestContextHash {
+			return Manifest{}, fmt.Errorf("tamper detected: frozen request-context.txt sha256 mismatch")
+		}
+	}
+
+	filesDir := filepath.Join(revDir, "files")
 	for _, f := range manifest.Files {
 		if f.Status == "D" {
 			continue

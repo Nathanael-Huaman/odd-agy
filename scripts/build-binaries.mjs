@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { mkdirSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,13 +23,33 @@ mkdirSync(outDir, { recursive: true });
 
 function buildOne(outName, envOverrides = {}) {
   const outPath = path.join(outDir, outName);
-  const res = spawnSync("go", ["build", "-o", outPath, "./cmd/odd-agy"], {
+  const tmpPath = `${outPath}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  const res = spawnSync("go", ["build", "-o", tmpPath, "./cmd/odd-agy"], {
     cwd: pkgRoot,
     env: { ...process.env, CGO_ENABLED: "0", ...envOverrides },
     stdio: "inherit",
   });
   if (res.status !== 0) {
+    if (existsSync(tmpPath)) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Ignore cleanup failure on error exit.
+      }
+    }
     process.exit(res.status ?? 1);
+  }
+  try {
+    renameSync(tmpPath, outPath);
+  } catch (err) {
+    if (existsSync(tmpPath)) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Ignore cleanup failure on rename error.
+      }
+    }
+    throw err;
   }
 }
 

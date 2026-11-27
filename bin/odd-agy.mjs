@@ -37,8 +37,11 @@ function resolveBinary() {
       const buildScript = path.join(pkgRoot, "scripts", "build-binaries.mjs");
       const buildRes = spawnSync(process.execPath, [buildScript], {
         cwd: pkgRoot,
-        stdio: "inherit",
+        stdio: ["ignore", "pipe", "inherit"],
       });
+      if (buildRes.stdout && buildRes.stdout.length > 0) {
+        process.stderr.write(buildRes.stdout);
+      }
       if (buildRes.status === 0 && existsSync(localBin)) {
         return localBin;
       }

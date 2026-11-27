@@ -5,15 +5,17 @@ description: Core ODD 7-step workflow, High-Risk rubric, task sizing, safety gua
 
 # ODD Core Discipline (`odd-agy`)
 
-Follow Objective-Driven Development (ODD) on every non-trivial task.
+Follow **ODD = Organic Driven Development** proportionally on every task.
 
 ## 1. Seven-Step Mandatory Workflow
 
 1. **Authorize**: Before mutating repository files, configs, or git state, confirm the task is clearly authorized. Discussing, exploring, and diagnosing are always safe; confirm before ambiguous, irreversible, or high-impact changes.
 2. **Explore**: Inspect existing code first using `gentle-ai-explore` or targeted file reads to gather exact `path:line` anchors before planning or editing.
 3. **Resolve uncertainty**: Never guess when requirements, scope, ownership, or trade-offs are ambiguous. Pause and ask via `ask_question` with concrete bounded choices and a recommended option.
-4. **Classify**: Size the task (`Small`, `Medium`, `Large`) by changed lines, touched files, dependencies, and reversibility, and apply the **Resume Test**: if work could pause across resets or spans multiple units, create/update `odd/tasks/<feature>.md`.
-5. **Track**: Maintain `odd/tasks/<feature>.md` (`## Specs` verbatim, `## Tasks`, `## Log`), mirror durable decisions in Engram (`mem_search` -> `mem_get_observation` -> `mem_update` or `mem_save`), and sync the active checklist via the `todo` MCP tool.
+4. **Classify**: Size the task (`Small`, `Medium`, `Large`) by changed lines, touched files, dependencies, and reversibility, and apply the **Resume Test**:
+   - **Small tasks** (clearly understood, no High-Risk item 1–6, passes the resume test without a tracking file): **MUST NOT** create `odd/tasks/<feature>.md`, **MUST NOT** create a `todo` list unless requested by the user, and **MUST NOT** start RDD (`odd_review_start`) when `odd_review_assess` returns `reviewDue: false` (unless the user explicitly asks for a review).
+   - **Medium / Large / High-Risk tasks** (or work that could pause across resets or spans multiple units): create/update `odd/tasks/<feature>.md`.
+5. **Track**: For tasks that need tracking, maintain `odd/tasks/<feature>.md` (`## Specs` verbatim, `## Tasks`, `## Log`), mirror durable decisions in Engram (`mem_search` -> `mem_get_observation` -> `mem_update` or `mem_save`), and sync the active checklist via the `todo` MCP tool.
 6. **Implement**: Execute task by task using test-first discipline (`RED` -> `GREEN` -> `PRESERVE` -> `REFACTOR`) and logical work-unit commits (~400 authored changed lines per slice).
 7. **Close**: Conclude only with verified command evidence (`<exact command>: <observed result>`), RDD review status when enabled, and an explicit `Risk:` line.
 
