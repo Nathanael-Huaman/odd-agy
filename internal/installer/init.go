@@ -86,15 +86,23 @@ func Init(workspaceRoot string, opts InitOptions) (InitResult, error) {
 	}
 
 	var profilesExists bool
+	activeProfilesCfg := desiredProfiles
 	if _, err := os.Stat(config.ProfilesPath(ws)); err == nil {
 		profilesExists = true
 		if !opts.Force {
-			if _, err := config.LoadProfiles(ws); err != nil {
+			existingProfiles, err := config.LoadProfiles(ws)
+			if err != nil {
 				return InitResult{}, fmt.Errorf("existing profiles invalid (use Force to overwrite): %w", err)
 			}
+			activeProfilesCfg = existingProfiles
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return InitResult{}, fmt.Errorf("stat profiles: %w", err)
+	}
+
+	var activeProfilePtr *config.ProfileConfig
+	if prof, ok := activeProfilesCfg.Profiles[activeProfilesCfg.ActiveProfile]; ok {
+		activeProfilePtr = &prof
 	}
 
 	if _, _, err := readJSONObject(HooksPath(ws)); err != nil {
@@ -129,10 +137,11 @@ func Init(workspaceRoot string, opts InitOptions) (InitResult, error) {
 		if err != nil {
 			return InitResult{}, err
 		}
-		if err := writeFileAtomic(target, af.Content, 0o644); err != nil {
+		rendered := renderAssetForProfile(af, activeProfilePtr)
+		if err := writeFileAtomic(target, rendered, 0o644); err != nil {
 			return InitResult{}, err
 		}
-		manifestFiles[relSlash] = sha256PrefixedHex(af.Content)
+		manifestFiles[relSlash] = sha256PrefixedHex(rendered)
 		installed = append(installed, relSlash)
 	}
 

@@ -42,6 +42,10 @@ func (m Model) View() string {
 		m.renderProfiles(&b)
 	case screenRoles:
 		m.renderRoles(&b)
+	case screenModelPicker:
+		m.renderModelPicker(&b)
+	case screenEffortPicker:
+		m.renderEffortPicker(&b)
 	case screenProviders:
 		m.renderProviders(&b)
 	case screenActions:
@@ -52,6 +56,14 @@ func (m Model) View() string {
 		b.WriteByte('\n')
 		b.WriteString(focusStyle.Render(fmt.Sprintf("Edit %s (%s): %s_", m.inputLabel(), m.inputTarget, m.inputBuffer)))
 		b.WriteByte('\n')
+		if m.inputMode == inputRoleModel {
+			if prof, ok := m.profiles.Profiles[m.profiles.ActiveProfile]; ok {
+				if route, ok := prof.Roles[m.inputTarget]; ok && route.Runtime == config.RuntimeAgyNative {
+					b.WriteString(mutedStyle.Render("Antigravity models: inherit, flash, gemini-3.8-flash-high, gemini-3.8-flash-medium, gemini-3.8-flash-low, gemini-4-hydrogen-high, claude-sonnet-4-6, claude-opus-4-6-thinking"))
+					b.WriteByte('\n')
+				}
+			}
+		}
 		b.WriteString(mutedStyle.Render("[enter] save  [esc] cancel"))
 		b.WriteByte('\n')
 	}
@@ -95,7 +107,7 @@ func (m Model) renderOverview(b *strings.Builder) {
 		fmt.Sprintf("Toggle Delegation Mode (%s)", m.cfg.DelegationMode),
 		fmt.Sprintf("Toggle RDD (%s)", boolOnOff(m.cfg.RDDEnabled)),
 		fmt.Sprintf("Active Profile (%s)", m.profiles.ActiveProfile),
-		"Roles Editor (11 roles)",
+		fmt.Sprintf("Roles Editor (%d roles)", len(config.AllRoles)),
 		"Providers & Probe",
 		"Project Actions (Init / Sync / Doctor / Uninstall)",
 	}
@@ -138,12 +150,59 @@ func (m Model) renderRoles(b *strings.Builder) {
 		if prov == "" {
 			prov = "-"
 		}
-		line := fmt.Sprintf("%-18s %-12s %-18s %s", role, route.Runtime, prov, route.Model)
+		effort := route.Effort
+		if effort == "" {
+			effort = "default"
+		}
+		line := fmt.Sprintf("%-18s %-12s %-18s %-26s %s", role, route.Runtime, prov, route.Model, effort)
 		b.WriteString(renderCursorLine(i == m.cursor, line))
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')
-	b.WriteString(mutedStyle.Render("[t/enter] toggle runtime  [p] cycle provider  [m] edit model  [esc] back  [q] quit"))
+	b.WriteString(mutedStyle.Render("[t] toggle runtime  [p] cycle provider  [m] model  [e] effort  [esc] back  [q] quit"))
+	b.WriteByte('\n')
+}
+
+func (m Model) renderModelPicker(b *strings.Builder) {
+	b.WriteString(fmt.Sprintf("Select Model for %s (%s):\n", m.pickerRole, m.profiles.ActiveProfile))
+	var catalog []AgyModelOption
+	if m.pickerRole == config.RoleOrchestrator {
+		catalog = m.agyModels
+		if !m.agyModelsLoaded {
+			catalog = fallbackAgyModels
+		}
+	}
+	opts := m.buildModelPickerOptions(catalog)
+	for i, opt := range opts {
+		var line string
+		if opt.isCustom {
+			line = opt.label
+		} else if opt.label != "" {
+			line = fmt.Sprintf("%-26s %s", opt.id, opt.label)
+		} else {
+			line = opt.id
+		}
+		b.WriteString(renderCursorLine(i == m.cursor, line))
+		b.WriteByte('\n')
+	}
+	if m.pickerRole != config.RoleOrchestrator {
+		b.WriteByte('\n')
+		b.WriteString(mutedStyle.Render("Antigravity CLI native subagents accept inherit, flash, or pro (switch runtime with [t] to external-mcp for exact per-subagent models)."))
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("[up/down] move  [enter] select  [esc] cancel  [q] quit"))
+	b.WriteByte('\n')
+}
+
+func (m Model) renderEffortPicker(b *strings.Builder) {
+	b.WriteString(fmt.Sprintf("Select Effort for %s (%s):\n", m.pickerRole, m.profiles.ActiveProfile))
+	for i, opt := range effortPickerOptions {
+		b.WriteString(renderCursorLine(i == m.cursor, opt.label))
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	b.WriteString(mutedStyle.Render("[up/down] move  [enter] select  [esc] cancel  [q] quit"))
 	b.WriteByte('\n')
 }
 

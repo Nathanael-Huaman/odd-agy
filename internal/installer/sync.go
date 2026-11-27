@@ -61,6 +61,19 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 		binCmd = cfg.BinaryCommand
 	}
 
+	var activeProfilePtr *config.ProfileConfig
+	if _, err := os.Stat(config.ProfilesPath(ws)); err == nil {
+		profs, err := config.LoadProfiles(ws)
+		if err != nil {
+			return SyncResult{}, fmt.Errorf("load profiles: %w", err)
+		}
+		if prof, ok := profs.Profiles[profs.ActiveProfile]; ok {
+			activeProfilePtr = &prof
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return SyncResult{}, fmt.Errorf("stat profiles: %w", err)
+	}
+
 	// Preflight hooks.json and mcp_config.json validity before touching any files.
 	if _, _, err := readJSONObject(HooksPath(ws)); err != nil {
 		return SyncResult{}, err
@@ -89,7 +102,7 @@ func Sync(workspaceRoot string, opts SyncOptions) (SyncResult, error) {
 	for _, af := range allAssets {
 		desiredFiles = append(desiredFiles, desiredManagedFile{
 			relSlash: ".agents/" + af.RelPath,
-			content:  af.Content,
+			content:  renderAssetForProfile(af, activeProfilePtr),
 		})
 	}
 	desiredFiles = append(desiredFiles, desiredManagedFile{

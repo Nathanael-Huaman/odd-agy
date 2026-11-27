@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -21,6 +22,8 @@ const (
 	screenOverview screenKind = iota
 	screenProfiles
 	screenRoles
+	screenModelPicker
+	screenEffortPicker
 	screenProviders
 	screenActions
 )
@@ -35,12 +38,19 @@ const (
 	inputProviderModel
 )
 
+// AgyModelOption represents a selectable Antigravity CLI model entry.
+type AgyModelOption struct {
+	ID    string
+	Label string
+}
+
 // Options injects external dependencies so the TUI is 100% testable hermetically.
 type Options struct {
-	HomeDir   string
-	LookPath  func(string) (string, error)
-	LookupEnv func(string) (string, bool)
-	ProbeFunc func(ctx context.Context, providerName string, providerCfg config.ProviderConfig, lookupEnv func(string) (string, bool)) llm.ProbeResult
+	HomeDir       string
+	LookPath      func(string) (string, error)
+	LookupEnv     func(string) (string, bool)
+	ProbeFunc     func(ctx context.Context, providerName string, providerCfg config.ProviderConfig, lookupEnv func(string) (string, bool)) llm.ProbeResult
+	ListAgyModels func() []AgyModelOption
 }
 
 type probeResultMsg struct {
@@ -64,10 +74,14 @@ type Model struct {
 	probeResults  map[string]llm.ProbeResult
 	doctorReport  *installer.DoctorReport
 
-	confirmUninstall bool
-	inputMode        inputKind
-	inputBuffer      string
-	inputTarget      string
+	confirmUninstall   bool
+	inputMode          inputKind
+	inputBuffer        string
+	inputTarget        string
+	pickerRole         string
+	pickerReturnCursor int
+	agyModels          []AgyModelOption
+	agyModelsLoaded    bool
 
 	statusMsg string
 	errMsg    string
@@ -248,11 +262,7 @@ func (m *Model) commitInput(val string) error {
 		route.Model = val
 		prof.Roles[m.inputTarget] = route
 		m.profiles.Profiles[m.profiles.ActiveProfile] = prof
-		if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-			return err
-		}
-		m.errMsg = ""
-		m.statusMsg = fmt.Sprintf("Updated %s model to %s", m.inputTarget, val)
+		return m.persistProfileChange(fmt.Sprintf("Updated %s model to %s", m.inputTarget, val))
 
 	case inputProviderURL:
 		prov := m.profiles.Providers[m.inputTarget]
@@ -321,13 +331,19 @@ func (m Model) handleNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusMsg = "Reloaded workspace configuration"
 		return m, nil
 	case "esc":
-		if m.screen != screenOverview {
+		switch m.screen {
+		case screenModelPicker, screenEffortPicker:
+			m.screen = screenRoles
+			m.cursor = m.pickerReturnCursor
+			return m, nil
+		case screenOverview:
+			return m, nil
+		default:
 			m.screen = screenOverview
 			m.cursor = 0
 			m.doctorReport = nil
 			return m, nil
 		}
-		return m, nil
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
@@ -348,6 +364,10 @@ func (m Model) handleNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleProfilesKey(key)
 	case screenRoles:
 		return m.handleRolesKey(key)
+	case screenModelPicker:
+		return m.handleModelPickerKey(key)
+	case screenEffortPicker:
+		return m.handleEffortPickerKey(key)
 	case screenProviders:
 		return m.handleProvidersKey(key)
 	case screenActions:
@@ -367,6 +387,14 @@ func (m Model) maxCursorIndex() int {
 		return len(m.profileNames) - 1
 	case screenRoles:
 		return len(config.AllRoles) - 1
+	case screenModelPicker:
+		opts := m.modelPickerOptions()
+		if len(opts) == 0 {
+			return 0
+		}
+		return len(opts) - 1
+	case screenEffortPicker:
+		return len(effortPickerOptions) - 1
 	case screenProviders:
 		if len(m.providerNames) == 0 {
 			return 0
@@ -418,12 +446,7 @@ func (m Model) handleOverviewKey(key string) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.profiles.ActiveProfile = m.profileNames[nextIdx]
-			if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-				m.errMsg = err.Error()
-				return m, nil
-			}
-			m.errMsg = ""
-			m.statusMsg = fmt.Sprintf("Active profile set to %s", m.profiles.ActiveProfile)
+			_ = m.persistProfileChange(fmt.Sprintf("Active profile set to %s", m.profiles.ActiveProfile))
 			return m, nil
 		}
 		m.screen = screenProfiles
@@ -460,12 +483,9 @@ func (m Model) handleProfilesKey(key string) (tea.Model, tea.Cmd) {
 	}
 	chosen := m.profileNames[m.cursor]
 	m.profiles.ActiveProfile = chosen
-	if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-		m.errMsg = err.Error()
+	if err := m.persistProfileChange(fmt.Sprintf("Active profile set to %s", chosen)); err != nil {
 		return m, nil
 	}
-	m.errMsg = ""
-	m.statusMsg = fmt.Sprintf("Active profile set to %s", chosen)
 	m.screen = screenOverview
 	m.cursor = 2
 	return m, nil
@@ -480,39 +500,27 @@ func (m Model) handleRolesKey(key string) (tea.Model, tea.Cmd) {
 	route := prof.Roles[role]
 
 	switch key {
-	case "t", "enter", " ":
-		if route.Runtime == config.RuntimeAgyNative {
-			if len(m.providerNames) == 0 {
-				m.errMsg = "No providers configured"
-				return m, nil
-			}
-			provName := m.providerNames[0]
-			provCfg := m.profiles.Providers[provName]
-			route.Runtime = config.RuntimeExternalMCP
-			route.Provider = provName
-			if route.Model == "" || route.Model == "pro" || route.Model == "flash" {
-				route.Model = provCfg.DefaultModel
-			}
-		} else {
-			route.Runtime = config.RuntimeAgyNative
-			route.Provider = ""
-			if role == "explore" {
-				route.Model = "flash"
-			} else {
-				route.Model = "pro"
-			}
-		}
-		prof.Roles[role] = route
-		m.profiles.Profiles[m.profiles.ActiveProfile] = prof
-		if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-			m.errMsg = err.Error()
-			m.reload()
+	case "t", " ":
+		if role == config.RoleOrchestrator {
+			m.errMsg = ""
+			m.statusMsg = "orchestrator always runs on agy-native (press [m] to edit its model)"
 			return m, nil
 		}
-		m.errMsg = ""
-		m.statusMsg = fmt.Sprintf("Role %s runtime set to %s", role, route.Runtime)
+		m.toggleRoleRuntime(role)
+
+	case "enter":
+		if role == config.RoleOrchestrator {
+			m.openModelPicker(role, m.cursor)
+			return m, nil
+		}
+		m.toggleRoleRuntime(role)
 
 	case "p":
+		if role == config.RoleOrchestrator {
+			m.errMsg = ""
+			m.statusMsg = "orchestrator always runs on agy-native (press [m] to edit its model)"
+			return m, nil
+		}
 		if len(m.providerNames) == 0 {
 			m.errMsg = "No providers configured"
 			return m, nil
@@ -532,21 +540,152 @@ func (m Model) handleRolesKey(key string) (tea.Model, tea.Cmd) {
 		route.Model = m.profiles.Providers[nextProv].DefaultModel
 		prof.Roles[role] = route
 		m.profiles.Profiles[m.profiles.ActiveProfile] = prof
-		if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-			m.errMsg = err.Error()
-			m.reload()
-			return m, nil
-		}
-		m.errMsg = ""
-		m.statusMsg = fmt.Sprintf("Role %s provider set to %s", role, nextProv)
+		_ = m.persistProfileChange(fmt.Sprintf("Role %s provider set to %s", role, nextProv))
 
 	case "m":
+		if route.Runtime == config.RuntimeAgyNative {
+			m.openModelPicker(role, m.cursor)
+			return m, nil
+		}
 		m.inputMode = inputRoleModel
 		m.inputTarget = role
 		m.inputBuffer = route.Model
 		m.errMsg = ""
+
+	case "e":
+		m.openEffortPicker(role, m.cursor)
+		return m, nil
 	}
 
+	return m, nil
+}
+
+func (m *Model) toggleRoleRuntime(role string) {
+	prof := m.profiles.Profiles[m.profiles.ActiveProfile]
+	route := prof.Roles[role]
+	if route.Runtime == config.RuntimeAgyNative {
+		if len(m.providerNames) == 0 {
+			m.errMsg = "No providers configured"
+			return
+		}
+		provName := m.providerNames[0]
+		provCfg := m.profiles.Providers[provName]
+		route.Runtime = config.RuntimeExternalMCP
+		route.Provider = provName
+		if route.Model == "" || route.Model == "pro" || route.Model == "flash" {
+			route.Model = provCfg.DefaultModel
+		}
+	} else {
+		route.Runtime = config.RuntimeAgyNative
+		route.Provider = ""
+		if role == "explore" {
+			route.Model = "flash"
+		} else {
+			route.Model = "pro"
+		}
+	}
+	prof.Roles[role] = route
+	m.profiles.Profiles[m.profiles.ActiveProfile] = prof
+	_ = m.persistProfileChange(fmt.Sprintf("Role %s runtime set to %s", role, route.Runtime))
+}
+
+func (m *Model) openModelPicker(role string, roleIdx int) {
+	m.pickerRole = role
+	m.pickerReturnCursor = roleIdx
+	m.screen = screenModelPicker
+	m.errMsg = ""
+
+	opts := m.modelPickerOptions()
+	curModel := m.profiles.Profiles[m.profiles.ActiveProfile].Roles[role].Model
+	m.cursor = 0
+	for i, opt := range opts {
+		if !opt.isCustom && opt.id == curModel {
+			m.cursor = i
+			break
+		}
+	}
+}
+
+func (m *Model) openEffortPicker(role string, roleIdx int) {
+	m.pickerRole = role
+	m.pickerReturnCursor = roleIdx
+	m.screen = screenEffortPicker
+	m.errMsg = ""
+
+	curEffort := m.profiles.Profiles[m.profiles.ActiveProfile].Roles[role].Effort
+	m.cursor = 0
+	for i, opt := range effortPickerOptions {
+		if opt.value == curEffort {
+			m.cursor = i
+			break
+		}
+	}
+}
+
+func (m Model) handleModelPickerKey(key string) (tea.Model, tea.Cmd) {
+	if key != "enter" && key != " " {
+		return m, nil
+	}
+	opts := m.modelPickerOptions()
+	if m.cursor < 0 || m.cursor >= len(opts) {
+		return m, nil
+	}
+	chosen := opts[m.cursor]
+	prof := m.profiles.Profiles[m.profiles.ActiveProfile]
+	route := prof.Roles[m.pickerRole]
+
+	if chosen.isCustom {
+		m.screen = screenRoles
+		m.cursor = m.pickerReturnCursor
+		m.inputMode = inputRoleModel
+		m.inputTarget = m.pickerRole
+		m.inputBuffer = route.Model
+		m.errMsg = ""
+		return m, nil
+	}
+
+	route.Model = chosen.id
+	if chosen.fromCatalog {
+		if suffix, ok := extractCatalogEffortSuffix(chosen.id); ok {
+			route.Effort = suffix
+		}
+	}
+	prof.Roles[m.pickerRole] = route
+	m.profiles.Profiles[m.profiles.ActiveProfile] = prof
+
+	m.screen = screenRoles
+	m.cursor = m.pickerReturnCursor
+	_ = m.persistProfileChange(fmt.Sprintf("Updated %s model to %s", m.pickerRole, chosen.id))
+	return m, nil
+}
+
+func (m Model) handleEffortPickerKey(key string) (tea.Model, tea.Cmd) {
+	if key != "enter" && key != " " {
+		return m, nil
+	}
+	if m.cursor < 0 || m.cursor >= len(effortPickerOptions) {
+		return m, nil
+	}
+	chosen := effortPickerOptions[m.cursor].value
+	prof := m.profiles.Profiles[m.profiles.ActiveProfile]
+	route := prof.Roles[m.pickerRole]
+
+	route.Effort = chosen
+	if route.Runtime == config.RuntimeAgyNative && chosen != "" {
+		if variant, ok := findEffortModelVariant(m.ensureAgyModels(), route.Model, chosen); ok {
+			route.Model = variant
+		}
+	}
+	prof.Roles[m.pickerRole] = route
+	m.profiles.Profiles[m.profiles.ActiveProfile] = prof
+
+	m.screen = screenRoles
+	m.cursor = m.pickerReturnCursor
+	label := chosen
+	if label == "" {
+		label = "default"
+	}
+	_ = m.persistProfileChange(fmt.Sprintf("Updated %s effort to %s", m.pickerRole, label))
 	return m, nil
 }
 
@@ -669,9 +808,224 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) persistProfileChange(baseStatus string) error {
+	if err := config.ValidateProfiles(m.profiles); err != nil {
+		m.reload()
+		m.errMsg = err.Error()
+		return err
+	}
+	updated, err := installer.ApplyProfileModels(m.cwd, m.profiles)
+	if err != nil {
+		m.reload()
+		m.errMsg = err.Error()
+		return err
+	}
+	if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
+		_, _ = installer.ApplyActiveProfileModels(m.cwd)
+		m.reload()
+		m.errMsg = err.Error()
+		return err
+	}
+	m.errMsg = ""
+	if updated > 0 {
+		m.statusMsg = fmt.Sprintf("%s (%d .agents/agents/*.md synced; restart odd-agy launch to apply)", baseStatus, updated)
+	} else {
+		m.statusMsg = baseStatus
+	}
+	return nil
+}
+
 func boolOnOff(v bool) string {
 	if v {
 		return "on"
 	}
 	return "off"
+}
+
+type modelPickerItem struct {
+	id          string
+	label       string
+	fromCatalog bool
+	isCustom    bool
+}
+
+type effortPickerItem struct {
+	value string
+	label string
+}
+
+var effortPickerOptions = buildEffortPickerOptions()
+
+func buildEffortPickerOptions() []effortPickerItem {
+	opts := make([]effortPickerItem, 0, len(config.ValidEfforts))
+	for _, v := range config.ValidEfforts {
+		label := v
+		if v == "" {
+			label = "default (Antigravity default / inherit)"
+		}
+		opts = append(opts, effortPickerItem{value: v, label: label})
+	}
+	return opts
+}
+
+var fallbackAgyModels = []AgyModelOption{
+	{ID: "gemini-4-hydrogen-high", Label: "Gemini 4 Hydrogen (High)"},
+	{ID: "gemini-4-hydrogen-xhigh", Label: "Gemini 4 Hydrogen (XHigh)"},
+	{ID: "gemini-4-hydrogen-medium", Label: "Gemini 4 Hydrogen (Medium)"},
+	{ID: "gemini-4-hydrogen-low", Label: "Gemini 4 Hydrogen (Low)"},
+	{ID: "gemini-3.8-flash-high", Label: "Gemini 3.8 Flash (High)"},
+	{ID: "gemini-3.8-flash-medium", Label: "Gemini 3.8 Flash (Medium)"},
+	{ID: "gemini-3.8-flash-low", Label: "Gemini 3.8 Flash (Low)"},
+	{ID: "claude-sonnet-4-6", Label: "Claude Sonnet 4.6 (Thinking)"},
+	{ID: "claude-opus-4-6-thinking", Label: "Claude Opus 4.6 (Thinking)"},
+	{ID: "gpt-oss-120b-medium", Label: "GPT-OSS 120B (Medium)"},
+}
+
+func (m *Model) ensureAgyModels() []AgyModelOption {
+	if !m.agyModelsLoaded {
+		if m.opts.ListAgyModels != nil {
+			m.agyModels = m.opts.ListAgyModels()
+		} else {
+			m.agyModels = defaultListAgyModels(m.opts.LookPath)
+		}
+		m.agyModelsLoaded = true
+	}
+	return m.agyModels
+}
+
+func (m *Model) modelPickerOptions() []modelPickerItem {
+	if m.pickerRole != config.RoleOrchestrator {
+		return m.buildModelPickerOptions(nil)
+	}
+	return m.buildModelPickerOptions(m.ensureAgyModels())
+}
+
+func (m Model) buildModelPickerOptions(catalog []AgyModelOption) []modelPickerItem {
+	if m.pickerRole != config.RoleOrchestrator {
+		return []modelPickerItem{
+			{id: "inherit", label: "inherit session model"},
+			{id: "flash", label: "Antigravity fast tier"},
+			{id: "pro", label: "Antigravity pro/high tier"},
+		}
+	}
+	items := make([]modelPickerItem, 0, len(catalog)+4)
+	items = append(items,
+		modelPickerItem{id: "inherit", label: "Antigravity session default"},
+		modelPickerItem{id: "flash", label: "Antigravity fast alias"},
+		modelPickerItem{id: "pro", label: "Antigravity pro alias"},
+	)
+	for _, opt := range catalog {
+		if opt.ID == "inherit" || opt.ID == "flash" || opt.ID == "pro" {
+			continue
+		}
+		items = append(items, modelPickerItem{
+			id:          opt.ID,
+			label:       opt.Label,
+			fromCatalog: true,
+		})
+	}
+	items = append(items, modelPickerItem{
+		label:    "Custom model ID...",
+		isCustom: true,
+	})
+	return items
+}
+
+func defaultListAgyModels(lookPath func(string) (string, error)) []AgyModelOption {
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	agyPath, err := lookPath("agy")
+	if err != nil || strings.TrimSpace(agyPath) == "" {
+		return append([]AgyModelOption(nil), fallbackAgyModels...)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, agyPath, "models").Output()
+	if err != nil {
+		return append([]AgyModelOption(nil), fallbackAgyModels...)
+	}
+	parsed := parseAgyModelsOutput(string(out))
+	if len(parsed) == 0 {
+		return append([]AgyModelOption(nil), fallbackAgyModels...)
+	}
+	return parsed
+}
+
+func parseAgyModelsOutput(raw string) []AgyModelOption {
+	lines := strings.Split(raw, "\n")
+	out := make([]AgyModelOption, 0, len(lines))
+	seen := make(map[string]bool)
+	for _, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		id := strings.TrimSpace(parts[0])
+		label := strings.TrimSpace(parts[1])
+		if id == "" || strings.ContainsAny(id, " \t") || hasControlChar(id) || hasControlChar(label) {
+			continue
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, AgyModelOption{ID: id, Label: label})
+	}
+	return out
+}
+
+func hasControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+var catalogEffortSuffixes = []string{"xhigh", "medium", "high", "low", "max"}
+
+func extractCatalogEffortSuffix(modelID string) (string, bool) {
+	for _, s := range catalogEffortSuffixes {
+		if strings.HasSuffix(modelID, "-"+s) {
+			return s, true
+		}
+	}
+	return "", false
+}
+
+func findEffortModelVariant(models []AgyModelOption, currentModel, targetEffort string) (string, bool) {
+	if targetEffort == "" || len(models) == 0 {
+		return "", false
+	}
+	inCatalog := false
+	for _, m := range models {
+		if m.ID == currentModel {
+			inCatalog = true
+			break
+		}
+	}
+	if !inCatalog {
+		return "", false
+	}
+	suffix, ok := extractCatalogEffortSuffix(currentModel)
+	if !ok {
+		return "", false
+	}
+	base := strings.TrimSuffix(currentModel, "-"+suffix)
+	if base == "" {
+		return "", false
+	}
+	candidate := base + "-" + targetEffort
+	for _, m := range models {
+		if m.ID == candidate {
+			return candidate, true
+		}
+	}
+	return "", false
 }

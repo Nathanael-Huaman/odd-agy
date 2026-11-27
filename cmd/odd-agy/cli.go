@@ -381,14 +381,67 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 		return exitError
 	}
 
-	agyArgs := make([]string, 0, 4+len(extraArgs))
+	var orchestratorModel string
+	var orchestratorEffort string
+	if !noAgent && agentName == "odd-orchestrator" && (!hasCLIFlag(extraArgs, "--model") || !hasCLIFlag(extraArgs, "--effort")) {
+		if _, err := os.Stat(config.ProfilesPath(cwd)); err == nil {
+			profs, err := config.LoadProfiles(cwd)
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy launch: %v\n", err)
+				return exitError
+			}
+			if prof, ok := profs.Profiles[profs.ActiveProfile]; ok {
+				ra := prof.Roles[config.RoleOrchestrator]
+				if ra.Runtime == config.RuntimeAgyNative {
+					model := strings.TrimSpace(ra.Model)
+					if !hasCLIFlag(extraArgs, "--model") && model != "" && model != "inherit" {
+						orchestratorModel = model
+					}
+					if effort := strings.TrimSpace(ra.Effort); !hasCLIFlag(extraArgs, "--effort") && effort != "" && !modelHasEffortSuffix(model) {
+						orchestratorEffort = effort
+					}
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "odd-agy launch: stat profiles: %v\n", err)
+			return exitError
+		}
+	}
+
+	agyArgs := make([]string, 0, 8+len(extraArgs))
 	if !noAgent {
 		agyArgs = append(agyArgs, "--agent", agentName)
+		if orchestratorModel != "" {
+			agyArgs = append(agyArgs, "--model", orchestratorModel)
+		}
+		if orchestratorEffort != "" {
+			agyArgs = append(agyArgs, "--effort", orchestratorEffort)
+		}
 	}
 	agyArgs = append(agyArgs, "--settings", absSettings)
 	agyArgs = append(agyArgs, extraArgs...)
 
 	return runExternalCmd(cwd, stdin, stdout, stderr, agyBin, agyArgs...)
+}
+
+func hasCLIFlag(args []string, flagName string) bool {
+	prefix := flagName + "="
+	for _, a := range args {
+		if a == flagName || strings.HasPrefix(a, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelHasEffortSuffix(model string) bool {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	for _, suffix := range []string{"-low", "-medium", "-high", "-xhigh", "-max"} {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func runPermissions(args []string, stdout, stderr io.Writer) int {
@@ -622,6 +675,9 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 			} else {
 				fmt.Fprintf(stdout, "  %-20s runtime=%s model=%s", role, route.Runtime, route.Model)
 			}
+			if route.Effort != "" {
+				fmt.Fprintf(stdout, " effort=%s", route.Effort)
+			}
 			if len(route.Fallback) > 0 {
 				fb := route.Fallback[0]
 				if fb.Provider != "" {
@@ -645,7 +701,16 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 			return exitUsage
 		}
 		cfg.ActiveProfile = name
+		if err := config.ValidateProfiles(cfg); err != nil {
+			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
+			return exitError
+		}
+		if _, err := installer.ApplyProfileModels(cwd, cfg); err != nil {
+			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
+			return exitError
+		}
 		if err := config.SaveProfiles(cwd, cfg); err != nil {
+			_, _ = installer.ApplyActiveProfileModels(cwd)
 			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
 			return exitError
 		}
