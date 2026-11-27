@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 	"github.com/Nathanael-Huaman/odd-agy/internal/rdd"
@@ -578,5 +580,531 @@ func TestMCPDefaultServerUsesStoredSecretsAndEnvPrecedence(t *testing.T) {
 	}
 	if profSummary.Providers["deepseek"].APIKeyPresent || profSummary.Providers["deepseek"].KeySource != "missing" {
 		t.Fatalf("hermetic server must ignore stored secrets, got %+v", profSummary.Providers["deepseek"])
+	}
+}
+
+func TestMCPConcurrentExternalRunsExecuteInParallel(t *testing.T) {
+	const parallelCount = 3
+	var inFlight atomic.Int32
+	barrierReady := make(chan struct{})
+	var barrierOnce sync.Once
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n := inFlight.Add(1); n == parallelCount {
+			barrierOnce.Do(func() { close(barrierReady) })
+		}
+		select {
+		case <-barrierReady:
+		case <-time.After(3 * time.Second):
+			http.Error(w, "timed out waiting for concurrent peers (server is sequential!)", http.StatusGatewayTimeout)
+			return
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "par-1", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role":              "assistant",
+					"content":           "parallel ok",
+					"reasoning_content": "done",
+				},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"clientInfo":      map[string]any{"name": "parallel-test", "version": "1.0"},
+	})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// Write 3 tools/call requests concurrently while reading responses concurrently (avoids io.Pipe deadlock on regressions).
+	var writeMu sync.Mutex
+	var writeWG sync.WaitGroup
+	for i := 1; i <= parallelCount; i++ {
+		writeWG.Add(1)
+		id := 100 + i
+		go func(reqID int) {
+			defer writeWG.Done()
+			msg := map[string]any{
+				"jsonrpc": "2.0",
+				"id":      reqID,
+				"method":  "tools/call",
+				"params": map[string]any{
+					"name": "odd_external_run",
+					"arguments": map[string]any{
+						"role": "verify",
+						"task": "Verify main.go",
+					},
+				},
+			}
+			b, _ := json.Marshal(msg)
+			b = append(b, '\n')
+			writeMu.Lock()
+			_, err := inW.Write(b)
+			writeMu.Unlock()
+			if err != nil {
+				t.Errorf("write req %d: %v", reqID, err)
+			}
+		}(id)
+	}
+
+	// Read all 3 responses (order may vary due to concurrency).
+	seenIDs := make(map[int]bool)
+	for i := 0; i < parallelCount; i++ {
+		line, err := cli.reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read parallel response %d: %v", i, err)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal([]byte(line), &resp); err != nil {
+			t.Fatalf("unmarshal response %q: %v", line, err)
+		}
+		if resp["error"] != nil {
+			t.Fatalf("unexpected JSON-RPC error: %v", resp["error"])
+		}
+		id := int(resp["id"].(float64))
+		seenIDs[id] = true
+		res := resp["result"].(map[string]any)
+		if isErr, _ := res["isError"].(bool); isErr {
+			t.Fatalf("id %d tool returned error: %v", id, res)
+		}
+		text := res["content"].([]any)[0].(map[string]any)["text"].(string)
+		if !strings.Contains(text, `"status": "completed"`) {
+			t.Fatalf("id %d unexpected output: %s", id, text)
+		}
+	}
+	writeWG.Wait()
+	if len(seenIDs) != parallelCount {
+		t.Fatalf("seenIDs = %v, want 3 distinct responses", seenIDs)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve returned error on EOF: %v", err)
+	}
+}
+
+func TestMCPServeContextCancellationUnblocksAndWaitsInFlight(t *testing.T) {
+	inFlightStarted := make(chan struct{})
+	inFlightCanceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(inFlightStarted)
+		select {
+		case <-r.Context().Done():
+			close(inFlightCanceled)
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	defer inW.Close()
+	defer outR.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+	// Drain outR so in-flight error response (if written before ctx check) never blocks pipe.
+	go func() { _, _ = io.Copy(io.Discard, outR) }()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	msg := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "odd_external_run",
+			"arguments": map[string]any{"role": "verify", "task": "Verify main.go"},
+		},
+	}
+	b, _ := json.Marshal(msg)
+	b = append(b, '\n')
+	if _, err := cli.pw.Write(b); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	<-inFlightStarted
+	cancel()
+
+	select {
+	case <-inFlightCanceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for in-flight HTTP request cancellation")
+	}
+
+	select {
+	case err := <-serveDone:
+		if err != context.Canceled {
+			t.Fatalf("Serve error = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Serve to return after cancel")
+	}
+}
+
+func TestMCPExternalReviewRoleUsesFrozenScopeOnlyAndSubmitsDirectly(t *testing.T) {
+	const envSecret = "SUPER_SECRET_TOKEN_XYZ"
+	var step atomic.Int32
+	var seenToolNames []string
+	var sawRedactedEnv atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		n := step.Add(1)
+		if n == 1 {
+			for _, item := range payload["tools"].([]any) {
+				seenToolNames = append(seenToolNames, item.(map[string]any)["function"].(map[string]any)["name"].(string))
+			}
+		}
+		// Inspect tool outputs sent back on turn 2+ to confirm .env content is redacted.
+		for _, rawMsg := range payload["messages"].([]any) {
+			m := rawMsg.(map[string]any)
+			if m["role"] == "tool" {
+				content, _ := m["content"].(string)
+				if strings.Contains(content, envSecret) {
+					t.Errorf("frozen scope leaked raw .env secret in tool output: %s", content)
+				}
+				if strings.Contains(content, "[REDACTED SENSITIVE FILE CONTENT]") {
+					sawRedactedEnv.Store(true)
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "m1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading scope",
+						"tool_calls": []map[string]any{{
+							"id":   "c1",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "read_review_scope",
+								"arguments": `{"cursor":0}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		case 2:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "m2", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submitting warning only",
+						"tool_calls": []map[string]any{{
+							"id":   "c2",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": `{"findings":[{"id":"R-ENV","severity":"WARNING","causality":"candidate","location":".env:1","claim":"env file added"}]}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "m3", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "submitted risk lens cleanly",
+						"reasoning_content": "done",
+					},
+					"finish_reason": "stop",
+				}},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(42) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".env"), []byte("API_KEY="+envSecret+"\n"), 0o644); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"clientInfo":      map[string]any{"name": "review-test", "version": "1.0"},
+	})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk"},
+		"lensesReason": "verify frozen scope redaction and direct submit",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start failed: %s", startOut)
+	}
+	var startRes rdd.StartResult
+	if err := json.Unmarshal([]byte(startOut), &startRes); err != nil {
+		t.Fatalf("unmarshal StartResult: %v", err)
+	}
+	if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": startRes.LineageID,
+		"answer":    "granted",
+	}); isErr {
+		t.Fatal("odd_review_consent failed")
+	}
+
+	runOut, isErr := cli.callTool("odd_external_run", map[string]any{
+		"role":      "review-risk",
+		"lineageId": startRes.LineageID,
+		"task":      "Review the frozen snapshot.",
+	})
+	if isErr {
+		t.Fatalf("odd_external_run(review-risk) failed: %s", runOut)
+	}
+	var runObj map[string]any
+	if err := json.Unmarshal([]byte(runOut), &runObj); err != nil {
+		t.Fatalf("unmarshal runOut: %v", err)
+	}
+	if runObj["status"] != "completed" || runObj["submittedToLineage"] != true {
+		t.Fatalf("unexpected review-risk runObj: %s", runOut)
+	}
+
+	if len(seenToolNames) != 2 {
+		t.Fatalf("expected 2 tools for review-risk, got %v", seenToolNames)
+	}
+	for _, tn := range seenToolNames {
+		if tn != "read_review_scope" && tn != "submit_review_findings" {
+			t.Fatalf("unexpected tool exposed to review-risk: %q", tn)
+		}
+	}
+	if !sawRedactedEnv.Load() {
+		t.Fatal("expected read_review_scope output to contain [REDACTED SENSITIVE FILE CONTENT]")
+	}
+
+	// Lineage should now be approved_pending_ack and acknowledgeable cleanly!
+	statusOut, isErr := cli.callTool("odd_review_status", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr || !strings.Contains(statusOut, rdd.StatusApprovedPending) {
+		t.Fatalf("odd_review_status unexpected (err=%v): %s", isErr, statusOut)
+	}
+	ackOut, isErr := cli.callTool("odd_review_ack", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr || !strings.Contains(ackOut, rdd.AuthorityBurned) {
+		t.Fatalf("odd_review_ack unexpected (err=%v): %s", isErr, ackOut)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPToolsListSchemas(t *testing.T) {
+	repo := initMCPRepo(t)
+	server := NewServer(ServerConfig{Workspace: repo})
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	listResp := cli.call("tools/list", map[string]any{})
+	toolsRaw := listResp["result"].(map[string]any)["tools"].([]any)
+	byName := make(map[string]map[string]any)
+	for _, raw := range toolsRaw {
+		obj := raw.(map[string]any)
+		byName[obj["name"].(string)] = obj
+	}
+
+	// Verify odd_review_submit schema has typed findings.items.required and enums.
+	submitSchema := byName["odd_review_submit"]["inputSchema"].(map[string]any)
+	submitProps := submitSchema["properties"].(map[string]any)
+	findingsSchema := submitProps["findings"].(map[string]any)
+	if findingsSchema["type"] != "array" {
+		t.Fatalf("odd_review_submit findings.type = %v, want array", findingsSchema["type"])
+	}
+	items := findingsSchema["items"].(map[string]any)
+	reqSlice := items["required"].([]any)
+	gotReq := make([]string, 0, len(reqSlice))
+	for _, v := range reqSlice {
+		gotReq = append(gotReq, v.(string))
+	}
+	wantReq := []string{"id", "severity", "causality", "location", "claim"}
+	if strings.Join(gotReq, ",") != strings.Join(wantReq, ",") {
+		t.Fatalf("findings.items.required = %v, want %v", gotReq, wantReq)
+	}
+	itemProps := items["properties"].(map[string]any)
+	sevEnum := itemProps["severity"].(map[string]any)["enum"].([]any)
+	if len(sevEnum) != 3 || sevEnum[0] != "BLOCKER" || sevEnum[1] != "WARNING" || sevEnum[2] != "SUGGESTION" {
+		t.Fatalf("severity.enum = %v, want [BLOCKER WARNING SUGGESTION]", sevEnum)
+	}
+	causEnum := itemProps["causality"].(map[string]any)["enum"].([]any)
+	if len(causEnum) != 3 || causEnum[0] != "candidate" || causEnum[1] != "pre_existing" || causEnum[2] != "unknown" {
+		t.Fatalf("causality.enum = %v, want [candidate pre_existing unknown]", causEnum)
+	}
+
+	// Verify odd_external_run schema documents lineageId.
+	extRunSchema := byName["odd_external_run"]["inputSchema"].(map[string]any)
+	extRunProps := extRunSchema["properties"].(map[string]any)
+	linProp, ok := extRunProps["lineageId"].(map[string]any)
+	if !ok || linProp["type"] != "string" {
+		t.Fatalf("odd_external_run missing string lineageId property: %+v", extRunProps)
+	}
+
+	// Verify odd_review_submit accepts BLOCKER severity from schema (PRESERVE: SEVERE also still works).
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(99) }\n"), 0o644); err != nil {
+		t.Fatalf("edit main.go v3: %v", err)
+	}
+	start3Out, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk"},
+		"lensesReason": "verify BLOCKER severity mapping",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start 3 failed: %s", start3Out)
+	}
+	var start3 rdd.StartResult
+	if err := json.Unmarshal([]byte(start3Out), &start3); err != nil {
+		t.Fatalf("unmarshal start3: %v", err)
+	}
+	if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": start3.LineageID,
+		"answer":    "granted",
+	}); isErr {
+		t.Fatal("odd_review_consent 3 failed")
+	}
+	if out, isErr := cli.callTool("odd_review_submit", map[string]any{
+		"lineageId": start3.LineageID,
+		"role":      "risk",
+		"findings": []map[string]any{{
+			"id":        "F-BLK-MAP",
+			"severity":  "BLOCKER",
+			"causality": "candidate",
+			"location":  "main.go:3",
+			"claim":     "blocker mapped to SEVERE",
+		}},
+	}); isErr || !strings.Contains(out, rdd.StatusCollectingRefuter) || !strings.Contains(out, rdd.SeveritySEVERE) {
+		t.Fatalf("odd_review_submit BLOCKER unexpected (err=%v): %s", isErr, out)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
 	}
 }

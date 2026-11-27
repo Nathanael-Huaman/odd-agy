@@ -80,6 +80,9 @@ func (e *Engine) Mode(action string) (ModeResult, error) {
 
 // Assess evaluates candidate risk and review readiness without mutating RDD state.
 func (e *Engine) Assess(req AssessRequest) (AssessResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if err := validateEscalation(req.Escalate); err != nil {
 		return AssessResult{}, err
 	}
@@ -97,6 +100,15 @@ func (e *Engine) Assess(req AssessRequest) (AssessResult, error) {
 	}
 
 	nativeRisk, reason := classifyRisk(snap)
+	if nativeRisk != RiskHigh {
+		for _, f := range snap.Files {
+			if isSensitiveScopePath(f.Path) {
+				nativeRisk = RiskHigh
+				reason = fmt.Sprintf("sensitive/credential path changed: %s", f.Path)
+				break
+			}
+		}
+	}
 	effectiveRisk := nativeRisk
 	independentVerifier := false
 	if req.Escalate != nil {
@@ -279,6 +291,9 @@ func (e *Engine) AnswerConsent(lineageID, answer string) (LineageStatus, error) 
 // Scope returns a paginated, SHA-256-verified read-only view of the frozen snapshot.
 // It never reads the live working tree and fails closed on any tamper detection.
 func (e *Engine) Scope(lineageID string, cursor, limit int) (ScopePage, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if cursor < 0 {
 		return ScopePage{}, fmt.Errorf("invalid negative cursor %d", cursor)
 	}
@@ -311,6 +326,12 @@ func (e *Engine) Scope(lineageID string, cursor, limit int) (ScopePage, error) {
 	}
 
 	files := append([]FrozenFile(nil), manifest.Files[start:end]...)
+	for i := range files {
+		if isSensitiveScopePath(files[i].Path) {
+			files[i].Content = "[REDACTED SENSITIVE FILE CONTENT]"
+			files[i].Diff = "[REDACTED SENSITIVE FILE CONTENT]"
+		}
+	}
 	hasMore := end < total
 	nextCursor := 0
 	if hasMore {
@@ -489,6 +510,9 @@ func (e *Engine) ApplyCorrection(lineageID string) (LineageStatus, error) {
 
 // Status returns the full deterministic state of an RDD lineage.
 func (e *Engine) Status(lineageID string) (LineageStatus, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	gitDir, err := resolveGitDir(e.repoRoot)
 	if err != nil {
 		return LineageStatus{}, err
@@ -1021,4 +1045,27 @@ func cloneStatus(st LineageStatus) LineageStatus {
 
 func nowUTC() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func isSensitiveScopePath(p string) bool {
+	lower := strings.ToLower(strings.TrimPrefix(filepath.ToSlash(p), "./"))
+	base := filepath.Base(lower)
+	if base == ".env" || strings.HasPrefix(base, ".env.") {
+		return true
+	}
+	if lower == ".ssh" || strings.HasPrefix(lower, ".ssh/") || strings.Contains(lower, "/.ssh/") {
+		return true
+	}
+	if lower == ".aws" || strings.HasPrefix(lower, ".aws/") || strings.Contains(lower, "/.aws/") {
+		return true
+	}
+	switch base {
+	case "secrets.json", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".netrc", ".npmrc", ".pypirc":
+		return true
+	}
+	switch filepath.Ext(base) {
+	case ".pem", ".key", ".p12", ".pfx":
+		return true
+	}
+	return false
 }

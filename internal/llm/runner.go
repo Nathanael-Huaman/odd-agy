@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -55,8 +56,10 @@ type TaskRecord struct {
 	Provider        string          `json:"provider,omitempty"`
 	Model           string          `json:"model,omitempty"`
 	Compatibility   string          `json:"compatibility,omitempty"`
-	AllowedSurfaces []string        `json:"allowedSurfaces,omitempty"`
-	Messages        []Message       `json:"messages"`
+	AllowedSurfaces    []string        `json:"allowedSurfaces,omitempty"`
+	LineageID          string          `json:"lineageId,omitempty"`
+	SubmittedToLineage bool            `json:"submittedToLineage,omitempty"`
+	Messages           []Message       `json:"messages"`
 	Turns           int             `json:"turns"`
 	Usage           Usage           `json:"usage"`
 	Status          string          `json:"status"`
@@ -72,6 +75,7 @@ type TaskRecord struct {
 type RunRequest struct {
 	Role            string        `json:"role"`
 	Task            string        `json:"task"`
+	LineageID       string        `json:"lineageId,omitempty"`
 	Provider        string        `json:"provider,omitempty"`
 	Model           string        `json:"model,omitempty"`
 	MaxTurns        int           `json:"maxTurns,omitempty"`
@@ -109,11 +113,18 @@ type ProfilesSummary struct {
 	Profiles      map[string]config.ProfileConfig `json:"profiles"`
 }
 
+// ReviewHost bridges external review-* agents to the frozen-snapshot RDD engine.
+type ReviewHost interface {
+	Scope(lineageID string, cursor int) (any, error)
+	Submit(lineageID, role string, findings []rdd.Finding, verdicts []rdd.RefuterVerdict) (any, error)
+}
+
 // RunnerConfig configures a sandboxed external agentic Runner.
 type RunnerConfig struct {
 	RepoRoot        string
 	Client          *Client
 	LookupEnv       func(string) (string, bool)
+	ReviewHost      ReviewHost
 	DefaultMaxTurns int
 	DefaultTimeout  time.Duration
 }
@@ -125,6 +136,7 @@ type Runner struct {
 	client            *Client
 	lookupEnv         func(string) (string, bool)
 	usedDefaultLookup bool
+	reviewHost        ReviewHost
 	defaultMaxTurns   int
 	defaultTimeout    time.Duration
 }
@@ -153,6 +165,7 @@ func NewRunner(cfg RunnerConfig) *Runner {
 		client:            client,
 		lookupEnv:         lookupEnv,
 		usedDefaultLookup: usedDefaultLookup,
+		reviewHost:        cfg.ReviewHost,
 		defaultMaxTurns:   maxTurns,
 		defaultTimeout:    timeout,
 	}
@@ -241,13 +254,19 @@ func (r *Runner) Run(ctx context.Context, req RunRequest) (TaskRecord, error) {
 		return TaskRecord{}, err
 	}
 
+	lineageID := strings.TrimSpace(req.LineageID)
+	if lineageID == "" && isReviewRole(role) {
+		lineageID = extractLineageID(req.Task)
+	}
+
 	now := nowUTC()
 	rec := TaskRecord{
 		TaskID:          taskID,
 		Role:            role,
 		AllowedSurfaces: surfaces,
+		LineageID:       lineageID,
 		Messages: []Message{
-			{Role: "system", Content: buildSystemPrompt(role, surfaces)},
+			{Role: "system", Content: buildSystemPrompt(role, surfaces, lineageID, r.reviewHost != nil)},
 			{Role: "user", Content: req.Task},
 		},
 		Status:    TaskStatusRunning,
@@ -354,7 +373,7 @@ func (r *Runner) executeWithCandidates(
 	maxTurns int,
 	maxTokens int,
 ) (TaskRecord, error) {
-	tools := r.toolsForRole(rec.Role)
+	tools := r.toolsForRole(rec.Role, rec.LineageID)
 	baseMsgsLen := len(rec.Messages)
 
 	for _, cand := range candidates {
@@ -376,6 +395,7 @@ func (r *Runner) executeWithCandidates(
 		var finalResp string
 		var loopErr error
 		var retryOnNext bool
+		attemptSubmitted := rec.SubmittedToLineage
 		hitMaxTurns := false
 
 		for turn := 0; turn < maxTurns; turn++ {
@@ -388,8 +408,8 @@ func (r *Runner) executeWithCandidates(
 			})
 			if err != nil {
 				loopErr = err
-				// Only fall back to next provider if first turn failed with retryable error.
-				if turn == 0 && isRetryableError(err) {
+				// Only fall back to next provider if first turn failed with retryable error and ctx is still active.
+				if turn == 0 && ctx.Err() == nil && isRetryableError(err) {
 					retryOnNext = true
 				}
 				break
@@ -412,7 +432,10 @@ func (r *Runner) executeWithCandidates(
 			}
 
 			for _, tc := range asstMsg.ToolCalls {
-				toolOut := r.executeToolCall(rec.Role, rec.AllowedSurfaces, tc)
+				toolOut, submitted := r.executeToolCall(rec.Role, rec.AllowedSurfaces, rec.LineageID, tc)
+				if submitted {
+					attemptSubmitted = true
+				}
 				attemptMsgs = append(attemptMsgs, Message{
 					Role:       "tool",
 					ToolCallID: tc.ID,
@@ -422,6 +445,10 @@ func (r *Runner) executeWithCandidates(
 			}
 
 			if turn == maxTurns-1 {
+				if attemptSubmitted {
+					finalResp = "submitted review findings to lineage"
+					break
+				}
 				hitMaxTurns = true
 			}
 		}
@@ -441,6 +468,7 @@ func (r *Runner) executeWithCandidates(
 			rec.Compatibility = cand.Endpoint.Compatibility
 			rec.Messages = attemptMsgs
 			rec.Turns += turnsTaken
+			rec.SubmittedToLineage = attemptSubmitted
 			rec.Status = TaskStatusFailed
 			rec.Error = redactError(loopErr, cand.Endpoint.APIKey)
 			rec.UpdatedAt = nowUTC()
@@ -459,6 +487,7 @@ func (r *Runner) executeWithCandidates(
 		rec.Usage.CompletionTokens += attemptUsage.CompletionTokens
 		rec.Usage.TotalTokens += attemptUsage.TotalTokens
 		rec.FinalResponse = finalResp
+		rec.SubmittedToLineage = attemptSubmitted
 		if hitMaxTurns {
 			rec.Status = TaskStatusMaxTurns
 			rec.Error = fmt.Sprintf("reached maxTurns limit (%d)", maxTurns)
@@ -554,7 +583,98 @@ func (r *Runner) saveTask(rec TaskRecord) error {
 	return nil
 }
 
-func (r *Runner) toolsForRole(role string) []ToolDefinition {
+func (r *Runner) reviewHostTools(role, lineageID string) []ToolDefinition {
+	scopeRequired := []string(nil)
+	if strings.TrimSpace(lineageID) == "" {
+		scopeRequired = []string{"lineageId"}
+	}
+
+	var submitProps map[string]any
+	var submitRequired []string
+	if strings.TrimSpace(role) == "review-refuter" {
+		submitProps = map[string]any{
+			"lineageId": map[string]any{
+				"type":        "string",
+				"description": "RDD review lineage ID (optional when already bound to this task)",
+			},
+			"refuterVerdicts": map[string]any{
+				"type":        "array",
+				"description": "Refuter verdicts for each severe blocker finding",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"findingId": map[string]any{"type": "string"},
+						"verdict":   map[string]any{"type": "string", "enum": []string{"confirmed", "refuted", "unknown"}},
+						"rationale": map[string]any{"type": "string"},
+					},
+					"required": []string{"findingId", "verdict"},
+				},
+			},
+		}
+		submitRequired = []string{"refuterVerdicts"}
+	} else {
+		submitProps = map[string]any{
+			"lineageId": map[string]any{
+				"type":        "string",
+				"description": "RDD review lineage ID (optional when already bound to this task)",
+			},
+			"findings": map[string]any{
+				"type":        "array",
+				"description": "Structured findings for your review lens (empty array if none)",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"id":        map[string]any{"type": "string", "description": "Unique finding identifier"},
+						"severity":  map[string]any{"type": "string", "enum": []string{"BLOCKER", "WARNING", "SUGGESTION"}},
+						"causality": map[string]any{"type": "string", "enum": []string{"candidate", "pre_existing", "unknown"}},
+						"location":  map[string]any{"type": "string", "description": "file:line"},
+						"claim":     map[string]any{"type": "string", "description": "Concise evidence-backed finding"},
+					},
+					"required": []string{"id", "severity", "causality", "location", "claim"},
+				},
+			},
+		}
+		submitRequired = []string{"findings"}
+	}
+	if strings.TrimSpace(lineageID) == "" {
+		submitRequired = append([]string{"lineageId"}, submitRequired...)
+	}
+
+	return []ToolDefinition{
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "read_review_scope",
+				Description: "Read paginated frozen candidate snapshot pages for the bound RDD review lineage. Never reads the live worktree.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"lineageId": map[string]any{"type": "string", "description": "RDD review lineage ID (optional when already bound to this task)"},
+						"cursor":    map[string]any{"type": "integer", "description": "Pagination cursor starting at 0"},
+					},
+					"required": scopeRequired,
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: FunctionDefinition{
+				Name:        "submit_review_findings",
+				Description: "Submit your review lens findings or refuter verdicts directly to the bound RDD review lineage.",
+				Parameters: map[string]any{
+					"type":       "object",
+					"properties": submitProps,
+					"required":   submitRequired,
+				},
+			},
+		},
+	}
+}
+
+func (r *Runner) toolsForRole(role, lineageID string) []ToolDefinition {
+	if isReviewRole(role) && r.reviewHost != nil {
+		return r.reviewHostTools(role, lineageID)
+	}
 	tools := []ToolDefinition{
 		{
 			Type: "function",
@@ -692,16 +812,140 @@ func (r *Runner) toolsForRole(role string) []ToolDefinition {
 	return tools
 }
 
-func (r *Runner) executeToolCall(role string, allowedSurfaces []string, tc ToolCall) string {
+func (r *Runner) executeToolCall(role string, allowedSurfaces []string, boundLineageID string, tc ToolCall) (string, bool) {
 	allowed := make(map[string]bool)
-	for _, t := range r.toolsForRole(role) {
+	for _, t := range r.toolsForRole(role, boundLineageID) {
 		allowed[t.Function.Name] = true
 	}
 	if !allowed[tc.Function.Name] {
-		return toolErrJSON(fmt.Sprintf("tool %q is not permitted for role %q", tc.Function.Name, role))
+		return toolErrJSON(fmt.Sprintf("tool %q is not permitted for role %q", tc.Function.Name, role)), false
 	}
 
 	switch tc.Function.Name {
+	case "read_review_scope":
+		if r.reviewHost == nil {
+			return toolErrJSON("read_review_scope is not available without ReviewHost"), false
+		}
+		var args struct {
+			LineageID string `json:"lineageId"`
+			Cursor    int    `json:"cursor"`
+		}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			return toolErrJSON("invalid arguments: " + err.Error()), false
+		}
+		lineageID := strings.TrimSpace(args.LineageID)
+		if lineageID == "" {
+			lineageID = strings.TrimSpace(boundLineageID)
+		} else if boundLineageID != "" && lineageID != boundLineageID {
+			return toolErrJSON(fmt.Sprintf("lineageId %q does not match bound lineage %q", lineageID, boundLineageID)), false
+		}
+		if lineageID == "" {
+			return toolErrJSON("lineageId is required"), false
+		}
+		page, err := r.reviewHost.Scope(lineageID, args.Cursor)
+		if err != nil {
+			return toolErrJSON(err.Error()), false
+		}
+		return mustJSON(page), false
+
+	case "submit_review_findings":
+		if r.reviewHost == nil {
+			return toolErrJSON("submit_review_findings is not available without ReviewHost"), false
+		}
+		mappedRole, ok := mapReviewRoleToLens(role)
+		if !ok {
+			return toolErrJSON(fmt.Sprintf("role %q is not a supported review role", role)), false
+		}
+		var args struct {
+			LineageID string `json:"lineageId"`
+			Findings  []struct {
+				ID        string `json:"id"`
+				Severity  string `json:"severity"`
+				Causality string `json:"causality"`
+				Origin    string `json:"origin"`
+				Location  string `json:"location"`
+				Claim     string `json:"claim"`
+			} `json:"findings"`
+			RefuterVerdicts []struct {
+				FindingID string `json:"findingId"`
+				Verdict   string `json:"verdict"`
+				Rationale string `json:"rationale"`
+			} `json:"refuterVerdicts"`
+			Verdicts []struct {
+				FindingID string `json:"findingId"`
+				Verdict   string `json:"verdict"`
+				Rationale string `json:"rationale"`
+			} `json:"verdicts"`
+		}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			return toolErrJSON("invalid arguments: " + err.Error()), false
+		}
+		lineageID := strings.TrimSpace(args.LineageID)
+		if lineageID == "" {
+			lineageID = strings.TrimSpace(boundLineageID)
+		} else if boundLineageID != "" && lineageID != boundLineageID {
+			return toolErrJSON(fmt.Sprintf("lineageId %q does not match bound lineage %q", lineageID, boundLineageID)), false
+		}
+		if lineageID == "" {
+			return toolErrJSON("lineageId is required"), false
+		}
+
+		findings := make([]rdd.Finding, 0, len(args.Findings))
+		for _, f := range args.Findings {
+			sev := strings.ToUpper(strings.TrimSpace(f.Severity))
+			if sev == "BLOCKER" {
+				sev = rdd.SeveritySEVERE
+			}
+			causality := strings.TrimSpace(f.Causality)
+			if causality == "" {
+				causality = strings.TrimSpace(f.Origin)
+			}
+			if strings.EqualFold(causality, "pre-existing") {
+				causality = rdd.CausalityPreExisting
+			} else {
+				causality = strings.ToLower(causality)
+			}
+			findings = append(findings, rdd.Finding{
+				ID:        f.ID,
+				Severity:  sev,
+				Causality: causality,
+				Location:  f.Location,
+				Claim:     f.Claim,
+				Lens:      mappedRole,
+			})
+		}
+
+		rawVerdicts := args.RefuterVerdicts
+		if len(rawVerdicts) == 0 {
+			rawVerdicts = args.Verdicts
+		}
+		verdicts := make([]rdd.RefuterVerdict, 0, len(rawVerdicts))
+		for _, v := range rawVerdicts {
+			verdict := strings.ToLower(strings.TrimSpace(v.Verdict))
+			switch verdict {
+			case "uphold", "upheld":
+				verdict = rdd.VerdictConfirmed
+			case "refute":
+				verdict = rdd.VerdictRefuted
+			}
+			verdicts = append(verdicts, rdd.RefuterVerdict{
+				FindingID: v.FindingID,
+				Verdict:   verdict,
+				Rationale: v.Rationale,
+			})
+		}
+
+		res, err := r.reviewHost.Submit(lineageID, mappedRole, findings, verdicts)
+		if err != nil {
+			return toolErrJSON(err.Error()), false
+		}
+		return mustJSON(map[string]any{
+			"submittedToLineage": true,
+			"lineageId":          lineageID,
+			"role":               mappedRole,
+			"result":             res,
+		}), true
+
 	case "read_file":
 		var args struct {
 			Path   string `json:"path"`
@@ -709,18 +953,18 @@ func (r *Runner) executeToolCall(role string, allowedSurfaces []string, tc ToolC
 			Limit  int    `json:"limit"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
-		return r.toolReadFile(args.Path, args.Offset, args.Limit)
+		return r.toolReadFile(args.Path, args.Offset, args.Limit), false
 
 	case "list_dir":
 		var args struct {
 			Path string `json:"path"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
-		return r.toolListDir(args.Path)
+		return r.toolListDir(args.Path), false
 
 	case "grep_search":
 		var args struct {
@@ -728,9 +972,9 @@ func (r *Runner) executeToolCall(role string, allowedSurfaces []string, tc ToolC
 			Path    string `json:"path"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
-		return r.toolGrep(args.Pattern, args.Path)
+		return r.toolGrep(args.Pattern, args.Path), false
 
 	case "glob_files":
 		var args struct {
@@ -738,9 +982,9 @@ func (r *Runner) executeToolCall(role string, allowedSurfaces []string, tc ToolC
 			Path    string `json:"path"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
-		return r.toolGlob(args.Pattern, args.Path)
+		return r.toolGlob(args.Pattern, args.Path), false
 
 	case "odd_review_scope":
 		var args struct {
@@ -749,22 +993,22 @@ func (r *Runner) executeToolCall(role string, allowedSurfaces []string, tc ToolC
 			Limit     int    `json:"limit"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
 		page, err := rdd.NewEngine(r.repoRoot).Scope(args.LineageID, args.Cursor, args.Limit)
 		if err != nil {
-			return toolErrJSON(err.Error())
+			return toolErrJSON(err.Error()), false
 		}
-		return mustJSON(page)
+		return mustJSON(page), false
 
 	case "run_shell":
 		var args struct {
 			Command string `json:"command"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
-		return r.toolRunShell(role, allowedSurfaces, args.Command)
+		return r.toolRunShell(role, allowedSurfaces, args.Command), false
 
 	case "write_file":
 		var args struct {
@@ -772,9 +1016,9 @@ func (r *Runner) executeToolCall(role string, allowedSurfaces []string, tc ToolC
 			Content string `json:"content"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
-		return r.toolWriteFile(allowedSurfaces, args.Path, args.Content)
+		return r.toolWriteFile(allowedSurfaces, args.Path, args.Content), false
 
 	case "edit_file":
 		var args struct {
@@ -783,12 +1027,12 @@ func (r *Runner) executeToolCall(role string, allowedSurfaces []string, tc ToolC
 			NewText string `json:"newText"`
 		}
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return toolErrJSON("invalid arguments: " + err.Error())
+			return toolErrJSON("invalid arguments: " + err.Error()), false
 		}
-		return r.toolEditFile(allowedSurfaces, args.Path, args.OldText, args.NewText)
+		return r.toolEditFile(allowedSurfaces, args.Path, args.OldText, args.NewText), false
 
 	default:
-		return toolErrJSON("unknown tool " + tc.Function.Name)
+		return toolErrJSON("unknown tool " + tc.Function.Name), false
 	}
 }
 
@@ -2338,18 +2582,49 @@ func isSensitiveResolvedPath(realRoot, resolved string) bool {
 	return isSensitiveRelPath(filepath.ToSlash(resolved))
 }
 
-func buildSystemPrompt(role string, surfaces []string) string {
+func buildSystemPrompt(role string, surfaces []string, lineageID string, hasReviewHost bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are the external %s agent for odd-agy.\n", role)
 	b.WriteString("Use only the provided tools within the repository sandbox. ")
 	b.WriteString("Never attempt to access secrets, .env, .ssh, or run git commit/git push.\n")
 	if isReviewRole(role) {
-		b.WriteString("Inspect frozen candidate snapshots exclusively via odd_review_scope.\n")
+		if hasReviewHost {
+			b.WriteString("Inspect frozen candidate snapshots exclusively via read_review_scope (never access the live worktree).\n")
+			b.WriteString("Submit your structured verdict directly via submit_review_findings, then summarize cleanly.\n")
+			if lineageID != "" {
+				fmt.Fprintf(&b, "Bound lineageId: %s\n", lineageID)
+			}
+		} else {
+			b.WriteString("Inspect frozen candidate snapshots exclusively via odd_review_scope.\n")
+		}
 	}
 	if len(surfaces) > 0 {
 		fmt.Fprintf(&b, "Allowed edit surfaces: %s\n", strings.Join(surfaces, ", "))
 	}
 	return b.String()
+}
+
+var reLineageID = regexp.MustCompile(`\breview-[0-9a-f]+\b`)
+
+func extractLineageID(task string) string {
+	return reLineageID.FindString(task)
+}
+
+func mapReviewRoleToLens(role string) (string, bool) {
+	switch strings.TrimSpace(role) {
+	case "review-risk":
+		return rdd.LensRisk, true
+	case "review-resilience":
+		return rdd.LensResilience, true
+	case "review-readability":
+		return rdd.LensReadability, true
+	case "review-reliability":
+		return rdd.LensReliability, true
+	case "review-refuter":
+		return rdd.LensRefuter, true
+	default:
+		return "", false
+	}
 }
 
 func isWriterRole(role string) bool {
