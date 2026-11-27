@@ -860,6 +860,86 @@ func TestStop_RDDPreflightNoInfiniteLoop(t *testing.T) {
 	}
 }
 
+func TestPreToolUseDeniesInWorkspaceSymlinkToSensitiveFile(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeOrganic
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	writeFile(t, filepath.Join(repo, "secret.pem"), "PRIVATE KEY")
+	writeFile(t, filepath.Join(repo, ".env"), "SECRET=1")
+	writeFile(t, filepath.Join(repo, ".ssh", "id_rsa"), "SSH KEY")
+
+	if err := os.Symlink(filepath.Join(repo, "secret.pem"), filepath.Join(repo, "innocent.txt")); err != nil {
+		t.Fatalf("symlink innocent.txt: %v", err)
+	}
+	if err := os.Symlink(".env", filepath.Join(repo, "public.txt")); err != nil {
+		t.Fatalf("symlink public.txt: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(".ssh", "id_rsa"), filepath.Join(repo, "keylink")); err != nil {
+		t.Fatalf("symlink keylink: %v", err)
+	}
+	if err := os.Symlink("README.md", filepath.Join(repo, "readme_link.md")); err != nil {
+		t.Fatalf("symlink readme_link.md: %v", err)
+	}
+
+	deniedCases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"view_symlink_pem", "view_file", map[string]any{"AbsolutePath": filepath.Join(repo, "innocent.txt")}},
+		{"view_symlink_env", "view_file", map[string]any{"AbsolutePath": filepath.Join(repo, "public.txt")}},
+		{"view_symlink_ssh", "view_file", map[string]any{"AbsolutePath": filepath.Join(repo, "keylink")}},
+		{"cmd_cat_symlink_pem", "run_command", map[string]any{"CommandLine": "cat innocent.txt"}},
+		{"cmd_cat_rel_symlink_pem", "run_command", map[string]any{"CommandLine": "cat ./innocent.txt"}},
+		{"cmd_cat_symlink_env", "run_command", map[string]any{"CommandLine": "cat public.txt"}},
+		{"cmd_cat_symlink_ssh", "run_command", map[string]any{"CommandLine": "cat keylink"}},
+	}
+
+	for _, tc := range deniedCases {
+		t.Run("deny_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{
+					ConversationID: "conv-sym",
+					WorkspacePaths: []string{repo},
+				},
+				ToolCall: ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionDeny {
+				t.Fatalf("expected deny for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+
+	// Preserve: benign in-workspace symlink remains allowed.
+	for _, tc := range []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"view_benign_symlink", "view_file", map[string]any{"AbsolutePath": filepath.Join(repo, "readme_link.md")}},
+		{"cmd_cat_benign_symlink", "run_command", map[string]any{"CommandLine": "cat readme_link.md"}},
+	} {
+		t.Run("allow_"+tc.name, func(t *testing.T) {
+			var out PreToolUseOutput
+			dispatchJSON(t, "PreToolUse", PreToolUseInput{
+				CommonInput: CommonInput{
+					ConversationID: "conv-sym",
+					WorkspacePaths: []string{repo},
+				},
+				ToolCall: ToolCall{Name: tc.tool, Args: tc.args},
+			}, &out)
+			if out.Decision != DecisionAllow {
+				t.Fatalf("expected allow for %s, got %+v", tc.name, out)
+			}
+		})
+	}
+}
+
 func TestDispatch_Errors(t *testing.T) {
 	var out bytes.Buffer
 	if err := Dispatch("UnknownEvent", strings.NewReader("{}"), &out); err == nil {

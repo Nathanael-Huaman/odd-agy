@@ -120,16 +120,30 @@ func checkSensitiveOrOutOfBoundsPath(workspace, rawPath string, args map[string]
 	if reason := checkSensitivePathPattern(workspace, rawPath, args); reason != "" {
 		return reason
 	}
-	return checkPathBoundsOnly(workspace, rawPath)
+	realTarget, reason := resolveAndCheckPathBounds(workspace, rawPath)
+	if reason != "" {
+		return reason
+	}
+	if realTarget != "" {
+		if reason := checkSensitivePathPattern(workspace, realTarget, args); reason != "" {
+			return reason
+		}
+	}
+	return ""
 }
 
 func checkPathBoundsOnly(workspace, rawPath string) string {
+	_, reason := resolveAndCheckPathBounds(workspace, rawPath)
+	return reason
+}
+
+func resolveAndCheckPathBounds(workspace, rawPath string) (string, string) {
 	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
-		return ""
+		return "", ""
 	}
 	if trimmed == "~" || strings.HasPrefix(trimmed, "~/") || strings.HasPrefix(trimmed, "~\\") {
-		return fmt.Sprintf("access denied: path %q escapes workspace root", rawPath)
+		return "", fmt.Sprintf("access denied: path %q escapes workspace root", rawPath)
 	}
 
 	absTarget := trimmed
@@ -138,23 +152,23 @@ func checkPathBoundsOnly(workspace, rawPath string) string {
 	}
 	realTarget, err := evalSymlinksBestEffort(absTarget)
 	if err != nil {
-		return fmt.Sprintf("access denied: unable to resolve path %q: %v", rawPath, err)
+		return "", fmt.Sprintf("access denied: unable to resolve path %q: %v", rawPath, err)
 	}
 	realWorkspace, err := evalSymlinksBestEffort(workspace)
 	if err != nil {
-		return fmt.Sprintf("access denied: unable to resolve workspace root: %v", err)
+		return "", fmt.Sprintf("access denied: unable to resolve workspace root: %v", err)
 	}
 
 	if isWithinDir(realTarget, realWorkspace) {
-		return ""
+		return realTarget, ""
 	}
 	if !filepath.IsAbs(trimmed) {
-		return fmt.Sprintf("access denied: relative path %q escapes workspace root", rawPath)
+		return "", fmt.Sprintf("access denied: relative path %q escapes workspace root", rawPath)
 	}
 	if isAllowedTempTarget(realWorkspace, realTarget) {
-		return ""
+		return realTarget, ""
 	}
-	return fmt.Sprintf("access denied: path %q escapes workspace root", rawPath)
+	return "", fmt.Sprintf("access denied: path %q escapes workspace root", rawPath)
 }
 
 func checkSensitivePathPattern(workspace, rawPath string, args map[string]any) string {
@@ -257,8 +271,35 @@ func checkCommandSensitivePaths(workspace, cmdStr string) string {
 			}
 			// Check path escapes for tokens that look like filesystem paths.
 			if looksLikeFilePathToken(clean) {
-				if reason := checkPathBoundsOnly(workspace, clean); reason != "" {
+				realTarget, reason := resolveAndCheckPathBounds(workspace, clean)
+				if reason != "" {
 					return reason
+				}
+				if realTarget != "" {
+					if reason := checkSensitivePathPattern(workspace, realTarget, nil); reason != "" {
+						return reason
+					}
+				}
+				continue
+			}
+			// Also resolve relative path-like or existing workspace entries (including symlinks)
+			// so commands like "cat innocent.txt" (innocent.txt -> secret.pem) are checked against realTarget.
+			if !strings.Contains(clean, "://") && !strings.HasPrefix(clean, "~") {
+				absCandidate := filepath.Join(workspace, clean)
+				if _, lstatErr := os.Lstat(absCandidate); lstatErr == nil {
+					realTarget, reason := resolveAndCheckPathBounds(workspace, clean)
+					if reason != "" {
+						return reason
+					}
+					if realTarget != "" {
+						if reason := checkSensitivePathPattern(workspace, realTarget, nil); reason != "" {
+							return reason
+						}
+					}
+				} else if realTarget, err := evalSymlinksBestEffort(absCandidate); err == nil {
+					if reason := checkSensitivePathPattern(workspace, realTarget, nil); reason != "" {
+						return reason
+					}
 				}
 			}
 		}
