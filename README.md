@@ -27,7 +27,7 @@ odd-agy launch
 
 ### Recommended launch (`odd-agy launch` — zero global config)
 
-Start Antigravity CLI via `odd-agy launch` to pass `.agents/odd/agy-session-settings.json` with `--settings` and select `odd-orchestrator`:
+Start Antigravity CLI via `odd-agy launch` to pass `.agents/odd/agy-session-settings.json` with `--settings`, select `odd-orchestrator`, and forward `--model` and `--effort` from the active profile's `orchestrator` route (when not overridden after `--`; `--effort` is omitted if the chosen model already carries an effort suffix):
 
 ```bash
 odd-agy launch
@@ -39,15 +39,17 @@ This keeps all permission rules 100% project-scoped (`mcp(odd-agy/*)` allowed, `
 
 ### Optional global opt-in (`--allow-mcp` / `odd-agy permissions`)
 
-If you prefer running plain `agy` directly without `odd-agy launch`, you can optionally opt in to adding the same two MCP rules to `~/.gemini/antigravity-cli/settings.json` (creates a timestamped `.odd-agy.bak.*` backup if the file already exists and preserves all existing keys and rules):
+Plain `odd-agy init` remains 100% project-scoped. If you prefer running `agy` directly without `odd-agy launch`, or need global registration for `external-mcp` / RDD tools, you can opt in to registering the `odd-agy` MCP server in `~/.gemini/config/mcp_config.json` and adding the MCP permission rules to `~/.gemini/antigravity-cli/settings.json` (creates timestamped `0600` `.odd-agy.bak.*` backups, enforces symlink guards, and preserves existing keys and rules):
 
 ```bash
 odd-agy init --allow-mcp
-# or manage anytime:
+# or manage anytime (or toggle in the TUI Project Actions screen):
 odd-agy permissions status
-odd-agy permissions allow-mcp
-odd-agy permissions revoke-mcp
+odd-agy permissions enable   # alias: allow-mcp
+odd-agy permissions disable  # alias: revoke-mcp
 ```
+
+When an active profile uses `external-mcp` roles without global registration, `odd-agy doctor` and `odd-agy launch` emit readiness warnings.
 
 ---
 
@@ -65,8 +67,8 @@ Every TUI setting has an equivalent non-interactive CLI command:
 | Command | Description |
 |---|---|
 | `odd-agy init [--mode=local\|standalone] [--delegation=full-delegation\|organic] [--profile=agy-oauth] [--binary=...] [--allow-mcp] [--force]` | Install `.agents/` rules, agents, skills, hooks, MCP config, and `.agents/odd/agy-session-settings.json` (use `--allow-mcp` only to opt into global `~/.gemini/antigravity-cli/settings.json`) |
-| `odd-agy launch [--agent=<name>] [--no-agent] [-- <extra agy args...>]` | Recommended zero-global-config launcher passing `--agent` and `--settings <abs-path-to-.agents/odd/agy-session-settings.json>` to `agy` |
-| `odd-agy permissions [status\|allow-mcp\|revoke-mcp]` | Inspect, grant, or revoke optional global `~/.gemini/antigravity-cli/settings.json` MCP permission rules |
+| `odd-agy launch [--agent=<name>] [--no-agent] [-- <extra agy args...>]` | Recommended zero-global-config launcher passing `--agent`, orchestrator `--model` / `--effort`, and `--settings <abs-path-to-.agents/odd/agy-session-settings.json>` to `agy` |
+| `odd-agy permissions [status\|enable\|disable\|allow-mcp\|revoke-mcp] [--binary=<path>]` | Inspect, grant, or revoke optional global `~/.gemini/` MCP permission rules and `~/.gemini/config/mcp_config.json` registration |
 | `odd-agy sync [--binary=...] [--force]` | Refresh managed `.agents/` files against `.agents/odd/.managed-manifest.json` |
 | `odd-agy doctor` | Verify `agy`, `engram`, `.agents/` assets, hooks, MCP config, provider readiness, and global `~/.gemini/` collisions |
 | `odd-agy uninstall` | Remove only managed `.agents/` files and `odd-agy` hook/MCP entries, keeping user entries intact |
@@ -89,16 +91,21 @@ Pass `--cwd <dir>` before or after any command to target another workspace direc
 
 `odd-agy` **never** spawns `agy -p` or `gemini -p` subprocesses. Personal Antigravity OAuth subscription credentials stay solely inside Antigravity itself (`agy-native` roles).
 
-### Built-in profiles (`.agents/odd/profiles.json`)
+### Built-in profiles, roles & effort (`.agents/odd/profiles.json`)
 
-- **`agy-oauth`** *(default)*: All 11 roles (`explore`, `worker`, `verify`, `jd-judge-a`, `jd-judge-b`, `jd-fix-agent`, `review-risk`, `review-resilience`, `review-readability`, `review-reliability`, `review-refuter`) run natively on Antigravity OAuth (`flash` / `pro`).
-- **`deepseek-hybrid`**: Uses DeepSeek (`compatibility: "deepseek-thinking"`, preserving `reasoning_content` across tool-calling turns) for `verify`, `jd-judge-b`, and `review-*` roles while keeping `explore`/`worker` on native Antigravity OAuth.
+- **`agy-oauth`** *(default)*: All 12 roles (`orchestrator`, `explore`, `worker`, `verify`, `jd-judge-a`, `jd-judge-b`, `jd-fix-agent`, `review-risk`, `review-resilience`, `review-readability`, `review-reliability`, `review-refuter`) run natively on Antigravity OAuth (`inherit` / `flash` / `pro`).
+- **`deepseek-hybrid`**: Uses DeepSeek (`compatibility: "deepseek-thinking"`, preserving `reasoning_content` across tool-calling turns) for `verify`, `jd-judge-b`, and `review-*` roles while keeping `orchestrator`/`explore`/`worker` on native Antigravity OAuth.
 - **`9router-hybrid`**: Routes `verify`, `jd-judge-b`, and `review-*` through a local 9Router proxy (`http://localhost:20128/v1`, `NINEROUTER_BASE_URL` / optional `NINEROUTER_API_KEY` on loopback).
 - **`omniroute-hybrid`**: Routes `verify`, `jd-judge-b`, and `review-*` through a local OmniRoute proxy (`http://localhost:20128/v1`, `OMNIROUTE_BASE_URL` / optional `OMNIROUTE_API_KEY` on loopback).
 
-### Provider templates & fallback chains
+Each role supports an optional `effort` (`low`, `medium`, `high`, `xhigh`, `max`, or empty/`default`). In the TUI **Roles Editor**, vertical arrow-navigable **Model** (`[m]`) and **Effort** (`[e]`) pickers configure per-role routes: native Antigravity subagent frontmatter models normalize to `inherit | flash | pro`, while `orchestrator` forwards `--model` and `--effort` through `odd-agy launch`.
+
+### Provider templates, API key store & routing enforcement
 
 `.agents/odd/profiles.json` ships ready-to-use templates for `deepseek`, `9router`, `omniroute`, and generic `openai-compatible` endpoints (OpenRouter, OpenAI, Ollama, LM Studio, etc.) with custom `headers`, `apiKeyEnv`, `baseUrlEnv`, and ordered per-role `fallback` chains that cleanly fall back to `agy-oauth` on missing keys, `429`, or unreachable endpoints.
+
+- **User-scoped API key store (`0600`)**: Store provider API keys in `~/.config/odd-agy/secrets.json` via masked `[s] set key` in the TUI **Providers & Live Probe** screen. Environment variables always take precedence, and secrets are never written to `.agents/` or Git.
+- **Deterministic `external-mcp` enforcement & SSE decoding**: `PreToolUse` blocks native `invoke_subagent` calls for roles routed to `external-mcp` so they execute via `odd-agy/odd_external_run` (permitting native fallback only after `fallback_to_native`). The LLM client sends `"stream": false` and decodes `text/event-stream` SSE responses from 9Router, OmniRoute, and other OpenAI-compatible gateways.
 
 Probe a configured provider at any time:
 
