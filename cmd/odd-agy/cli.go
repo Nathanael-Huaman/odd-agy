@@ -399,7 +399,7 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 				}
 			}
 			if profileUsesExternalMCP(prof) {
-				if reg, _, err := installer.GlobalMCPServerRegistered(""); err == nil && !reg {
+				if reg, _, err := installer.GlobalMCPServerRegistered(""); err != nil || !reg {
 					fmt.Fprintf(stderr, "note: active profile %q uses external-mcp roles, but \"odd-agy\" is not registered in ~/.gemini/config/mcp_config.json. Run \"odd-agy permissions enable\" or \"agy mcp add odd-agy odd-agy mcp\" first.\n", profs.ActiveProfile)
 				}
 			}
@@ -517,12 +517,7 @@ func runPermissions(args []string, stdout, stderr io.Writer) int {
 
 	case "enable", "allow-mcp":
 		resolvedBin := installer.ResolveBinaryPath(binaryPath)
-		permRes, err := installer.GrantGlobalMCPPermissions("")
-		if err != nil {
-			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
-			return exitError
-		}
-		regRes, err := installer.RegisterGlobalMCPServer("", resolvedBin)
+		permRes, regRes, err := installer.EnableGlobalMCP("", resolvedBin)
 		if err != nil {
 			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
 			return exitError
@@ -539,12 +534,7 @@ func runPermissions(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 
 	case "disable", "revoke-mcp":
-		permRes, err := installer.RevokeGlobalMCPPermissions("")
-		if err != nil {
-			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
-			return exitError
-		}
-		regRes, err := installer.UnregisterGlobalMCPServer("")
+		permRes, regRes, err := installer.DisableGlobalMCP("")
 		if err != nil {
 			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
 			return exitError

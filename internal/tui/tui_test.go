@@ -1235,3 +1235,108 @@ func TestProvidersSetKeyControlCharPasteAndSymlinkErrorClearBuffer(t *testing.T)
 	}
 }
 
+func TestProjectActionsGlobalMCPSymlinkRejectionDoesNotMutateSettings(t *testing.T) {
+	t.Run("enable_rejected_on_mcp_config_symlink_leaves_settings_unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		home := t.TempDir()
+
+		settingsPath := installer.GlobalSettingsPath(home)
+		if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		const settingsOrig = "{\n  \"theme\": \"dark\"\n}\n"
+		if err := os.WriteFile(settingsPath, []byte(settingsOrig), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		outside := t.TempDir()
+		outsideMCP := filepath.Join(outside, "outside-mcp.json")
+		const mcpSentinel = `{"mcpServers":{"keep":{"command":"x"}}}` + "\n"
+		if err := os.WriteFile(outsideMCP, []byte(mcpSentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mcpPath := installer.GlobalMCPConfigPath(home)
+		if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideMCP, mcpPath); err != nil {
+			t.Fatal(err)
+		}
+
+		m := NewModel(dir, testOptions(home, nil, nil))
+		for i := 0; i < 5; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		for i := 0; i < 4; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+		if m.errMsg == "" {
+			t.Fatalf("expected errMsg when mcp_config.json is a symlink")
+		}
+		if got, _ := os.ReadFile(settingsPath); string(got) != settingsOrig {
+			t.Fatalf("settings.json mutated despite symlink rejection:\ngot:\n%s\nwant:\n%s", string(got), settingsOrig)
+		}
+		if matches, _ := filepath.Glob(settingsPath + ".odd-agy.bak.*"); len(matches) != 0 {
+			t.Fatalf("unexpected settings backups created: %v", matches)
+		}
+		if got, _ := os.ReadFile(outsideMCP); string(got) != mcpSentinel {
+			t.Fatalf("external symlink target mutated: %q", string(got))
+		}
+	})
+
+	t.Run("disable_rejected_on_mcp_config_symlink_leaves_settings_unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		home := t.TempDir()
+
+		if _, err := installer.GrantGlobalMCPPermissions(home); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := installer.RegisterGlobalMCPServer(home, "odd-agy"); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := installer.GlobalSettingsPath(home)
+		settingsOrig, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Load model while enabled, then replace mcp_config.json with a symlink before toggling.
+		m := NewModel(dir, testOptions(home, nil, nil))
+		outside := t.TempDir()
+		outsideMCP := filepath.Join(outside, "outside-mcp.json")
+		const mcpSentinel = `{"mcpServers":{"odd-agy":{"command":"odd-agy","args":["mcp"],"disabled":false}}}` + "\n"
+		if err := os.WriteFile(outsideMCP, []byte(mcpSentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mcpPath := installer.GlobalMCPConfigPath(home)
+		if err := os.Remove(mcpPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideMCP, mcpPath); err != nil {
+			t.Fatal(err)
+		}
+
+		for i := 0; i < 5; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		for i := 0; i < 4; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+		if m.errMsg == "" {
+			t.Fatalf("expected errMsg when mcp_config.json is a symlink during disable")
+		}
+		if got, _ := os.ReadFile(settingsPath); string(got) != string(settingsOrig) {
+			t.Fatalf("settings.json mutated despite symlink rejection during disable:\ngot:\n%s\nwant:\n%s", string(got), string(settingsOrig))
+		}
+		if got, _ := os.ReadFile(outsideMCP); string(got) != mcpSentinel {
+			t.Fatalf("external symlink target mutated: %q", string(got))
+		}
+	})
+}
+

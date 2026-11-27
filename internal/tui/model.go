@@ -829,12 +829,7 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 
 	case 4: // Toggle global MCP permissions + registration (~/.gemini/)
 		if m.globalMCPAllowed && m.globalMCPRegistered {
-			permRes, err := installer.RevokeGlobalMCPPermissions(m.opts.HomeDir)
-			if err != nil {
-				m.errMsg = err.Error()
-				return m, nil
-			}
-			regRes, err := installer.UnregisterGlobalMCPServer(m.opts.HomeDir)
+			permRes, regRes, err := installer.DisableGlobalMCP(m.opts.HomeDir)
 			if err != nil {
 				m.reload()
 				m.errMsg = err.Error()
@@ -844,12 +839,7 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 			m.errMsg = ""
 			m.statusMsg = fmt.Sprintf("Revoked global MCP permission & registration (%s, %s)", permRes.SettingsPath, regRes.ConfigPath)
 		} else {
-			permRes, err := installer.GrantGlobalMCPPermissions(m.opts.HomeDir)
-			if err != nil {
-				m.errMsg = err.Error()
-				return m, nil
-			}
-			regRes, err := installer.RegisterGlobalMCPServer(m.opts.HomeDir, installer.ResolveBinaryPath(""))
+			permRes, regRes, err := installer.EnableGlobalMCP(m.opts.HomeDir, installer.ResolveBinaryPath(""))
 			if err != nil {
 				m.reload()
 				m.errMsg = err.Error()

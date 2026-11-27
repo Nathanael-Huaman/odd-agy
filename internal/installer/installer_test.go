@@ -2127,4 +2127,194 @@ func TestResolveBinaryPath(t *testing.T) {
 	}
 }
 
+func TestInitAllowGlobalMCPUsesResolvedBinaryNotRelativeNodeModules(t *testing.T) {
+	t.Run("fallback_to_odd_agy_when_not_on_path", func(t *testing.T) {
+		ws := t.TempDir()
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+		t.Setenv("PATH", t.TempDir())
+
+		res, err := Init(ws, InitOptions{
+			AllowGlobalMCP: true,
+			HomeDir:        fakeHome,
+			LookPath:       fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+		})
+		if err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+		if !res.GlobalMCPRegistered {
+			t.Fatalf("expected GlobalMCPRegistered=true")
+		}
+
+		// Workspace .agents/mcp_config.json keeps project-relative ./node_modules/.bin/odd-agy
+		wsMCP := readJSONFile(t, MCPConfigPath(ws))
+		wsOdd := wsMCP["mcpServers"].(map[string]any)["odd-agy"].(map[string]any)
+		if wsOdd["command"] != "./node_modules/.bin/odd-agy" {
+			t.Fatalf("workspace mcp command = %v, want ./node_modules/.bin/odd-agy", wsOdd["command"])
+		}
+
+		// Global ~/.gemini/config/mcp_config.json MUST NOT receive relative ./node_modules/.bin/odd-agy
+		reg, cmd, err := GlobalMCPServerRegistered(fakeHome)
+		if err != nil || !reg {
+			t.Fatalf("GlobalMCPServerRegistered = (%t, %q, %v), want registered", reg, cmd, err)
+		}
+		if cmd == "./node_modules/.bin/odd-agy" || cmd != "odd-agy" {
+			t.Fatalf("global mcp command = %q, want resolved binary (odd-agy), never ./node_modules/.bin/odd-agy", cmd)
+		}
+	})
+
+	t.Run("resolves_odd_agy_from_path", func(t *testing.T) {
+		ws := t.TempDir()
+		fakeHome := t.TempDir()
+		binDir := t.TempDir()
+		fakeBin := filepath.Join(binDir, "odd-agy")
+		if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HOME", fakeHome)
+		t.Setenv("PATH", binDir)
+
+		if _, err := Init(ws, InitOptions{
+			AllowGlobalMCP: true,
+			HomeDir:        fakeHome,
+			LookPath:       fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+		}); err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+
+		reg, cmd, err := GlobalMCPServerRegistered(fakeHome)
+		if err != nil || !reg || cmd != fakeBin {
+			t.Fatalf("GlobalMCPServerRegistered = (%t, %q, %v), want (true, %q, nil)", reg, cmd, err, fakeBin)
+		}
+	})
+}
+
+func TestInitAllowGlobalMCPInvalidMCPConfigDoesNotMutateSettings(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "malformed_json", raw: `{"mcpServers": `},
+		{name: "non_object_mcp_servers", raw: `{"mcpServers": "bad"}` + "\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			fakeHome := t.TempDir()
+			t.Setenv("HOME", fakeHome)
+
+			settingsPath := GlobalSettingsPath(fakeHome)
+			if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			const settingsOrig = "{\n  \"theme\": \"dark\"\n}\n"
+			if err := os.WriteFile(settingsPath, []byte(settingsOrig), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			mcpPath := GlobalMCPConfigPath(fakeHome)
+			if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(mcpPath, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Init(ws, InitOptions{
+				AllowGlobalMCP: true,
+				HomeDir:        fakeHome,
+				LookPath:       fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+			}); err == nil {
+				t.Fatalf("expected Init to fail when global mcp_config.json is %s", tc.name)
+			}
+
+			// Neither settings.json nor mcp_config.json may be modified or backed up.
+			if got, err := os.ReadFile(settingsPath); err != nil || string(got) != settingsOrig {
+				t.Fatalf("settings.json was mutated: err=%v got=%q", err, string(got))
+			}
+			if got, err := os.ReadFile(mcpPath); err != nil || string(got) != tc.raw {
+				t.Fatalf("mcp_config.json was mutated: err=%v got=%q", err, string(got))
+			}
+			if matches, _ := filepath.Glob(settingsPath + ".odd-agy.bak.*"); len(matches) != 0 {
+				t.Fatalf("unexpected settings backups created: %v", matches)
+			}
+			// Preflight must also abort BEFORE writing .agents/ in workspace (A2).
+			if _, err := os.Stat(filepath.Join(ws, ".agents")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("Init wrote .agents/ despite failing global MCP preflight: err=%v", err)
+			}
+		})
+	}
+}
+
+func TestGlobalMCPPermissionsRejectSymlinks(t *testing.T) {
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "outside-settings.json")
+	outsideDir := filepath.Join(outside, "outside-dir")
+	const sentinel = `{"theme":"keep"}` + "\n"
+	if err := os.WriteFile(outsideFile, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. ~/.gemini symlink
+	homeGeminiSym := t.TempDir()
+	if err := os.Symlink(outsideDir, filepath.Join(homeGeminiSym, ".gemini")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckGlobalMCPPermissions(homeGeminiSym); err == nil {
+		t.Fatalf("expected CheckGlobalMCPPermissions to reject ~/.gemini symlink")
+	}
+	if _, err := GrantGlobalMCPPermissions(homeGeminiSym); err == nil {
+		t.Fatalf("expected GrantGlobalMCPPermissions to reject ~/.gemini symlink")
+	}
+	if _, err := RevokeGlobalMCPPermissions(homeGeminiSym); err == nil {
+		t.Fatalf("expected RevokeGlobalMCPPermissions to reject ~/.gemini symlink")
+	}
+
+	// 2. ~/.gemini/antigravity-cli symlink
+	homeCLISym := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(homeCLISym, ".gemini"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(homeCLISym, ".gemini", "antigravity-cli")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckGlobalMCPPermissions(homeCLISym); err == nil {
+		t.Fatalf("expected CheckGlobalMCPPermissions to reject antigravity-cli symlink")
+	}
+	if _, err := GrantGlobalMCPPermissions(homeCLISym); err == nil {
+		t.Fatalf("expected GrantGlobalMCPPermissions to reject antigravity-cli symlink")
+	}
+	if _, err := RevokeGlobalMCPPermissions(homeCLISym); err == nil {
+		t.Fatalf("expected RevokeGlobalMCPPermissions to reject antigravity-cli symlink")
+	}
+
+	// 3. ~/.gemini/antigravity-cli/settings.json symlink
+	homeFileSym := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(homeFileSym, ".gemini", "antigravity-cli"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, GlobalSettingsPath(homeFileSym)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckGlobalMCPPermissions(homeFileSym); err == nil {
+		t.Fatalf("expected CheckGlobalMCPPermissions to reject settings.json symlink")
+	}
+	if _, err := GrantGlobalMCPPermissions(homeFileSym); err == nil {
+		t.Fatalf("expected GrantGlobalMCPPermissions to reject settings.json symlink")
+	}
+	if _, err := RevokeGlobalMCPPermissions(homeFileSym); err == nil {
+		t.Fatalf("expected RevokeGlobalMCPPermissions to reject settings.json symlink")
+	}
+	if got, _ := os.ReadFile(outsideFile); string(got) != sentinel {
+		t.Fatalf("external symlink target was modified: %q", string(got))
+	}
+	if entries, _ := os.ReadDir(outsideDir); len(entries) != 0 {
+		t.Fatalf("external dir symlink target was written into: %v", entries)
+	}
+}
+
 

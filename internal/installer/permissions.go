@@ -109,6 +109,9 @@ func GrantGlobalMCPPermissions(homeDir string) (GlobalPermissionsResult, error) 
 	if hd == "" {
 		return GlobalPermissionsResult{}, errors.New("home directory unavailable")
 	}
+	if err := checkGlobalSettingsSymlinks(hd); err != nil {
+		return GlobalPermissionsResult{}, err
+	}
 	p := GlobalSettingsPath(hd)
 
 	var origBytes []byte
@@ -188,6 +191,9 @@ func RevokeGlobalMCPPermissions(homeDir string) (GlobalPermissionsResult, error)
 	hd := resolveHomeDir(homeDir)
 	if hd == "" {
 		return GlobalPermissionsResult{}, errors.New("home directory unavailable")
+	}
+	if err := checkGlobalSettingsSymlinks(hd); err != nil {
+		return GlobalPermissionsResult{}, err
 	}
 	p := GlobalSettingsPath(hd)
 
@@ -272,6 +278,9 @@ func CheckGlobalMCPPermissions(homeDir string) (bool, error) {
 	hd := resolveHomeDir(homeDir)
 	if hd == "" {
 		return false, errors.New("home directory unavailable")
+	}
+	if err := checkGlobalSettingsSymlinks(hd); err != nil {
+		return false, err
 	}
 	p := GlobalSettingsPath(hd)
 
@@ -504,12 +513,102 @@ func UnregisterGlobalMCPServer(homeDir string) (GlobalMCPRegistrationResult, err
 	}, nil
 }
 
+// PreflightGlobalMCP performs zero-write validation of both global Antigravity config files
+// (<homeDir>/.gemini/antigravity-cli/settings.json and <homeDir>/.gemini/config/mcp_config.json):
+// it rejects symlinks along either path and validates JSON structure and required field types.
+func PreflightGlobalMCP(homeDir string) error {
+	hd := resolveHomeDir(homeDir)
+	if hd == "" {
+		return errors.New("home directory unavailable")
+	}
+	if err := checkGlobalSettingsSymlinks(hd); err != nil {
+		return err
+	}
+	settingsPath := GlobalSettingsPath(hd)
+	settingsDoc, _, err := readJSONObject(settingsPath)
+	if err != nil {
+		return err
+	}
+	perms, err := extractPermissionsMap(settingsDoc, settingsPath)
+	if err != nil {
+		return err
+	}
+	if _, err := extractRuleSlice(perms, "allow", settingsPath); err != nil {
+		return err
+	}
+	if _, err := extractRuleSlice(perms, "ask", settingsPath); err != nil {
+		return err
+	}
+
+	if err := checkGlobalMCPConfigSymlinks(hd); err != nil {
+		return err
+	}
+	mcpPath := GlobalMCPConfigPath(hd)
+	mcpDoc, _, err := readJSONObject(mcpPath)
+	if err != nil {
+		return err
+	}
+	if rawServers, hasServers := mcpDoc["mcpServers"]; hasServers && rawServers != nil {
+		if _, ok := rawServers.(map[string]any); !ok {
+			return fmt.Errorf("%s: mcpServers must be a JSON object", mcpPath)
+		}
+	}
+	return nil
+}
+
+// EnableGlobalMCP performs two-phase global MCP activation:
+// Phase 1 preflights symlinks and schemas on both settings.json and mcp_config.json with zero writes;
+// Phase 2 grants permissions and registers mcpServers["odd-agy"] with 0600 backups.
+func EnableGlobalMCP(homeDir, binaryPath string) (GlobalPermissionsResult, GlobalMCPRegistrationResult, error) {
+	if err := PreflightGlobalMCP(homeDir); err != nil {
+		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
+	}
+	permRes, err := GrantGlobalMCPPermissions(homeDir)
+	if err != nil {
+		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
+	}
+	regRes, err := RegisterGlobalMCPServer(homeDir, binaryPath)
+	if err != nil {
+		return permRes, GlobalMCPRegistrationResult{}, err
+	}
+	return permRes, regRes, nil
+}
+
+// DisableGlobalMCP performs two-phase global MCP deactivation:
+// Phase 1 preflights symlinks and schemas on both settings.json and mcp_config.json with zero writes;
+// Phase 2 revokes permissions and unregisters mcpServers["odd-agy"] cleanly.
+func DisableGlobalMCP(homeDir string) (GlobalPermissionsResult, GlobalMCPRegistrationResult, error) {
+	if err := PreflightGlobalMCP(homeDir); err != nil {
+		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
+	}
+	permRes, err := RevokeGlobalMCPPermissions(homeDir)
+	if err != nil {
+		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
+	}
+	regRes, err := UnregisterGlobalMCPServer(homeDir)
+	if err != nil {
+		return permRes, GlobalMCPRegistrationResult{}, err
+	}
+	return permRes, regRes, nil
+}
+
+func checkGlobalSettingsSymlinks(hd string) error {
+	geminiDir := filepath.Join(hd, ".gemini")
+	cliDir := filepath.Join(geminiDir, "antigravity-cli")
+	settingsFile := filepath.Join(cliDir, "settings.json")
+	return checkGlobalFilePathSymlinks([]string{geminiDir, cliDir, settingsFile})
+}
+
 func checkGlobalMCPConfigSymlinks(hd string) error {
 	geminiDir := filepath.Join(hd, ".gemini")
 	configDir := filepath.Join(geminiDir, "config")
 	configFile := filepath.Join(configDir, "mcp_config.json")
+	return checkGlobalFilePathSymlinks([]string{geminiDir, configDir, configFile})
+}
 
-	for i, p := range []string{geminiDir, configDir, configFile} {
+func checkGlobalFilePathSymlinks(paths []string) error {
+	last := len(paths) - 1
+	for i, p := range paths {
 		info, err := os.Lstat(p)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -520,10 +619,10 @@ func checkGlobalMCPConfigSymlinks(hd string) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%s: symlink is not allowed", p)
 		}
-		if i < 2 && !info.IsDir() {
+		if i < last && !info.IsDir() {
 			return fmt.Errorf("%s: expected directory", p)
 		}
-		if i == 2 && info.IsDir() {
+		if i == last && info.IsDir() {
 			return fmt.Errorf("%s: expected file, got directory", p)
 		}
 	}

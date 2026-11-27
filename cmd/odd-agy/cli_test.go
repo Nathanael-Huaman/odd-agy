@@ -1461,6 +1461,123 @@ func TestLaunchWarnsWhenExternalMCPActiveAndUnregistered(t *testing.T) {
 	if code != 0 || errOut != "" {
 		t.Fatalf("launch after registration => code=%d err=%q (want empty stderr)", code, errOut)
 	}
+
+	// Malformed global mcp_config.json (err != nil) still emits the stderr note.
+	mcpPath := installer.GlobalMCPConfigPath(fakeHome)
+	if err := os.WriteFile(mcpPath, []byte(`{"mcpServers": `), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 {
+		t.Fatalf("launch with invalid mcp_config.json => code=%d err=%q", code, errOut)
+	}
+	if errOut != wantNote {
+		t.Fatalf("launch warning stderr on invalid mcp_config.json = %q, want %q", errOut, wantNote)
+	}
+}
+
+func TestPermissionsRejectedSymlinkLeavesSettingsUnchanged(t *testing.T) {
+	t.Run("enable_mcp_config_symlink_leaves_settings_unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+
+		settingsPath := installer.GlobalSettingsPath(fakeHome)
+		if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		const settingsOrig = "{\n  \"theme\": \"dark\"\n}\n"
+		if err := os.WriteFile(settingsPath, []byte(settingsOrig), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		outside := t.TempDir()
+		outsideMCP := filepath.Join(outside, "outside-mcp.json")
+		const mcpSentinel = `{"mcpServers":{"keep":{"command":"x"}}}` + "\n"
+		if err := os.WriteFile(outsideMCP, []byte(mcpSentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mcpPath := installer.GlobalMCPConfigPath(fakeHome)
+		if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideMCP, mcpPath); err != nil {
+			t.Fatal(err)
+		}
+
+		code, _, errOut := runCLI(t, dir, "permissions", "enable")
+		if code != exitError || errOut == "" {
+			t.Fatalf("permissions enable with mcp_config.json symlink => code=%d err=%q, want exitError", code, errOut)
+		}
+		if got, _ := os.ReadFile(settingsPath); string(got) != settingsOrig {
+			t.Fatalf("settings.json mutated despite mcp_config.json symlink rejection:\ngot:\n%s\nwant:\n%s", string(got), settingsOrig)
+		}
+		if matches, _ := filepath.Glob(settingsPath + ".odd-agy.bak.*"); len(matches) != 0 {
+			t.Fatalf("unexpected settings backups created: %v", matches)
+		}
+		if got, _ := os.ReadFile(outsideMCP); string(got) != mcpSentinel {
+			t.Fatalf("external symlink target mutated: %q", string(got))
+		}
+	})
+
+	t.Run("disable_mcp_config_symlink_leaves_settings_unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+
+		if _, err := installer.GrantGlobalMCPPermissions(fakeHome); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := installer.GlobalSettingsPath(fakeHome)
+		settingsOrig, err := os.ReadFile(settingsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		outside := t.TempDir()
+		outsideMCP := filepath.Join(outside, "outside-mcp.json")
+		const mcpSentinel = `{"mcpServers":{"odd-agy":{"command":"odd-agy","args":["mcp"],"disabled":false}}}` + "\n"
+		if err := os.WriteFile(outsideMCP, []byte(mcpSentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mcpPath := installer.GlobalMCPConfigPath(fakeHome)
+		if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideMCP, mcpPath); err != nil {
+			t.Fatal(err)
+		}
+
+		code, _, errOut := runCLI(t, dir, "permissions", "disable")
+		if code != exitError || errOut == "" {
+			t.Fatalf("permissions disable with mcp_config.json symlink => code=%d err=%q, want exitError", code, errOut)
+		}
+		if got, _ := os.ReadFile(settingsPath); !bytes.Equal(got, settingsOrig) {
+			t.Fatalf("settings.json mutated despite mcp_config.json symlink rejection:\ngot:\n%s\nwant:\n%s", string(got), string(settingsOrig))
+		}
+		if got, _ := os.ReadFile(outsideMCP); string(got) != mcpSentinel {
+			t.Fatalf("external symlink target mutated: %q", string(got))
+		}
+	})
+
+	t.Run("enable_gemini_dir_symlink_rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeHome := t.TempDir()
+		t.Setenv("HOME", fakeHome)
+
+		outside := t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(fakeHome, ".gemini")); err != nil {
+			t.Fatal(err)
+		}
+
+		code, _, errOut := runCLI(t, dir, "permissions", "enable")
+		if code != exitError || errOut == "" {
+			t.Fatalf("permissions enable with ~/.gemini symlink => code=%d err=%q, want exitError", code, errOut)
+		}
+		if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+			t.Fatalf("writes escaped through ~/.gemini symlink: %v", entries)
+		}
+	})
 }
 
 
