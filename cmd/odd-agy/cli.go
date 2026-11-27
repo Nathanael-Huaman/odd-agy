@@ -383,7 +383,7 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 
 	var orchestratorModel string
 	var orchestratorEffort string
-	if !noAgent && agentName == "odd-orchestrator" && (!hasModelFlag(extraArgs) || !hasEffortFlag(extraArgs)) {
+	if !noAgent && agentName == "odd-orchestrator" && (!hasCLIFlag(extraArgs, "--model") || !hasCLIFlag(extraArgs, "--effort")) {
 		if _, err := os.Stat(config.ProfilesPath(cwd)); err == nil {
 			profs, err := config.LoadProfiles(cwd)
 			if err != nil {
@@ -393,16 +393,12 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 			if prof, ok := profs.Profiles[profs.ActiveProfile]; ok {
 				ra := prof.Roles[config.RoleOrchestrator]
 				if ra.Runtime == config.RuntimeAgyNative {
-					if !hasModelFlag(extraArgs) {
-						model := strings.TrimSpace(ra.Model)
-						if model != "" && model != "inherit" {
-							orchestratorModel = model
-						}
+					model := strings.TrimSpace(ra.Model)
+					if !hasCLIFlag(extraArgs, "--model") && model != "" && model != "inherit" {
+						orchestratorModel = model
 					}
-					if !hasEffortFlag(extraArgs) {
-						if effort := strings.TrimSpace(ra.Effort); effort != "" {
-							orchestratorEffort = effort
-						}
+					if effort := strings.TrimSpace(ra.Effort); !hasCLIFlag(extraArgs, "--effort") && effort != "" && !modelHasEffortSuffix(model) {
+						orchestratorEffort = effort
 					}
 				}
 			}
@@ -428,18 +424,20 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 	return runExternalCmd(cwd, stdin, stdout, stderr, agyBin, agyArgs...)
 }
 
-func hasModelFlag(args []string) bool {
+func hasCLIFlag(args []string, flagName string) bool {
+	prefix := flagName + "="
 	for _, a := range args {
-		if a == "--model" || strings.HasPrefix(a, "--model=") {
+		if a == flagName || strings.HasPrefix(a, prefix) {
 			return true
 		}
 	}
 	return false
 }
 
-func hasEffortFlag(args []string) bool {
-	for _, a := range args {
-		if a == "--effort" || strings.HasPrefix(a, "--effort=") {
+func modelHasEffortSuffix(model string) bool {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	for _, suffix := range []string{"-low", "-medium", "-high", "-xhigh", "-max"} {
+		if strings.HasSuffix(lower, suffix) {
 			return true
 		}
 	}

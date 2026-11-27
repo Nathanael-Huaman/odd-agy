@@ -1254,9 +1254,9 @@ func TestInitAndSyncRenderAgyNativeModelsIntoAgentFrontmatter(t *testing.T) {
 		}
 	}
 
-	assertFrontmatterModel(".agents/agents/odd-orchestrator.md", "gemini-2.5-pro")
-	assertFrontmatterModel(".agents/agents/gentle-ai-explore.md", "gemini-2.5-flash")
-	assertFrontmatterModel(".agents/agents/gentle-ai-worker.md", "claude-sonnet-4.5")
+	assertFrontmatterModel(".agents/agents/odd-orchestrator.md", "inherit")
+	assertFrontmatterModel(".agents/agents/gentle-ai-explore.md", "flash")
+	assertFrontmatterModel(".agents/agents/gentle-ai-worker.md", "pro")
 	assertFrontmatterModel(".agents/agents/gentle-ai-verify.md", "pro")
 
 	// Doctor must report managed-files OK (manifest hashes match rendered agent files).
@@ -1272,8 +1272,9 @@ func TestInitAndSyncRenderAgyNativeModelsIntoAgentFrontmatter(t *testing.T) {
 		t.Fatalf("expected healthy doctor report, got %+v", docRep.Checks)
 	}
 
-	// Update profiles.json and run Sync without Force: must NOT report conflicts, must update agent frontmatter.
-	profs.Profiles["deepseek-hybrid"].Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-pro-latest"}
+	// Update profiles.json (switch worker from pro-normalized claude-sonnet-4.5 to flash-normalized gemini-3.8-flash-low)
+	// and run Sync without Force: must NOT report conflicts, must update agent frontmatter to flash.
+	profs.Profiles["deepseek-hybrid"].Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
 	if err := config.SaveProfiles(ws, profs); err != nil {
 		t.Fatalf("SaveProfiles update: %v", err)
 	}
@@ -1288,7 +1289,7 @@ func TestInitAndSyncRenderAgyNativeModelsIntoAgentFrontmatter(t *testing.T) {
 	if !slices.Contains(syncRes.Updated, ".agents/agents/gentle-ai-worker.md") {
 		t.Fatalf("expected gentle-ai-worker.md in Sync Updated, got %v", syncRes.Updated)
 	}
-	assertFrontmatterModel(".agents/agents/gentle-ai-worker.md", "gemini-2.5-pro-latest")
+	assertFrontmatterModel(".agents/agents/gentle-ai-worker.md", "flash")
 
 	// Immediate second Sync must report all unchanged.
 	syncRes2, err := Sync(ws, SyncOptions{Force: false})
@@ -1322,9 +1323,9 @@ func TestApplyActiveProfileModels(t *testing.T) {
 	}
 	profs.ActiveProfile = "deepseek-hybrid"
 	ds := profs.Profiles["deepseek-hybrid"]
-	ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-pro"}
-	ds.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-flash"}
-	ds.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-opus-4-6"}
+	ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-medium"}
+	ds.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4-6"}
+	ds.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
 	profs.Profiles["deepseek-hybrid"] = ds
 	if err := config.SaveProfiles(ws, profs); err != nil {
 		t.Fatal(err)
@@ -1334,8 +1335,8 @@ func TestApplyActiveProfileModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyActiveProfileModels: %v", err)
 	}
-	if updated != 3 {
-		t.Fatalf("updated = %d, want 3", updated)
+	if updated != 2 {
+		t.Fatalf("updated = %d, want 2 (explore->pro, worker->flash; orchestrator stays inherit)", updated)
 	}
 
 	// Idempotent second call returns (0, nil).
@@ -1343,6 +1344,25 @@ func TestApplyActiveProfileModels(t *testing.T) {
 	if err != nil || updated2 != 0 {
 		t.Fatalf("second ApplyActiveProfileModels = (%d, %v), want (0, nil)", updated2, err)
 	}
+
+	// Verify normalized frontmatter values on disk and Doctor OK.
+	assertFrontmatter := func(relSlash, want string) {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(ws, filepath.FromSlash(relSlash)))
+		if err != nil {
+			t.Fatalf("read %s: %v", relSlash, err)
+		}
+		fm, _, err := assets.ParseFrontmatter(b)
+		if err != nil {
+			t.Fatalf("ParseFrontmatter(%s): %v", relSlash, err)
+		}
+		if fm.Model != want {
+			t.Fatalf("%s frontmatter model = %q, want %q", relSlash, fm.Model, want)
+		}
+	}
+	assertFrontmatter(".agents/agents/odd-orchestrator.md", "inherit")
+	assertFrontmatter(".agents/agents/gentle-ai-explore.md", "pro")
+	assertFrontmatter(".agents/agents/gentle-ai-worker.md", "flash")
 
 	// Manifest hashes updated so Sync reports zero changes and zero conflicts.
 	syncRes, err := Sync(ws, SyncOptions{})
@@ -1363,7 +1383,7 @@ func TestApplyActiveProfileModels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	profs.Profiles["deepseek-hybrid"].Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-pro"}
+	profs.Profiles["deepseek-hybrid"].Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4-6"}
 	if err := config.SaveProfiles(ws, profs); err != nil {
 		t.Fatal(err)
 	}
@@ -1380,8 +1400,8 @@ func TestApplyActiveProfileModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fm.Model != "gemini-2.5-pro" {
-		t.Fatalf("worker frontmatter model = %q, want gemini-2.5-pro", fm.Model)
+	if fm.Model != "pro" {
+		t.Fatalf("worker frontmatter model = %q, want pro", fm.Model)
 	}
 	if !strings.Contains(body, "model: body-literal-must-stay") {
 		t.Fatalf("user body edit or body 'model:' line was clobbered:\n%s", body)
@@ -1471,7 +1491,7 @@ func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := profs.Profiles[profs.ActiveProfile]
-		p.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high"}
+		p.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
 		profs.Profiles[profs.ActiveProfile] = p
 
 		if _, err := ApplyProfileModels(ws, profs); err == nil {
@@ -1492,6 +1512,11 @@ func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
 
 		orchPath := filepath.Join(ws, ".agents", "agents", "odd-orchestrator.md")
 		beforeOrch, err := os.ReadFile(orchPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		workerPath := filepath.Join(ws, ".agents", "agents", "gentle-ai-worker.md")
+		beforeWorker, err := os.ReadFile(workerPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1518,8 +1543,8 @@ func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := profs.Profiles[profs.ActiveProfile]
-		p.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high"}
-		p.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
+		p.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
+		p.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4-6"}
 		profs.Profiles[profs.ActiveProfile] = p
 
 		if _, err := ApplyProfileModels(ws, profs); err == nil {
@@ -1527,6 +1552,9 @@ func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
 		}
 		if afterOrch, _ := os.ReadFile(orchPath); string(afterOrch) != string(beforeOrch) {
 			t.Fatalf("odd-orchestrator.md was modified despite later symlink error")
+		}
+		if afterWorker, _ := os.ReadFile(workerPath); string(afterWorker) != string(beforeWorker) {
+			t.Fatalf("gentle-ai-worker.md was modified despite later symlink error")
 		}
 		if afterManifest, _ := os.ReadFile(ManifestPath(ws)); string(afterManifest) != string(beforeManifest) {
 			t.Fatalf("manifest was modified despite symlink error")
@@ -1568,7 +1596,7 @@ func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
 			t.Fatal(err)
 		}
 		p := profs.Profiles[profs.ActiveProfile]
-		p.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4-6"}
+		p.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
 		profs.Profiles[profs.ActiveProfile] = p
 		if err := config.SaveProfiles(ws, profs); err != nil {
 			t.Fatal(err)
@@ -1590,10 +1618,10 @@ func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseFrontmatter after CRLF update: %v", err)
 		}
-		if fm.Model != "claude-sonnet-4-6" {
-			t.Fatalf("worker model = %q, want claude-sonnet-4-6", fm.Model)
+		if fm.Model != "flash" {
+			t.Fatalf("worker model = %q, want flash", fm.Model)
 		}
-		if !strings.Contains(string(gotBytes), "model: claude-sonnet-4-6\r\n") {
+		if !strings.Contains(string(gotBytes), "model: flash\r\n") {
 			t.Fatalf("expected CRLF after updated model line")
 		}
 		// Ensure zero bare LF (every \n must be preceded by \r).
@@ -1602,5 +1630,93 @@ func TestApplyActiveProfileModelsDirSymlinkAndCRLFPreservation(t *testing.T) {
 			t.Fatalf("found bare LF in CRLF-preserved file")
 		}
 	})
+}
+
+func TestNormalizeAntigravityAgentFrontmatterModel(t *testing.T) {
+	cases := []struct {
+		name  string
+		role  string
+		model string
+		want  string
+	}{
+		{name: "empty_orchestrator", role: config.RoleOrchestrator, model: "", want: "inherit"},
+		{name: "empty_subagent", role: "worker", model: "  ", want: "inherit"},
+		{name: "inherit_case", role: "explore", model: " INHERIT ", want: "inherit"},
+		{name: "flash_exact", role: "explore", model: "Flash", want: "flash"},
+		{name: "pro_exact", role: "worker", model: "PRO", want: "pro"},
+		{name: "orchestrator_flash_model_maps_to_inherit", role: config.RoleOrchestrator, model: "gemini-3.8-flash-medium", want: "inherit"},
+		{name: "orchestrator_hydrogen_maps_to_inherit", role: config.RoleOrchestrator, model: "gemini-4-hydrogen-high", want: "inherit"},
+		{name: "orchestrator_claude_maps_to_inherit", role: config.RoleOrchestrator, model: "claude-sonnet-4-6", want: "inherit"},
+		{name: "explore_flash_model_maps_to_flash", role: "explore", model: "gemini-3.8-flash-low", want: "flash"},
+		{name: "worker_flash_case_insensitive", role: "worker", model: "Gemini-3.8-FLASH-High", want: "flash"},
+		{name: "worker_claude_maps_to_pro", role: "worker", model: "claude-sonnet-4-6", want: "pro"},
+		{name: "verify_hydrogen_maps_to_pro", role: "verify", model: "gemini-4-hydrogen-high", want: "pro"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeAntigravityAgentFrontmatterModel(tc.role, tc.model); got != tc.want {
+				t.Fatalf("NormalizeAntigravityAgentFrontmatterModel(%q, %q) = %q, want %q", tc.role, tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalizedFrontmatterPreservesDoctorOK(t *testing.T) {
+	ws := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	profs, err := config.LoadProfiles(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := profs.Profiles[profs.ActiveProfile]
+	p.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-medium", Effort: "medium"}
+	p.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
+	p.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4-6"}
+	profs.Profiles[profs.ActiveProfile] = p
+
+	if _, err := ApplyProfileModels(ws, profs); err != nil {
+		t.Fatalf("ApplyProfileModels: %v", err)
+	}
+	if err := config.SaveProfiles(ws, profs); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	assertModel := func(rel, want string) {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(ws, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fm, _, err := assets.ParseFrontmatter(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fm.Model != want {
+			t.Fatalf("%s model = %q, want %q", rel, fm.Model, want)
+		}
+	}
+	assertModel(".agents/agents/odd-orchestrator.md", "inherit")
+	assertModel(".agents/agents/gentle-ai-explore.md", "flash")
+	assertModel(".agents/agents/gentle-ai-worker.md", "pro")
+
+	rep, err := Doctor(ws, DoctorOptions{
+		HomeDir:   fakeHome,
+		LookPath:  fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+		LookupEnv: fakeLookupEnv(nil),
+	})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if rep.HasFailures() || rep.HasWarnings() {
+		t.Fatalf("expected healthy doctor report, got %+v", rep.Checks)
+	}
 }
 

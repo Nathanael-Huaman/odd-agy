@@ -165,9 +165,12 @@ func (m Model) renderRoles(b *strings.Builder) {
 
 func (m Model) renderModelPicker(b *strings.Builder) {
 	b.WriteString(fmt.Sprintf("Select Model for %s (%s):\n", m.pickerRole, m.profiles.ActiveProfile))
-	catalog := m.agyModels
-	if !m.agyModelsLoaded {
-		catalog = fallbackAgyModels
+	var catalog []AgyModelOption
+	if m.pickerRole == config.RoleOrchestrator {
+		catalog = m.agyModels
+		if !m.agyModelsLoaded {
+			catalog = fallbackAgyModels
+		}
 	}
 	opts := m.buildModelPickerOptions(catalog)
 	for i, opt := range opts {
@@ -180,6 +183,11 @@ func (m Model) renderModelPicker(b *strings.Builder) {
 			line = opt.id
 		}
 		b.WriteString(renderCursorLine(i == m.cursor, line))
+		b.WriteByte('\n')
+	}
+	if m.pickerRole != config.RoleOrchestrator {
+		b.WriteByte('\n')
+		b.WriteString(mutedStyle.Render("Antigravity CLI native subagents accept inherit, flash, or pro (switch runtime with [t] to external-mcp for exact per-subagent models)."))
 		b.WriteByte('\n')
 	}
 	b.WriteByte('\n')

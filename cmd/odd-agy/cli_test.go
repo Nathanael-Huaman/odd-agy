@@ -703,8 +703,9 @@ func TestProfileUseSyncsAgentFrontmatterInInitializedWorkspace(t *testing.T) {
 		t.Fatalf("LoadProfiles: %v", err)
 	}
 	ds := profs.Profiles["deepseek-hybrid"]
-	ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high"}
+	ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-medium"}
 	ds.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
+	ds.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4-6"}
 	profs.Profiles["deepseek-hybrid"] = ds
 	if err := config.SaveProfiles(dir, profs); err != nil {
 		t.Fatalf("SaveProfiles: %v", err)
@@ -723,8 +724,8 @@ func TestProfileUseSyncsAgentFrontmatterInInitializedWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseFrontmatter orchestrator: %v", err)
 	}
-	if orchFM.Model != "gemini-3.8-flash-high" {
-		t.Fatalf("odd-orchestrator.md model = %q, want gemini-3.8-flash-high", orchFM.Model)
+	if orchFM.Model != "inherit" {
+		t.Fatalf("odd-orchestrator.md model = %q, want inherit", orchFM.Model)
 	}
 
 	expBytes, err := os.ReadFile(filepath.Join(dir, ".agents", "agents", "gentle-ai-explore.md"))
@@ -735,8 +736,20 @@ func TestProfileUseSyncsAgentFrontmatterInInitializedWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseFrontmatter explore: %v", err)
 	}
-	if expFM.Model != "gemini-3.8-flash-low" {
-		t.Fatalf("gentle-ai-explore.md model = %q, want gemini-3.8-flash-low", expFM.Model)
+	if expFM.Model != "flash" {
+		t.Fatalf("gentle-ai-explore.md model = %q, want flash", expFM.Model)
+	}
+
+	wrkBytes, err := os.ReadFile(filepath.Join(dir, ".agents", "agents", "gentle-ai-worker.md"))
+	if err != nil {
+		t.Fatalf("read gentle-ai-worker.md: %v", err)
+	}
+	wrkFM, _, err := assets.ParseFrontmatter(wrkBytes)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter worker: %v", err)
+	}
+	if wrkFM.Model != "pro" {
+		t.Fatalf("gentle-ai-worker.md model = %q, want pro", wrkFM.Model)
 	}
 
 	syncRes, err := installer.Sync(dir, installer.SyncOptions{})
@@ -1256,6 +1269,57 @@ func TestLaunchEffortInjectionAndProfileShow(t *testing.T) {
 	wantDefault := []string{"--agent", "odd-orchestrator", "--settings", absSettings}
 	if !reflect.DeepEqual(gotArgs, wantDefault) {
 		t.Fatalf("launch empty effort args = %v, want %v", gotArgs, wantDefault)
+	}
+
+	// 9. Effort-suffixed model ID suppresses --effort injection (prevents agy --model/--effort conflict).
+	for _, tc := range []struct {
+		model  string
+		effort string
+	}{
+		{model: "gemini-3.8-flash-medium", effort: "medium"},
+		{model: "gemini-3.8-flash-low", effort: "low"},
+		{model: "gemini-4-hydrogen-high", effort: "high"},
+		{model: "gemini-4-hydrogen-xhigh", effort: "xhigh"},
+		{model: "custom-model-MAX", effort: "max"},
+	} {
+		active.Roles[config.RoleOrchestrator] = config.RoleRoute{
+			Runtime: config.RuntimeAgyNative,
+			Model:   tc.model,
+			Effort:  tc.effort,
+		}
+		profs.Profiles[profs.ActiveProfile] = active
+		if err := config.SaveProfiles(dir, profs); err != nil {
+			t.Fatal(err)
+		}
+		gotArgs = nil
+		code, _, errOut = runCLI(t, dir, "launch")
+		if code != 0 || errOut != "" {
+			t.Fatalf("launch %s => code=%d err=%q", tc.model, code, errOut)
+		}
+		wantModelOnly := []string{"--agent", "odd-orchestrator", "--model", tc.model, "--settings", absSettings}
+		if !reflect.DeepEqual(gotArgs, wantModelOnly) {
+			t.Fatalf("launch %s with effort=%s args = %v, want %v", tc.model, tc.effort, gotArgs, wantModelOnly)
+		}
+	}
+
+	// 10. inherit + effort=low injects --effort low without --model.
+	active.Roles[config.RoleOrchestrator] = config.RoleRoute{
+		Runtime: config.RuntimeAgyNative,
+		Model:   "inherit",
+		Effort:  "low",
+	}
+	profs.Profiles[profs.ActiveProfile] = active
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatal(err)
+	}
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch inherit + effort=low => code=%d err=%q", code, errOut)
+	}
+	wantInheritEffort := []string{"--agent", "odd-orchestrator", "--effort", "low", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantInheritEffort) {
+		t.Fatalf("launch inherit + effort=low args = %v, want %v", gotArgs, wantInheritEffort)
 	}
 }
 

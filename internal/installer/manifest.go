@@ -337,6 +337,27 @@ func roleForAgentRelPath(relSlash string) (string, bool) {
 	return "", false
 }
 
+// NormalizeAntigravityAgentFrontmatterModel maps a configured role model ID to
+// the valid Antigravity CLI .agents/agents/*.md frontmatter enum: inherit | flash | pro.
+func NormalizeAntigravityAgentFrontmatterModel(role, model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch lower {
+	case "", "inherit":
+		return "inherit"
+	case "flash":
+		return "flash"
+	case "pro":
+		return "pro"
+	}
+	if role == config.RoleOrchestrator {
+		return "inherit"
+	}
+	if strings.Contains(lower, "flash") {
+		return "flash"
+	}
+	return "pro"
+}
+
 func renderAssetForProfile(af assets.AssetFile, pf *config.ProfileConfig) []byte {
 	if pf == nil || af.Category != assets.CategoryAgent {
 		return af.Content
@@ -349,10 +370,10 @@ func renderAssetForProfile(af assets.AssetFile, pf *config.ProfileConfig) []byte
 	if !hasRole || ra.Runtime != config.RuntimeAgyNative {
 		return af.Content
 	}
-	model := strings.TrimSpace(ra.Model)
-	if model == "" {
+	if strings.TrimSpace(ra.Model) == "" {
 		return af.Content
 	}
+	model := NormalizeAntigravityAgentFrontmatterModel(role, ra.Model)
 	updated, _, err := replaceFrontmatterModel(af.Content, model)
 	if err != nil {
 		return af.Content
@@ -499,13 +520,15 @@ func ApplyProfileModels(workspaceRoot string, profs config.ProfilesConfig) (int,
 
 		var desiredModel string
 		if ra.Runtime == config.RuntimeAgyNative && strings.TrimSpace(ra.Model) != "" {
-			desiredModel = strings.TrimSpace(ra.Model)
+			desiredModel = NormalizeAntigravityAgentFrontmatterModel(role, ra.Model)
 		} else {
 			fm, _, err := assets.ParseFrontmatter(af.Content)
 			if err != nil {
 				return 0, fmt.Errorf("parse embedded %s frontmatter: %w", af.RelPath, err)
 			}
-			desiredModel = strings.TrimSpace(fm.Model)
+			if strings.TrimSpace(fm.Model) != "" {
+				desiredModel = NormalizeAntigravityAgentFrontmatterModel(role, fm.Model)
+			}
 		}
 		if desiredModel == "" {
 			continue

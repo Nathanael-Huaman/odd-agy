@@ -854,13 +854,18 @@ type effortPickerItem struct {
 	label string
 }
 
-var effortPickerOptions = []effortPickerItem{
-	{value: "", label: "default (Antigravity default / inherit)"},
-	{value: "low", label: "low"},
-	{value: "medium", label: "medium"},
-	{value: "high", label: "high"},
-	{value: "xhigh", label: "xhigh"},
-	{value: "max", label: "max"},
+var effortPickerOptions = buildEffortPickerOptions()
+
+func buildEffortPickerOptions() []effortPickerItem {
+	opts := make([]effortPickerItem, 0, len(config.ValidEfforts))
+	for _, v := range config.ValidEfforts {
+		label := v
+		if v == "" {
+			label = "default (Antigravity default / inherit)"
+		}
+		opts = append(opts, effortPickerItem{value: v, label: label})
+	}
+	return opts
 }
 
 var fallbackAgyModels = []AgyModelOption{
@@ -889,17 +894,28 @@ func (m *Model) ensureAgyModels() []AgyModelOption {
 }
 
 func (m *Model) modelPickerOptions() []modelPickerItem {
+	if m.pickerRole != config.RoleOrchestrator {
+		return m.buildModelPickerOptions(nil)
+	}
 	return m.buildModelPickerOptions(m.ensureAgyModels())
 }
 
 func (m Model) buildModelPickerOptions(catalog []AgyModelOption) []modelPickerItem {
-	items := make([]modelPickerItem, 0, len(catalog)+3)
+	if m.pickerRole != config.RoleOrchestrator {
+		return []modelPickerItem{
+			{id: "inherit", label: "inherit session model"},
+			{id: "flash", label: "Antigravity fast tier"},
+			{id: "pro", label: "Antigravity pro/high tier"},
+		}
+	}
+	items := make([]modelPickerItem, 0, len(catalog)+4)
 	items = append(items,
 		modelPickerItem{id: "inherit", label: "Antigravity session default"},
 		modelPickerItem{id: "flash", label: "Antigravity fast alias"},
+		modelPickerItem{id: "pro", label: "Antigravity pro alias"},
 	)
 	for _, opt := range catalog {
-		if opt.ID == "inherit" || opt.ID == "flash" {
+		if opt.ID == "inherit" || opt.ID == "flash" || opt.ID == "pro" {
 			continue
 		}
 		items = append(items, modelPickerItem{
@@ -972,7 +988,7 @@ func hasControlChar(s string) bool {
 	return false
 }
 
-var catalogEffortSuffixes = []string{"xhigh", "medium", "high", "low"}
+var catalogEffortSuffixes = []string{"xhigh", "medium", "high", "low", "max"}
 
 func extractCatalogEffortSuffix(modelID string) (string, bool) {
 	for _, s := range catalogEffortSuffixes {
@@ -997,14 +1013,11 @@ func findEffortModelVariant(models []AgyModelOption, currentModel, targetEffort 
 	if !inCatalog {
 		return "", false
 	}
-	var base string
-	for _, s := range []string{"xhigh", "medium", "high", "low", "max"} {
-		suffix := "-" + s
-		if strings.HasSuffix(currentModel, suffix) {
-			base = strings.TrimSuffix(currentModel, suffix)
-			break
-		}
+	suffix, ok := extractCatalogEffortSuffix(currentModel)
+	if !ok {
+		return "", false
 	}
+	base := strings.TrimSuffix(currentModel, "-"+suffix)
 	if base == "" {
 		return "", false
 	}
