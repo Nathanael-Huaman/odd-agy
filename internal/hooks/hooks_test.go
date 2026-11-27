@@ -1336,3 +1336,248 @@ func TestDispatch_Errors(t *testing.T) {
 		t.Fatal("expected error for invalid JSON input")
 	}
 }
+
+func TestPreToolUseInvokeSubagentEnforcesExternalMCPRouting(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeFull
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	// 1. Active profile 9router-hybrid with worker = external-mcp DENIES invoke_subagent(gentle-ai-worker)
+	// and does NOT acquire a surface lock.
+	profs := config.DefaultProfilesConfig()
+	profs.ActiveProfile = "9router-hybrid"
+	nineProf := profs.Profiles["9router-hybrid"]
+	nineProf.Roles["worker"] = config.RoleRoute{
+		Runtime:  config.RuntimeExternalMCP,
+		Provider: "9router",
+		Model:    "kr/claude-sonnet-4.5",
+		Fallback: []config.RoleTarget{{Runtime: config.RuntimeAgyNative, Model: "pro"}},
+	}
+	profs.Profiles["9router-hybrid"] = nineProf
+	if err := config.SaveProfiles(repo, profs); err != nil {
+		t.Fatalf("SaveProfiles 9router-hybrid: %v", err)
+	}
+
+	var out9Router PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     1,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{
+						"Role":   "gentle-ai-worker",
+						"Prompt": "## Allowed edit surfaces\n- pkg/a.go\n",
+					},
+				},
+			},
+		},
+	}, &out9Router)
+	if out9Router.Decision != DecisionDeny {
+		t.Fatalf("9router-hybrid worker=external-mcp: expected deny, got %+v", out9Router)
+	}
+	for _, want := range []string{"9router-hybrid", "worker", "9router/kr/claude-sonnet-4.5", "odd-agy/odd_external_run", "fallback_to_native"} {
+		if !strings.Contains(out9Router.Reason, want) {
+			t.Errorf("9router-hybrid deny reason %q missing %q", out9Router.Reason, want)
+		}
+	}
+	st, err := loadHookState(repo)
+	if err != nil {
+		t.Fatalf("loadHookState: %v", err)
+	}
+	if len(st.ActiveWriterSurfaces) != 0 {
+		t.Fatalf("expected no surface lock acquired on external-mcp deny, got %+v", st.ActiveWriterSurfaces)
+	}
+
+	// 2. Active profile deepseek-hybrid with worker = external-mcp DENIES invoke_subagent(gentle-ai-worker)
+	// and does NOT acquire a surface lock.
+	profs.ActiveProfile = "deepseek-hybrid"
+	dsProf := profs.Profiles["deepseek-hybrid"]
+	dsProf.Roles["worker"] = config.RoleRoute{
+		Runtime:  config.RuntimeExternalMCP,
+		Provider: "deepseek",
+		Model:    "deepseek-v4-pro",
+		Fallback: []config.RoleTarget{{Runtime: config.RuntimeAgyNative, Model: "pro"}},
+	}
+	profs.Profiles["deepseek-hybrid"] = dsProf
+	if err := config.SaveProfiles(repo, profs); err != nil {
+		t.Fatalf("SaveProfiles deepseek-hybrid: %v", err)
+	}
+
+	var outDeepSeek PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     2,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{
+						"Role":   "gentle-ai-worker",
+						"Prompt": "## Allowed edit surfaces\n- pkg/a.go\n",
+					},
+				},
+			},
+		},
+	}, &outDeepSeek)
+	if outDeepSeek.Decision != DecisionDeny {
+		t.Fatalf("deepseek-hybrid worker=external-mcp: expected deny, got %+v", outDeepSeek)
+	}
+	for _, want := range []string{"deepseek-hybrid", "worker", "deepseek/deepseek-v4-pro", "odd-agy/odd_external_run"} {
+		if !strings.Contains(outDeepSeek.Reason, want) {
+			t.Errorf("deepseek-hybrid deny reason %q missing %q", outDeepSeek.Reason, want)
+		}
+	}
+	st, err = loadHookState(repo)
+	if err != nil {
+		t.Fatalf("loadHookState: %v", err)
+	}
+	if len(st.ActiveWriterSurfaces) != 0 {
+		t.Fatalf("expected no surface lock acquired on deepseek-hybrid deny, got %+v", st.ActiveWriterSurfaces)
+	}
+
+	// 3. Same call WITH fallback_to_native but WITHOUT Allowed edit surfaces -> still DENIED by surface guard.
+	var outFallbackNoSurface PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     3,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{
+						"Role":   "gentle-ai-worker",
+						"Prompt": "Runtime fallback_to_native from odd_external_run.\nImplement change.",
+					},
+				},
+			},
+		},
+	}, &outFallbackNoSurface)
+	if outFallbackNoSurface.Decision != DecisionDeny {
+		t.Fatalf("expected deny when fallback_to_native omits Allowed edit surfaces, got %+v", outFallbackNoSurface)
+	}
+	if !strings.Contains(outFallbackNoSurface.Reason, "Allowed edit surfaces") {
+		t.Errorf("expected Allowed edit surfaces error, got %q", outFallbackNoSurface.Reason)
+	}
+
+	// 4. Same call WITH fallback_to_native AND Allowed edit surfaces -> ALLOWED.
+	var outFallbackAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     4,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{
+						"Role":   "gentle-ai-worker",
+						"Prompt": "Fallback reason: FALLBACK_TO_NATIVE after odd_external_run returned fallback_to_native.\n## Allowed edit surfaces\n- pkg/a.go\n",
+					},
+				},
+			},
+		},
+	}, &outFallbackAllow)
+	if outFallbackAllow.Decision != DecisionAllow {
+		t.Fatalf("expected allow with fallback_to_native + Allowed edit surfaces, got %+v", outFallbackAllow)
+	}
+	var postOut map[string]any
+	dispatchJSON(t, "PostToolUse", PostToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     4,
+		ToolCall:    ToolCall{Name: "invoke_subagent"},
+	}, &postOut)
+
+	// 5. Active profile agy-oauth (worker = agy-native) ALLOWS invoke_subagent(gentle-ai-worker) normally.
+	profs.ActiveProfile = "agy-oauth"
+	if err := config.SaveProfiles(repo, profs); err != nil {
+		t.Fatalf("SaveProfiles agy-oauth: %v", err)
+	}
+	var outAgyAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     5,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{
+						"Role":   "gentle-ai-worker",
+						"Prompt": "## Allowed edit surfaces\n- pkg/b.go\n",
+					},
+				},
+			},
+		},
+	}, &outAgyAllow)
+	if outAgyAllow.Decision != DecisionAllow {
+		t.Fatalf("expected allow under agy-oauth, got %+v", outAgyAllow)
+	}
+	dispatchJSON(t, "PostToolUse", PostToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     5,
+		ToolCall:    ToolCall{Name: "invoke_subagent"},
+	}, &postOut)
+
+	// 6. Active profile with explore = external-mcp DENIES invoke_subagent(gentle-ai-explore).
+	profs.ActiveProfile = "9router-hybrid"
+	nineProf = profs.Profiles["9router-hybrid"]
+	nineProf.Roles["explore"] = config.RoleRoute{
+		Runtime:  config.RuntimeExternalMCP,
+		Provider: "9router",
+		Model:    "kr/claude-sonnet-4.5",
+		Fallback: []config.RoleTarget{{Runtime: config.RuntimeAgyNative, Model: "flash"}},
+	}
+	profs.Profiles["9router-hybrid"] = nineProf
+	if err := config.SaveProfiles(repo, profs); err != nil {
+		t.Fatalf("SaveProfiles explore=external-mcp: %v", err)
+	}
+
+	var outExploreDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     6,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{
+						"TypeName": "GENTLE-AI-EXPLORE",
+						"Prompt":   "Map repo structure",
+					},
+				},
+			},
+		},
+	}, &outExploreDeny)
+	if outExploreDeny.Decision != DecisionDeny {
+		t.Fatalf("expected deny for gentle-ai-explore when explore=external-mcp, got %+v", outExploreDeny)
+	}
+	for _, want := range []string{"9router-hybrid", "explore", "odd-agy/odd_external_run"} {
+		if !strings.Contains(outExploreDeny.Reason, want) {
+			t.Errorf("explore deny reason %q missing %q", outExploreDeny.Reason, want)
+		}
+	}
+
+	// Same explore call WITH fallback_to_native -> ALLOWED.
+	var outExploreFallback PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-ext", WorkspacePaths: []string{repo}},
+		StepIdx:     7,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{
+						"TypeName": "gentle-ai-explore",
+						"Prompt":   "fallback_to_native from odd_external_run. Map repo structure.",
+					},
+				},
+			},
+		},
+	}, &outExploreFallback)
+	if outExploreFallback.Decision != DecisionAllow {
+		t.Fatalf("expected allow for gentle-ai-explore with fallback_to_native, got %+v", outExploreFallback)
+	}
+}
