@@ -1153,3 +1153,65 @@ func TestGlobalMCPPermissionsInvalidSettingsRemainByteIdentical(t *testing.T) {
 		})
 	}
 }
+
+func TestDoctorFailsWhenSessionSettingsMissingFromManifest(t *testing.T) {
+	ws := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	manifest, err := LoadManifest(ws)
+	if err != nil {
+		t.Fatalf("LoadManifest: %v", err)
+	}
+	if _, ok := manifest.Files[SessionSettingsRelPath]; !ok {
+		t.Fatalf("expected %s in manifest before deletion", SessionSettingsRelPath)
+	}
+	delete(manifest.Files, SessionSettingsRelPath)
+	if err := saveManifest(ws, manifest); err != nil {
+		t.Fatalf("saveManifest: %v", err)
+	}
+
+	report, err := Doctor(ws, DoctorOptions{
+		HomeDir: fakeHome,
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+		LookupEnv: fakeLookupEnv(nil),
+	})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if !report.HasFailures() {
+		t.Fatalf("expected Doctor report to fail when %s missing from manifest, got %+v", SessionSettingsRelPath, report.Checks)
+	}
+
+	var managed Check
+	var found bool
+	for _, c := range report.Checks {
+		if c.Name == "managed-files" {
+			managed = c
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing managed-files check in report: %+v", report.Checks)
+	}
+	if managed.Status != CheckFail {
+		t.Fatalf("managed-files status = %q, want %q (detail=%q)", managed.Status, CheckFail, managed.Detail)
+	}
+	if !strings.Contains(managed.Detail, SessionSettingsRelPath) {
+		t.Fatalf("managed-files detail = %q, want mention of %q", managed.Detail, SessionSettingsRelPath)
+	}
+}
+

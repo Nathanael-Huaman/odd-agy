@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -643,3 +644,46 @@ func TestLaunchRejectsConflictingAgentAndNoAgentFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestRunExternalCmdExitAndSignalHandling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX sh and SIGTERM signal termination test is Unix-only")
+	}
+
+	dir := t.TempDir()
+
+	t.Run("exit_0", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := runExternalCmd(dir, strings.NewReader(""), &stdout, &stderr, "sh", "-c", "exit 0")
+		if code != 0 {
+			t.Fatalf("code = %d, want 0 (stderr=%q)", code, stderr.String())
+		}
+		if stderr.String() != "" {
+			t.Fatalf("unexpected stderr: %q", stderr.String())
+		}
+	})
+
+	t.Run("exit_7", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := runExternalCmd(dir, strings.NewReader(""), &stdout, &stderr, "sh", "-c", "exit 7")
+		if code != 7 {
+			t.Fatalf("code = %d, want 7 (stderr=%q)", code, stderr.String())
+		}
+		if stderr.String() != "" {
+			t.Fatalf("unexpected stderr on normal non-zero exit: %q", stderr.String())
+		}
+	})
+
+	t.Run("terminated_by_signal", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := runExternalCmd(dir, strings.NewReader(""), &stdout, &stderr, "sh", "-c", "kill -TERM $$")
+		if code != 1 {
+			t.Fatalf("code = %d, want 1 (exitError) for signal termination (stderr=%q)", code, stderr.String())
+		}
+		errOut := stderr.String()
+		if errOut == "" || !strings.Contains(errOut, "terminated by signal") {
+			t.Fatalf("expected non-empty signal diagnostic on stderr, got %q", errOut)
+		}
+	})
+}
+

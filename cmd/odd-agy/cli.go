@@ -39,7 +39,12 @@ var (
 		if err := cmd.Run(); err != nil {
 			var exitErr *exec.ExitError
 			if errors.As(err, &exitErr) {
-				return exitErr.ExitCode()
+				code := exitErr.ExitCode()
+				if code < 0 {
+					fmt.Fprintf(stderr, "odd-agy: %s terminated by signal: %v\n", name, err)
+					return exitError
+				}
+				return code
 			}
 			fmt.Fprintf(stderr, "odd-agy launch: %v\n", err)
 			return exitError
