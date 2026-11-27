@@ -208,10 +208,29 @@ func Init(workspaceRoot string, opts InitOptions) (InitResult, error) {
 		return InitResult{}, fmt.Errorf("save manifest: %w", err)
 	}
 
-	return InitResult{
+	out := InitResult{
 		InstalledFiles:  installed,
 		PreservedConfig: preservedConfig,
 		AddedEngramMCP:  engramManaged,
 		ManifestPath:    ".agents/odd/.managed-manifest.json",
-	}, nil
+	}
+	if opts.AllowGlobalMCP {
+		if err := checkGlobalMCPConfigSymlinks(resolveHomeDir(opts.HomeDir)); err != nil {
+			return InitResult{}, err
+		}
+		permRes, err := GrantGlobalMCPPermissions(opts.HomeDir)
+		if err != nil {
+			return InitResult{}, fmt.Errorf("grant global MCP permissions: %w", err)
+		}
+		regRes, err := RegisterGlobalMCPServer(opts.HomeDir, binCmd)
+		if err != nil {
+			return InitResult{}, fmt.Errorf("register global MCP server: %w", err)
+		}
+		out.GlobalMCPAllowed = permRes.Enabled
+		out.GlobalMCPRegistered = regRes.Registered
+		out.GlobalSettingsPath = permRes.SettingsPath
+		out.GlobalMCPConfigPath = regRes.ConfigPath
+	}
+
+	return out, nil
 }

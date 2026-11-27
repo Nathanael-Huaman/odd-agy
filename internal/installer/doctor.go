@@ -84,10 +84,13 @@ func Doctor(workspaceRoot string, opts DoctorOptions) (DoctorReport, error) {
 	// 7. .agents/mcp_config.json validity & odd-agy entry
 	checks = append(checks, checkMCPConfig(ws))
 
-	// 8. Active profile provider readiness (never leaks API key values)
+	// 8. Global ~/.gemini/config/mcp_config.json registration check
+	checks = append(checks, checkGlobalMCPRegistration(homeDir, profCfg, profOK))
+
+	// 9. Active profile provider readiness (never leaks API key values)
 	checks = append(checks, checkProviderReadiness(profCfg, profOK, lookupEnv))
 
-	// 9. Global ~/.gemini/ gentle-ai collision check
+	// 10. Global ~/.gemini/ gentle-ai collision check
 	checks = append(checks, checkGlobalCollision(homeDir))
 
 	return DoctorReport{Checks: checks}, nil
@@ -250,6 +253,48 @@ func checkMCPConfig(ws string) Check {
 		return Check{Name: "mcp-config", Status: CheckFail, Detail: ".agents/mcp_config.json missing \"odd-agy\" server"}
 	}
 	return Check{Name: "mcp-config", Status: CheckOK, Detail: ".agents/mcp_config.json valid with odd-agy server"}
+}
+
+func checkGlobalMCPRegistration(homeDir string, cfg config.ProfilesConfig, profOK bool) Check {
+	registered, cmd, err := GlobalMCPServerRegistered(homeDir)
+	if err != nil {
+		return Check{
+			Name:   "mcp-registration",
+			Status: CheckWarn,
+			Detail: err.Error(),
+		}
+	}
+	if registered {
+		return Check{
+			Name:   "mcp-registration",
+			Status: CheckOK,
+			Detail: fmt.Sprintf("odd-agy MCP server registered in ~/.gemini/config/mcp_config.json (command=%s)", cmd),
+		}
+	}
+
+	usesExternalMCP := false
+	if profOK {
+		if active, ok := cfg.Profiles[cfg.ActiveProfile]; ok {
+			for _, route := range active.Roles {
+				if route.Runtime == config.RuntimeExternalMCP {
+					usesExternalMCP = true
+					break
+				}
+			}
+		}
+	}
+	if usesExternalMCP {
+		return Check{
+			Name:   "mcp-registration",
+			Status: CheckWarn,
+			Detail: "active profile uses external-mcp roles, but odd-agy MCP server is not registered in ~/.gemini/config/mcp_config.json (run 'odd-agy permissions enable' or 'agy mcp add odd-agy odd-agy mcp')",
+		}
+	}
+	return Check{
+		Name:   "mcp-registration",
+		Status: CheckOK,
+		Detail: "project-scoped only; run 'odd-agy permissions enable' when using external-mcp or RDD MCP tools",
+	}
 }
 
 func checkProviderReadiness(cfg config.ProfilesConfig, profOK bool, lookupEnv func(string) (string, bool)) Check {

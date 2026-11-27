@@ -239,19 +239,15 @@ func runInit(args []string, stdout, stderr io.Writer, cwd string) int {
 		return exitUsage
 	}
 
+	opts.AllowGlobalMCP = allowMCP
 	res, err := installer.Init(cwd, opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "odd-agy init: %v\n", err)
 		return exitError
 	}
 	if allowMCP {
-		permRes, err := installer.GrantGlobalMCPPermissions("")
-		if err != nil {
-			fmt.Fprintf(stderr, "odd-agy init --allow-mcp: %v\n", err)
-			return exitError
-		}
-		fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t globalMCP=enabled settings=%s)\n",
-			len(res.InstalledFiles), res.ManifestPath, res.PreservedConfig, res.AddedEngramMCP, permRes.SettingsPath)
+		fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t globalMCP=enabled settings=%s mcpConfig=%s)\n",
+			len(res.InstalledFiles), res.ManifestPath, res.PreservedConfig, res.AddedEngramMCP, res.GlobalSettingsPath, res.GlobalMCPConfigPath)
 		return exitOK
 	}
 	fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t)\n",
@@ -383,14 +379,14 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 
 	var orchestratorModel string
 	var orchestratorEffort string
-	if !noAgent && agentName == "odd-orchestrator" && (!hasCLIFlag(extraArgs, "--model") || !hasCLIFlag(extraArgs, "--effort")) {
-		if _, err := os.Stat(config.ProfilesPath(cwd)); err == nil {
-			profs, err := config.LoadProfiles(cwd)
-			if err != nil {
-				fmt.Fprintf(stderr, "odd-agy launch: %v\n", err)
-				return exitError
-			}
-			if prof, ok := profs.Profiles[profs.ActiveProfile]; ok {
+	if _, err := os.Stat(config.ProfilesPath(cwd)); err == nil {
+		profs, err := config.LoadProfiles(cwd)
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy launch: %v\n", err)
+			return exitError
+		}
+		if prof, ok := profs.Profiles[profs.ActiveProfile]; ok {
+			if !noAgent && agentName == "odd-orchestrator" && (!hasCLIFlag(extraArgs, "--model") || !hasCLIFlag(extraArgs, "--effort")) {
 				ra := prof.Roles[config.RoleOrchestrator]
 				if ra.Runtime == config.RuntimeAgyNative {
 					model := strings.TrimSpace(ra.Model)
@@ -402,10 +398,15 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 					}
 				}
 			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintf(stderr, "odd-agy launch: stat profiles: %v\n", err)
-			return exitError
+			if profileUsesExternalMCP(prof) {
+				if reg, _, err := installer.GlobalMCPServerRegistered(""); err == nil && !reg {
+					fmt.Fprintf(stderr, "note: active profile %q uses external-mcp roles, but \"odd-agy\" is not registered in ~/.gemini/config/mcp_config.json. Run \"odd-agy permissions enable\" or \"agy mcp add odd-agy odd-agy mcp\" first.\n", profs.ActiveProfile)
+				}
+			}
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "odd-agy launch: stat profiles: %v\n", err)
+		return exitError
 	}
 
 	agyArgs := make([]string, 0, 8+len(extraArgs))
@@ -444,14 +445,50 @@ func modelHasEffortSuffix(model string) bool {
 	return false
 }
 
+func profileUsesExternalMCP(prof config.ProfileConfig) bool {
+	for _, route := range prof.Roles {
+		if route.Runtime == config.RuntimeExternalMCP {
+			return true
+		}
+	}
+	return false
+}
+
 func runPermissions(args []string, stdout, stderr io.Writer) int {
+	var pos []string
+	var binaryPath string
+	hasBinaryFlag := false
+
+	for i := 0; i < len(args); i++ {
+		if val, nextIdx, matched, err := parseValueFlag(args, i, "--binary"); matched {
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy permissions: %v\n", err)
+				return exitUsage
+			}
+			binaryPath = val
+			hasBinaryFlag = true
+			i = nextIdx
+			continue
+		}
+		if strings.HasPrefix(args[i], "-") {
+			fmt.Fprintf(stderr, "odd-agy permissions: unknown flag %q\n", args[i])
+			return exitUsage
+		}
+		pos = append(pos, args[i])
+	}
+
 	sub := "status"
-	if len(args) > 1 {
-		fmt.Fprintf(stderr, "odd-agy permissions: expected at most 1 argument, got %d\n", len(args))
+	if len(pos) > 1 {
+		fmt.Fprintf(stderr, "odd-agy permissions: expected at most 1 subcommand, got %d\n", len(pos))
 		return exitUsage
 	}
-	if len(args) == 1 {
-		sub = args[0]
+	if len(pos) == 1 {
+		sub = pos[0]
+	}
+
+	if hasBinaryFlag && sub != "enable" && sub != "allow-mcp" {
+		fmt.Fprintf(stderr, "odd-agy permissions %s: --binary is only valid with \"enable\" or \"allow-mcp\"\n", sub)
+		return exitUsage
 	}
 
 	switch sub {
@@ -461,40 +498,67 @@ func runPermissions(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "odd-agy permissions status: %v\n", err)
 			return exitError
 		}
-		state := "disabled"
+		registered, regCmd, err := installer.GlobalMCPServerRegistered("")
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy permissions status: %v\n", err)
+			return exitError
+		}
+		permState := "disabled"
 		if enabled {
-			state = "enabled"
+			permState = "enabled"
 		}
-		fmt.Fprintf(stdout, "global MCP permissions: %s (%s)\n", state, installer.GlobalSettingsPath(""))
+		regState := "unregistered"
+		if registered {
+			regState = fmt.Sprintf("registered command=%s", regCmd)
+		}
+		fmt.Fprintf(stdout, "global MCP permissions: %s (%s)\n", permState, installer.GlobalSettingsPath(""))
+		fmt.Fprintf(stdout, "global MCP registration: %s (%s)\n", regState, installer.GlobalMCPConfigPath(""))
 		return exitOK
 
-	case "allow-mcp":
-		res, err := installer.GrantGlobalMCPPermissions("")
+	case "enable", "allow-mcp":
+		resolvedBin := installer.ResolveBinaryPath(binaryPath)
+		permRes, err := installer.GrantGlobalMCPPermissions("")
 		if err != nil {
-			fmt.Fprintf(stderr, "odd-agy permissions allow-mcp: %v\n", err)
+			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
 			return exitError
 		}
-		if res.BackupPath != "" {
-			fmt.Fprintf(stdout, "global MCP permissions enabled (settings=%s changed=%t backup=%s)\n",
-				res.SettingsPath, res.Changed, res.BackupPath)
-		} else {
-			fmt.Fprintf(stdout, "global MCP permissions enabled (settings=%s changed=%t)\n",
-				res.SettingsPath, res.Changed)
+		regRes, err := installer.RegisterGlobalMCPServer("", resolvedBin)
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
+			return exitError
 		}
+		fmt.Fprintf(stdout, "global MCP permissions enabled (settings=%s changed=%t", permRes.SettingsPath, permRes.Changed)
+		if permRes.BackupPath != "" {
+			fmt.Fprintf(stdout, " backup=%s", permRes.BackupPath)
+		}
+		fmt.Fprintf(stdout, "; mcpConfig=%s command=%s changed=%t", regRes.ConfigPath, regRes.Command, regRes.Changed)
+		if regRes.BackupPath != "" {
+			fmt.Fprintf(stdout, " mcpBackup=%s", regRes.BackupPath)
+		}
+		fmt.Fprintln(stdout, ")")
 		return exitOK
 
-	case "revoke-mcp":
-		res, err := installer.RevokeGlobalMCPPermissions("")
+	case "disable", "revoke-mcp":
+		permRes, err := installer.RevokeGlobalMCPPermissions("")
 		if err != nil {
-			fmt.Fprintf(stderr, "odd-agy permissions revoke-mcp: %v\n", err)
+			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
 			return exitError
 		}
-		fmt.Fprintf(stdout, "global MCP permissions revoked (settings=%s changed=%t)\n",
-			res.SettingsPath, res.Changed)
+		regRes, err := installer.UnregisterGlobalMCPServer("")
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
+			return exitError
+		}
+		fmt.Fprintf(stdout, "global MCP permissions revoked (settings=%s changed=%t; mcpConfig=%s changed=%t",
+			permRes.SettingsPath, permRes.Changed, regRes.ConfigPath, regRes.Changed)
+		if regRes.BackupPath != "" {
+			fmt.Fprintf(stdout, " mcpBackup=%s", regRes.BackupPath)
+		}
+		fmt.Fprintln(stdout, ")")
 		return exitOK
 
 	default:
-		fmt.Fprintf(stderr, "odd-agy permissions: invalid subcommand %q (expected \"status\", \"allow-mcp\", or \"revoke-mcp\")\n", sub)
+		fmt.Fprintf(stderr, "odd-agy permissions: invalid subcommand %q (expected \"status\", \"enable\", \"disable\", \"allow-mcp\", or \"revoke-mcp\")\n", sub)
 		return exitUsage
 	}
 }
@@ -910,7 +974,8 @@ Commands:
        [--profile=agy-oauth] [--binary=...] [--allow-mcp] [--force]
   launch [--agent=<name>] [--no-agent] [-- <extra agy args...>]
                                             Launch Antigravity CLI with project-scoped .agents/odd/agy-session-settings.json
-  permissions [status|allow-mcp|revoke-mcp] Manage optional global ~/.gemini/antigravity-cli/settings.json MCP rule
+  permissions [status|enable|disable|allow-mcp|revoke-mcp] [--binary=<path>]
+                                            Manage optional global ~/.gemini/ MCP rules & server registration
   sync [--binary=...] [--force]             Refresh managed .agents/ files against manifest
   doctor                                    Run workspace, CLI, provider, and collision diagnostics
   uninstall                                 Remove managed .agents/ files and hook/MCP entries

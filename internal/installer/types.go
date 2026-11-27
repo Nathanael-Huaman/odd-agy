@@ -29,16 +29,22 @@ type InitOptions struct {
 	BinaryCommand    string
 	IncludeEngramMCP bool
 	ExcludeEngramMCP bool
+	AllowGlobalMCP   bool
+	HomeDir          string
 	Force            bool
 	LookPath         func(string) (string, error)
 }
 
 // InitResult summarizes files installed and preserved during Init.
 type InitResult struct {
-	InstalledFiles  []string
-	PreservedConfig bool
-	AddedEngramMCP  bool
-	ManifestPath    string
+	InstalledFiles      []string
+	PreservedConfig     bool
+	AddedEngramMCP      bool
+	ManifestPath        string
+	GlobalMCPAllowed    bool
+	GlobalMCPRegistered bool
+	GlobalSettingsPath  string
+	GlobalMCPConfigPath string
 }
 
 // SyncOptions configures managed asset synchronization under <workspace>/.agents/.

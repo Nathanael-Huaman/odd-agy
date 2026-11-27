@@ -361,6 +361,9 @@ func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
 	if !strings.Contains(m.View(), "Allow MCP globally (~/.gemini)") {
 		t.Fatalf("expected Allow MCP globally action in Project Actions:\n%s", m.View())
 	}
+	if !strings.Contains(m.View(), "settings.json") || !strings.Contains(m.View(), "mcp_config.json") {
+		t.Fatalf("expected both settings.json and mcp_config.json status in Project Actions:\n%s", m.View())
+	}
 
 	// Move down to Item 4: Allow MCP globally (~/.gemini)
 	for i := 0; i < 4; i++ {
@@ -372,15 +375,23 @@ func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
 	if err != nil || !enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after TUI grant = (%t, %v)", enabled, err)
 	}
+	reg, _, err := installer.GlobalMCPServerRegistered(home)
+	if err != nil || !reg {
+		t.Fatalf("GlobalMCPServerRegistered after TUI grant = (%t, %v)", reg, err)
+	}
 	if !strings.Contains(m.View(), "Revoke global MCP rule") {
 		t.Fatalf("expected Revoke global MCP rule label after grant:\n%s", m.View())
 	}
 
-	// Toggle again -> Revoke global MCP rule
+	// Toggle again -> Revoke global MCP rule & unregister
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	enabled, err = installer.CheckGlobalMCPPermissions(home)
 	if err != nil || enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after TUI revoke = (%t, %v)", enabled, err)
+	}
+	reg, _, err = installer.GlobalMCPServerRegistered(home)
+	if err != nil || reg {
+		t.Fatalf("GlobalMCPServerRegistered after TUI revoke = (%t, %v)", reg, err)
 	}
 	if !strings.Contains(m.View(), "Allow MCP globally (~/.gemini)") {
 		t.Fatalf("expected Allow MCP globally label after revoke:\n%s", m.View())

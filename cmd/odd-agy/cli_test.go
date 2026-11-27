@@ -550,7 +550,7 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 		t.Fatalf("permissions status => code=%d out=%q err=%q", code, out, errOut)
 	}
 
-	// init --allow-mcp grants global MCP rules.
+	// init --allow-mcp grants global MCP permissions AND registers global MCP server.
 	code, out, errOut = runCLI(t, dir, "init", "--allow-mcp")
 	if code != 0 || errOut != "" || !strings.Contains(out, "globalMCP=enabled") {
 		t.Fatalf("init --allow-mcp => code=%d out=%q err=%q", code, out, errOut)
@@ -559,14 +559,18 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 	if err != nil || !enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after init --allow-mcp = (%t, %v)", enabled, err)
 	}
+	reg, cmd, err := installer.GlobalMCPServerRegistered(fakeHome)
+	if err != nil || !reg || cmd == "" {
+		t.Fatalf("GlobalMCPServerRegistered after init --allow-mcp = (%t, %q, %v)", reg, cmd, err)
+	}
 
-	// permissions status reports enabled.
+	// permissions status reports both enabled and registered.
 	code, out, errOut = runCLI(t, dir, "permissions", "status")
-	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") {
+	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") || !strings.Contains(out, "registered") {
 		t.Fatalf("permissions status enabled => code=%d out=%q err=%q", code, out, errOut)
 	}
 
-	// permissions revoke-mcp removes rules.
+	// permissions revoke-mcp removes both rules and registration (PRESERVE).
 	code, out, errOut = runCLI(t, dir, "permissions", "revoke-mcp")
 	if code != 0 || errOut != "" || !strings.Contains(out, "revoked") {
 		t.Fatalf("permissions revoke-mcp => code=%d out=%q err=%q", code, out, errOut)
@@ -575,8 +579,12 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 	if err != nil || enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after revoke-mcp = (%t, %v)", enabled, err)
 	}
+	reg, _, err = installer.GlobalMCPServerRegistered(fakeHome)
+	if err != nil || reg {
+		t.Fatalf("GlobalMCPServerRegistered after revoke-mcp = (%t, %v)", reg, err)
+	}
 
-	// permissions allow-mcp re-grants rules.
+	// permissions allow-mcp re-grants both (PRESERVE).
 	code, out, errOut = runCLI(t, dir, "permissions", "allow-mcp")
 	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") {
 		t.Fatalf("permissions allow-mcp => code=%d out=%q err=%q", code, out, errOut)
@@ -584,6 +592,40 @@ func TestInitAllowMCPAndPermissionsCommand(t *testing.T) {
 	enabled, err = installer.CheckGlobalMCPPermissions(fakeHome)
 	if err != nil || !enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after allow-mcp = (%t, %v)", enabled, err)
+	}
+	reg, _, err = installer.GlobalMCPServerRegistered(fakeHome)
+	if err != nil || !reg {
+		t.Fatalf("GlobalMCPServerRegistered after allow-mcp = (%t, %v)", reg, err)
+	}
+
+	// permissions disable & enable --binary=<path>.
+	code, out, errOut = runCLI(t, dir, "permissions", "disable")
+	if code != 0 || errOut != "" || !strings.Contains(out, "revoked") {
+		t.Fatalf("permissions disable => code=%d out=%q err=%q", code, out, errOut)
+	}
+	if enabled, _ := installer.CheckGlobalMCPPermissions(fakeHome); enabled {
+		t.Fatalf("expected permissions disabled after disable")
+	}
+	if reg, _, _ := installer.GlobalMCPServerRegistered(fakeHome); reg {
+		t.Fatalf("expected MCP unregistered after disable")
+	}
+
+	code, out, errOut = runCLI(t, dir, "permissions", "enable", "--binary=/custom/odd-agy")
+	if code != 0 || errOut != "" || !strings.Contains(out, "enabled") || !strings.Contains(out, "/custom/odd-agy") {
+		t.Fatalf("permissions enable --binary => code=%d out=%q err=%q", code, out, errOut)
+	}
+	if enabled, _ := installer.CheckGlobalMCPPermissions(fakeHome); !enabled {
+		t.Fatalf("expected permissions enabled after enable")
+	}
+	if reg, regCmd, _ := installer.GlobalMCPServerRegistered(fakeHome); !reg || regCmd != "/custom/odd-agy" {
+		t.Fatalf("GlobalMCPServerRegistered after enable --binary = (%t, %q), want (true, /custom/odd-agy)", reg, regCmd)
+	}
+
+	// permissions status reports disabled when unregistered.
+	_, _, _ = runCLI(t, dir, "permissions", "disable")
+	code, out, errOut = runCLI(t, dir, "permissions", "status")
+	if code != 0 || errOut != "" || !strings.Contains(out, "disabled") || !strings.Contains(out, "unregistered") {
+		t.Fatalf("permissions status disabled => code=%d out=%q err=%q", code, out, errOut)
 	}
 
 	// Invalid permissions subcommand exits 2.
@@ -1372,6 +1414,52 @@ func TestProfileTestAndProvidersUseStoredSecrets(t *testing.T) {
 	}
 	if strings.Contains(out, storedSecret) {
 		t.Fatalf("profile test leaked stored secret: %q", out)
+	}
+}
+
+func TestLaunchWarnsWhenExternalMCPActiveAndUnregistered(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	origLookPath := lookPath
+	origRunner := runExternalCmd
+	defer func() {
+		lookPath = origLookPath
+		runExternalCmd = origRunner
+	}()
+	lookPath = func(bin string) (string, error) {
+		if bin == "agy" {
+			return "/usr/local/bin/agy", nil
+		}
+		return "", errors.New("not found")
+	}
+	runExternalCmd = func(_ string, _ io.Reader, _, _ io.Writer, _ string, _ ...string) int {
+		return 0
+	}
+
+	code, _, errOut := runCLI(t, dir, "init", "--profile=deepseek-hybrid")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+
+	// Unregistered external-mcp profile emits single helpful note to stderr before launching agy.
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 {
+		t.Fatalf("launch => code=%d err=%q", code, errOut)
+	}
+	wantNote := `note: active profile "deepseek-hybrid" uses external-mcp roles, but "odd-agy" is not registered in ~/.gemini/config/mcp_config.json. Run "odd-agy permissions enable" or "agy mcp add odd-agy odd-agy mcp" first.` + "\n"
+	if errOut != wantNote {
+		t.Fatalf("launch warning stderr = %q, want %q", errOut, wantNote)
+	}
+
+	// Registering odd-agy silences the warning.
+	if _, err := installer.RegisterGlobalMCPServer(fakeHome, "odd-agy"); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch after registration => code=%d err=%q (want empty stderr)", code, errOut)
 	}
 }
 
