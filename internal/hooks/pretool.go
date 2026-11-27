@@ -34,8 +34,16 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 			return PreToolUseOutput{Decision: DecisionAutoApprove}, nil
 		case "odd_review_mode":
 			if mcpArgs, argsOK := extractMCPToolArgs(in.ToolCall.Args, isCallMCP); argsOK {
-				action := strings.ToLower(strings.TrimSpace(getStringArg(mcpArgs, "action")))
-				if action == "" || action == "status" {
+				if rawAction, hasAction := lookupArg(mcpArgs, "action"); hasAction {
+					s, isStr := rawAction.(string)
+					if !isStr {
+						return PreToolUseOutput{Decision: DecisionAllow}, nil
+					}
+					action := strings.ToLower(strings.TrimSpace(s))
+					if action == "" || action == "status" {
+						return PreToolUseOutput{Decision: DecisionAutoApprove}, nil
+					}
+				} else {
 					return PreToolUseOutput{Decision: DecisionAutoApprove}, nil
 				}
 			}
@@ -1137,7 +1145,16 @@ func lookupArg(args map[string]any, key string) (any, bool) {
 }
 
 func resolveOddAgyMCPTool(rawToolName string, args map[string]any) (toolName string, isCallMCPTool bool, ok bool) {
-	lower := strings.ToLower(strings.TrimSpace(rawToolName))
+	trimmed := strings.TrimSpace(rawToolName)
+	if strings.HasPrefix(trimmed, "McpOdd-agy") {
+		rest := strings.TrimPrefix(trimmed, "McpOdd-agy")
+		if len(rest) > 0 && rest[0] >= 'A' && rest[0] <= 'Z' && isASCIIAlnum(rest) {
+			return pascalToSnake(rest), false, true
+		}
+		return "", false, false
+	}
+
+	lower := strings.ToLower(trimmed)
 	switch {
 	case strings.HasPrefix(lower, "odd-agy/"):
 		name := strings.TrimSpace(strings.TrimPrefix(lower, "odd-agy/"))
@@ -1167,6 +1184,36 @@ func resolveOddAgyMCPTool(rawToolName string, args map[string]any) (toolName str
 	return "", false, false
 }
 
+func isASCIIAlnum(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func pascalToSnake(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			if i > 0 {
+				prev := s[i-1]
+				nextLower := i+1 < len(s) && s[i+1] >= 'a' && s[i+1] <= 'z'
+				if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || (prev >= 'A' && prev <= 'Z' && nextLower) {
+					b.WriteByte('_')
+				}
+			}
+			b.WriteByte(c + ('a' - 'A'))
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 func extractMCPToolArgs(args map[string]any, isCallMCPTool bool) (map[string]any, bool) {
 	if !isCallMCPTool {
 		return args, true
@@ -1184,7 +1231,7 @@ func extractMCPToolArgs(args map[string]any, isCallMCPTool bool) (map[string]any
 			return map[string]any{}, true
 		}
 		var parsed map[string]any
-		if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil || parsed == nil {
 			return nil, false
 		}
 		return parsed, true

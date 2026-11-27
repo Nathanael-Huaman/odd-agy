@@ -178,6 +178,9 @@ func collectCandidate(repoRoot, baseRef string, committedOnly bool) (candidateSn
 				continue
 			}
 			path := string(rawPath)
+			if isUntrackedLocalHarnessPath(path) {
+				continue
+			}
 			if _, exists := filesMap[path]; exists {
 				continue
 			}
@@ -239,6 +242,14 @@ func collectCandidate(repoRoot, baseRef string, committedOnly bool) (candidateSn
 		CandidateDigest: digest,
 		HasModeChange:   hasModeChange,
 	}, nil
+}
+
+func isUntrackedLocalHarnessPath(p string) bool {
+	relPath := filepath.ToSlash(p)
+	return relPath == ".agents" ||
+		strings.HasPrefix(relPath, ".agents/") ||
+		relPath == ".atl" ||
+		strings.HasPrefix(relPath, ".atl/")
 }
 
 func readWorktreeEntry(fullPath, mode string) ([]byte, error) {

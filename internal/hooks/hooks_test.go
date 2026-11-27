@@ -1197,6 +1197,20 @@ func TestPreToolUse_MCPAutoApproveAndConsentForceAsk(t *testing.T) {
 			"ServerName": "odd-agy",
 			"ToolName":   "odd_review_mode",
 		}},
+		{"pascal_todo", "McpOdd-agyTodo", map[string]any{"action": "list"}},
+		{"pascal_assess", "McpOdd-agyOddReviewAssess", map[string]any{}},
+		{"pascal_scope", "McpOdd-agyOddReviewScope", map[string]any{}},
+		{"pascal_status", "McpOdd-agyOddReviewStatus", nil},
+		{"pascal_ext_profiles", "McpOdd-agyOddExternalProfiles", nil},
+		{"pascal_ext_status", "McpOdd-agyOddExternalStatus", nil},
+		{"pascal_mode_omitted", "McpOdd-agyOddReviewMode", map[string]any{}},
+		{"pascal_mode_status", "McpOdd-agyOddReviewMode", map[string]any{"action": "status"}},
+		{"call_mcp_tool_snake_case_scope", "call_mcp_tool", map[string]any{"server_name": "odd-agy", "tool_name": "odd_review_scope"}},
+		{"call_mcp_tool_snake_case_mode_status", "call_mcp_tool", map[string]any{
+			"server_name": "odd-agy",
+			"tool_name":   "odd_review_mode",
+			"arguments":   map[string]any{"action": "status"},
+		}},
 	}
 
 	for _, tc := range autoApproveCases {
@@ -1220,6 +1234,7 @@ func TestPreToolUse_MCPAutoApproveAndConsentForceAsk(t *testing.T) {
 		{"slash_consent", "odd-agy/odd_review_consent", map[string]any{"consent": "granted"}},
 		{"mcp_prefix_consent", "mcp_odd-agy_odd_review_consent", map[string]any{"consent": "granted"}},
 		{"call_mcp_tool_consent", "call_mcp_tool", map[string]any{"ServerName": "odd-agy", "ToolName": "odd_review_consent"}},
+		{"pascal_consent", "McpOdd-agyOddReviewConsent", map[string]any{"consent": "granted"}},
 	}
 
 	for _, tc := range forceAskCases {
@@ -1262,6 +1277,40 @@ func TestPreToolUse_MCPAutoApproveAndConsentForceAsk(t *testing.T) {
 		{"engram_slash", "engram/mem_save", map[string]any{"title": "test"}},
 		{"engram_mcp_prefix", "mcp_engram_mem_save", map[string]any{"title": "test"}},
 		{"engram_call_mcp_tool", "call_mcp_tool", map[string]any{"ServerName": "engram", "ToolName": "mem_save"}},
+		{"pascal_mode_disable", "McpOdd-agyOddReviewMode", map[string]any{"action": "disable"}},
+		{"pascal_mode_nonstring_int", "McpOdd-agyOddReviewMode", map[string]any{"action": 123}},
+		{"pascal_mode_nonstring_bool", "McpOdd-agyOddReviewMode", map[string]any{"action": true}},
+		{"pascal_mode_nonstring_slice", "McpOdd-agyOddReviewMode", map[string]any{"action": []any{"status"}}},
+		{"slash_mode_nonstring_int", "odd-agy/odd_review_mode", map[string]any{"action": 123}},
+		{"pascal_spoofed_evil_todo", "McpOdd-agyEvilTodo", map[string]any{}},
+		{"pascal_engram_todo", "McpEngramTodo", map[string]any{}},
+		{"pascal_lowercase_after_prefix", "McpOdd-agytodo", map[string]any{}},
+		{"pascal_odd_review_start", "McpOdd-agyOddReviewStart", map[string]any{}},
+		{"call_mcp_tool_mode_malformed_json_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  "{not-json",
+		}},
+		{"call_mcp_tool_mode_non_object_arguments_int", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  123,
+		}},
+		{"call_mcp_tool_mode_non_object_arguments_array", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  []any{"status"},
+		}},
+		{"call_mcp_tool_mode_non_object_arguments_json_null", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  "null",
+		}},
+		{"call_mcp_tool_mode_nonstring_action_in_arguments", "call_mcp_tool", map[string]any{
+			"ServerName": "odd-agy",
+			"ToolName":   "odd_review_mode",
+			"Arguments":  `{"action": 123}`,
+		}},
 	}
 
 	for _, tc := range allowCases {

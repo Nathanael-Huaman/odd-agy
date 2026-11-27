@@ -258,15 +258,15 @@ func TestFullLifecycleConsentDeclineAndTamperAndCorrectionAndAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scope page 1 failed: %v", err)
 	}
-	// 4 changed files: .agents/odd/config.json (from Mode toggle), app.go, helper.go, odd/tasks/spec.md
-	if page1.TotalFiles != 4 || len(page1.Files) != 2 || !page1.HasMore {
+	// 3 changed files: app.go, helper.go, odd/tasks/spec.md (untracked .agents/odd/config.json is ignored)
+	if page1.TotalFiles != 3 || len(page1.Files) != 2 || !page1.HasMore {
 		t.Fatalf("unexpected page 1: total=%d len=%d hasMore=%v", page1.TotalFiles, len(page1.Files), page1.HasMore)
 	}
 	page2, err := eng.Scope(startRes.LineageID, page1.NextCursor, 2)
 	if err != nil {
 		t.Fatalf("Scope page 2 failed: %v", err)
 	}
-	if len(page2.Files) != 2 || page2.HasMore {
+	if len(page2.Files) != 1 || page2.HasMore {
 		t.Fatalf("unexpected page 2: len=%d hasMore=%v", len(page2.Files), page2.HasMore)
 	}
 	// Verify frozen content does NOT reflect live edit "999".
@@ -755,4 +755,63 @@ func TestTamperedOrMissingRequestContextFailsClosed(t *testing.T) {
 		t.Fatal("expected ApplyCorrection to fail when prior revision request-context.txt is missing")
 	}
 }
+
+func TestAssessIgnoresUntrackedAgentsHarnessButTracksCommittedAgentsEdits(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	writeFile(t, dir, "README.md", "# Project\n", 0o644)
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "base")
+
+	// Simulate untracked local .agents/ and .atl/ harness files alongside a small docs note.
+	writeFile(t, dir, ".agents/hooks.json", "{}\n", 0o644)
+	writeFile(t, dir, ".agents/rules/odd-01-core.md", "# rule\n", 0o644)
+	writeFile(t, dir, ".agents/agents/odd-orchestrator.md", "# agent\n", 0o644)
+	writeFile(t, dir, ".agents/odd/config.json", "{\"rddEnabled\":true}\n", 0o644)
+	writeFile(t, dir, ".atl/state.json", "{}\n", 0o644)
+	writeFile(t, dir, "docs/note.md", "# Note\n", 0o644)
+
+	passiveRes, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess with untracked .agents and docs/note.md failed: %v", err)
+	}
+	if len(passiveRes.ChangedPaths) != 1 || passiveRes.ChangedPaths[0] != "docs/note.md" {
+		t.Fatalf("ChangedPaths = %v, want [docs/note.md]", passiveRes.ChangedPaths)
+	}
+	if passiveRes.Risk != RiskPassive || passiveRes.ReviewDue {
+		t.Fatalf("expected passive risk and ReviewDue=false, got %+v", passiveRes)
+	}
+
+	// Add a small 2-file JS change -> medium risk (not high from untracked .agents/).
+	writeFile(t, dir, "src/math.js", "export const add = (a, b) => a + b;\n", 0o644)
+	medRes, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess with src/math.js failed: %v", err)
+	}
+	if len(medRes.ChangedPaths) != 2 || medRes.ChangedPaths[0] != "docs/note.md" || medRes.ChangedPaths[1] != "src/math.js" {
+		t.Fatalf("ChangedPaths = %v, want [docs/note.md src/math.js]", medRes.ChangedPaths)
+	}
+	if medRes.Risk != RiskMedium || !medRes.ReviewDue {
+		t.Fatalf("expected RiskMedium and ReviewDue=true, got %+v", medRes)
+	}
+
+	// Commit .agents/hooks.json (tracked) while leaving other .agents/* files untracked.
+	runGit(t, dir, "add", ".agents/hooks.json", "docs/note.md", "src/math.js")
+	runGit(t, dir, "commit", "-m", "track hooks.json")
+
+	// Modify tracked .agents/hooks.json -> must be included in ChangedPaths and classified RiskHigh.
+	writeFile(t, dir, ".agents/hooks.json", "{\"PreToolUse\":[]}\n", 0o644)
+	trackedRes, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess after modifying tracked .agents/hooks.json failed: %v", err)
+	}
+	if len(trackedRes.ChangedPaths) != 1 || trackedRes.ChangedPaths[0] != ".agents/hooks.json" {
+		t.Fatalf("ChangedPaths = %v, want [.agents/hooks.json]", trackedRes.ChangedPaths)
+	}
+	if trackedRes.Risk != RiskHigh || !trackedRes.ReviewDue {
+		t.Fatalf("expected RiskHigh and ReviewDue=true for modified tracked .agents/hooks.json, got %+v", trackedRes)
+	}
+}
+
 
