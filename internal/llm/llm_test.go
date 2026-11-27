@@ -792,3 +792,179 @@ func TestExternalReviewRoleHasFrozenScopeToolAndNoWriteTools(t *testing.T) {
 		t.Fatalf("expected odd_review_scope tool message to contain src/app.go")
 	}
 }
+
+func TestRunnerShellSandboxBlocksEscapesAndGitFlags(t *testing.T) {
+	repo := initTestGitRepo(t)
+	writeRepoFile(t, repo, "src/main.go", "package main\n\nfunc main() {}\n")
+	writeRepoFile(t, repo, "server.pem", "PRIVATE CERT\n")
+	writeRepoFile(t, repo, "certs/dev.key", "PRIVATE KEY\n")
+	writeRepoFile(t, repo, ".aws/credentials", "[default]\n")
+	writeRepoFile(t, repo, ".npmrc", "//registry/:_authToken=secret\n")
+
+	// Create ../outside.txt relative to repoRoot.
+	parentOutside := filepath.Join(filepath.Dir(repo), "outside.txt")
+	if err := os.WriteFile(parentOutside, []byte("secret outside"), 0o644); err != nil {
+		t.Fatalf("write parentOutside: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(parentOutside) })
+
+	// Create an in-workspace symlink pointing to server.pem.
+	if err := os.Symlink(filepath.Join(repo, "server.pem"), filepath.Join(repo, "innocent.txt")); err != nil {
+		t.Fatalf("symlink to pem: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{RepoRoot: repo})
+	writerSurfaces := []string{"src/**"}
+
+	blockedForWriter := []struct {
+		name string
+		cmd  string
+	}{
+		{"outside absolute path", "cat /etc/hosts"},
+		{"relative parent escape", "cat ../outside.txt"},
+		{"git -C commit bypass", "git -C . commit --allow-empty -m bypass"},
+		{"git -c push bypass", "git -c user.name=x push origin main"},
+		{"git reset hard", "git reset --hard"},
+		{"git clean -fd", "git clean -fd"},
+		{"read .pem", "cat server.pem"},
+		{"read .key", "cat certs/dev.key"},
+		{"read .aws/credentials", "cat .aws/credentials"},
+		{"read .npmrc", "cat .npmrc"},
+		{"symlink to .pem", "cat innocent.txt"},
+		{"shell redirect outside surface", "echo pwn > outside_surface.txt"},
+		{"shell append outside surface", "echo pwn >> README.md"},
+		{"tee outside surface", "echo pwn | tee outside_surface.txt"},
+		{"sed -i outside surface", "sed -i.bak 's/Demo/Pwn/' README.md"},
+		{"perl -i outside surface", "perl -i -pe 's/Demo/Pwn/' README.md"},
+		{"touch outside surface", "touch outside_surface.txt"},
+		{"mv outside surface", "mv src/main.go outside_surface.txt"},
+		{"cp outside surface", "cp src/main.go outside_surface.txt"},
+		{"rm outside surface", "rm README.md"},
+		{"nested sh -c bypass", "sh -c 'git -C . commit -m nope'"},
+		{"command substitution escape", "echo $(cat /etc/hosts)"},
+	}
+
+	for _, tc := range blockedForWriter {
+		t.Run("blocked_writer/"+tc.name, func(t *testing.T) {
+			out := runner.toolRunShell("worker", writerSurfaces, tc.cmd)
+			if !strings.Contains(out, `"error"`) {
+				t.Fatalf("expected command %q to be blocked, got: %s", tc.cmd, out)
+			}
+		})
+	}
+
+	// Ensure outside_surface.txt was never created and README.md is intact.
+	if _, err := os.Stat(filepath.Join(repo, "outside_surface.txt")); !os.IsNotExist(err) {
+		t.Fatal("outside_surface.txt must not be created by blocked shell commands")
+	}
+
+	// Read-only verify role must not mutate workspace files even inside src/**.
+	for _, cmd := range []string{
+		"echo pwn > src/main.go",
+		"touch src/new.go",
+		"echo pwn | tee src/main.go",
+		"sed -i 's/main/pwn/' src/main.go",
+	} {
+		out := runner.toolRunShell("verify", nil, cmd)
+		if !strings.Contains(out, `"error"`) {
+			t.Fatalf("expected verify shell write %q to be blocked, got: %s", cmd, out)
+		}
+	}
+
+	// Valid read-only commands must succeed for verify role.
+	for _, cmd := range []string{
+		"cat src/main.go",
+		"go version",
+		"git status --short",
+		"echo ok > /dev/null",
+		"go test ./... 2>&1 || true",
+	} {
+		out := runner.toolRunShell("verify", nil, cmd)
+		if strings.Contains(out, `"error"`) {
+			t.Fatalf("expected valid verify command %q to succeed, got: %s", cmd, out)
+		}
+	}
+
+	// Verify mktemp -d is allowed and clean up the created temp directory in test teardown.
+	mkOut := runner.toolRunShell("verify", nil, "mktemp -d")
+	if strings.Contains(mkOut, `"error"`) {
+		t.Fatalf("expected mktemp -d to succeed, got: %s", mkOut)
+	}
+	var mkRes struct {
+		ExitCode int    `json:"exitCode"`
+		Output   string `json:"output"`
+	}
+	if err := json.Unmarshal([]byte(mkOut), &mkRes); err == nil && mkRes.ExitCode == 0 {
+		if created := strings.TrimSpace(mkRes.Output); created != "" {
+			t.Cleanup(func() { _ = os.RemoveAll(created) })
+		}
+	}
+
+	// Valid in-surface shell write must succeed for worker role.
+	okOut := runner.toolRunShell("worker", writerSurfaces, "echo '// ok' > src/generated.go")
+	if strings.Contains(okOut, `"error"`) {
+		t.Fatalf("expected in-surface write to succeed, got: %s", okOut)
+	}
+	genBytes, err := os.ReadFile(filepath.Join(repo, "src", "generated.go"))
+	if err != nil || !strings.Contains(string(genBytes), "// ok") {
+		t.Fatalf("expected src/generated.go written, err=%v content=%q", err, string(genBytes))
+	}
+}
+
+func TestParseAllowedSurfacesIgnoresProseAfterBlankLine(t *testing.T) {
+	task := `Implement feature X.
+
+## Allowed edit surfaces
+
+- internal/llm/**
+- ` + "`internal/mcp/server.go`" + `
+
+Please keep changes minimal and run go test after editing.
+Do not touch unrelated packages.
+
+## Verification
+- go test ./internal/llm/...
+`
+	got := ParseAllowedSurfaces(task)
+	if len(got) != 2 || got[0] != "internal/llm/**" || got[1] != "internal/mcp/server.go" {
+		t.Fatalf("ParseAllowedSurfaces = %v, want [internal/llm/** internal/mcp/server.go]", got)
+	}
+}
+
+func TestRunnerShellSandboxBlocksAbsoluteOutsidePathInTempDir(t *testing.T) {
+	repo := initTestGitRepo(t)
+	siblingDir := t.TempDir()
+	outsideRead := filepath.Join(siblingDir, "outside_abs.txt")
+	if err := os.WriteFile(outsideRead, []byte("TOP-SECRET-OUTSIDE\n"), 0o600); err != nil {
+		t.Fatalf("write outside_abs.txt: %v", err)
+	}
+	outsideWrite := filepath.Join(siblingDir, "outside_write_bypass.txt")
+	tmpWrite := filepath.Join(os.TempDir(), "odd-agy-outside-write-bypass.txt")
+	t.Cleanup(func() {
+		_ = os.Remove(outsideWrite)
+		_ = os.Remove(tmpWrite)
+	})
+
+	runner := NewRunner(RunnerConfig{RepoRoot: repo})
+	surfaces := []string{"src/**"}
+
+	for _, role := range []string{"worker", "verify"} {
+		out := runner.toolRunShell(role, surfaces, "cat "+outsideRead)
+		if !strings.Contains(out, `"error"`) {
+			t.Fatalf("role %q: expected cat %s to be blocked, got: %s", role, outsideRead, out)
+		}
+		if strings.Contains(out, "TOP-SECRET-OUTSIDE") {
+			t.Fatalf("role %q: leaked outside file content: %s", role, out)
+		}
+	}
+
+	for _, target := range []string{outsideWrite, tmpWrite, "/tmp/outside_write_bypass.txt"} {
+		out := runner.toolRunShell("worker", surfaces, "echo pwn > "+target)
+		if !strings.Contains(out, `"error"`) {
+			t.Fatalf("expected shell write to %s to be blocked, got: %s", target, out)
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatalf("file %s must not be created by blocked shell write", target)
+		}
+	}
+}
