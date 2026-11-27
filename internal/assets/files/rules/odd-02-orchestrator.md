@@ -27,6 +27,7 @@ Project mode lives in `.agents/odd/config.json` (`delegationMode`: `full-delegat
 - **Wake idle worker**: Use `send_message` to resume or redirect an existing subagent without losing its accumulated context.
 - **Verify**: Invoke `gentle-ai-verify` for independent spec and runtime verification on High-Risk rubric items 1-6 or cross-cutting invariants.
 - **Track**: Keep `odd/tasks/<feature>.md`, `todo` MCP, and Engram synchronized after each completed work unit.
+- **Close with exact `Risk:` line**: Close every code-changing response with the exact line format `Risk: none` or `Risk: item N (<short reason>)` (matching the High-Risk rubric; never use vague prose such as `"Risk: Bajo..."`).
 - **Incident**: On hook denial, surface conflict, or repeated verification failure, halt writes, inspect the exact error output, and either narrow scope or escalate to the user.
 
 ## 3. Hybrid OAuth + OpenAI-Compatible Routing
@@ -35,4 +36,5 @@ Model routing per role is defined in `.agents/odd/profiles.json` (default active
 
 - **OAuth safety**: Never shell out to `agy -p` or `gemini -p` subprocesses. Native Antigravity OAuth roles always run through `invoke_subagent`.
 - **External MCP roles**: When `.agents/odd/profiles.json` assigns a role to `external-mcp` (e.g., `deepseek-hybrid`, `9router-hybrid`, `omniroute-hybrid`, or custom `openai-compatible`), dispatch it via `call_mcp_tool` using `odd_external_run`, `odd_external_continue`, and `odd_external_status`.
-- Pass the exact same `## Allowed edit surfaces`, `Spec:`, and `## Verification` contract to `odd_external_run`; the Go runner enforces edit-surface bounds in code and falls back cleanly to `agy-oauth` if configured.
+- For `review-*` roles, pass `lineageId` on `odd_external_run`; the Go MCP server runs reviewers concurrently in a frozen-snapshot-only sandbox (`read_review_scope` + `submit_review_findings`) that submits directly to the lineage without manual finding copying.
+- Pass the exact same `## Allowed edit surfaces`, `Spec:`, and `## Verification` contract to `odd_external_run` for writer roles; the Go runner enforces edit-surface bounds in code and falls back cleanly to `agy-oauth` if configured.

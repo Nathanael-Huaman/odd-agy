@@ -192,14 +192,54 @@ func TestRulesContractAndBudget(t *testing.T) {
 	}
 
 	rddRule := string(byPath["rules/odd-05-rdd.md"].Content)
-	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined"} {
+	for _, needle := range []string{
+		"odd_review_consent",
+		"consent_required",
+		"ask_question",
+		"granted",
+		"declined",
+		"lineageId",
+		"odd_external_run",
+		"read_review_scope",
+		"submit_review_findings",
+		"submittedToLineage",
+		"odd_review_submit",
+		"odd_review_status",
+		"odd_review_ack",
+		"causality",
+		"location",
+		"claim",
+	} {
 		if !strings.Contains(rddRule, needle) {
 			t.Errorf("odd-05-rdd.md missing %q", needle)
 		}
 	}
+	lowerRddRule := strings.ToLower(rddRule)
+	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain"} {
+		if !strings.Contains(lowerRddRule, phrase) {
+			t.Errorf("odd-05-rdd.md missing pre-consent/parallel guidance %q", phrase)
+		}
+	}
 
 	orch := string(byPath["rules/odd-02-orchestrator.md"].Content)
-	for _, needle := range []string{"full-delegation", "organic", "gentle-ai-worker", "gentle-ai-explore", "gentle-ai-verify", "Allowed edit surfaces", "odd_external_run", "odd_external_continue", "profiles.json", "3 bounded reads", "manage_subagents", "duplicate"} {
+	for _, needle := range []string{
+		"full-delegation",
+		"organic",
+		"gentle-ai-worker",
+		"gentle-ai-explore",
+		"gentle-ai-verify",
+		"Allowed edit surfaces",
+		"odd_external_run",
+		"odd_external_continue",
+		"profiles.json",
+		"3 bounded reads",
+		"manage_subagents",
+		"duplicate",
+		"Risk: none",
+		"Risk: item N",
+		"lineageId",
+		"review-*",
+	} {
 		if !strings.Contains(orch, needle) {
 			t.Errorf("odd-02-orchestrator.md missing %q", needle)
 		}
@@ -246,7 +286,20 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 		t.Errorf("odd-orchestrator must omit replace_file_content and multi_replace_file_content")
 	}
 	orchAgent := string(byPath["agents/odd-orchestrator.md"].Content)
-	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined", "3 bounded reads", "manage_subagents", "duplicate"} {
+	for _, needle := range []string{
+		"odd_review_consent",
+		"consent_required",
+		"ask_question",
+		"granted",
+		"declined",
+		"3 bounded reads",
+		"manage_subagents",
+		"duplicate",
+		"Risk: none",
+		"Risk: item N",
+		"lineageId",
+		"review-*",
+	} {
 		if !strings.Contains(orchAgent, needle) {
 			t.Errorf("odd-orchestrator.md missing %q", needle)
 		}
@@ -358,6 +411,63 @@ func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
 		}
 		if strings.Contains(text, "severe") {
 			t.Errorf("%s must not contain lowercase severe schema instructions", af.RelPath)
+		}
+		if strings.HasPrefix(af.RelPath, "agents/review-") {
+			for _, needle := range []string{
+				"read_review_scope",
+				"odd_review_scope",
+				"submit_review_findings",
+				"odd_review_submit",
+				"id",
+				"severity",
+				"BLOCKER",
+				"WARNING",
+				"SUGGESTION",
+				"candidate",
+				"unknown",
+				"location",
+				"claim",
+			} {
+				if !strings.Contains(text, needle) {
+					t.Errorf("%s must reference %q", af.RelPath, needle)
+				}
+			}
+			if !strings.Contains(strings.ToLower(text), "live worktree") {
+				t.Errorf("%s must forbid inspecting live worktree files", af.RelPath)
+			}
+		}
+	}
+
+	var rddSkill string
+	for _, s := range skills {
+		if s.RelPath == "skills/odd-rdd/SKILL.md" {
+			rddSkill = string(s.Content)
+			break
+		}
+	}
+	for _, needle := range []string{
+		"odd_review_consent",
+		"ask_question",
+		"lineageId",
+		"odd_external_run",
+		"read_review_scope",
+		"submit_review_findings",
+		"submittedToLineage",
+		"odd_review_submit",
+		"odd_review_status",
+		"odd_review_ack",
+		"causality",
+		"location",
+		"claim",
+	} {
+		if !strings.Contains(rddSkill, needle) {
+			t.Errorf("skills/odd-rdd/SKILL.md missing %q", needle)
+		}
+	}
+	lowerRddSkill := strings.ToLower(rddSkill)
+	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain"} {
+		if !strings.Contains(lowerRddSkill, phrase) {
+			t.Errorf("skills/odd-rdd/SKILL.md missing pre-consent/parallel guidance %q", phrase)
 		}
 	}
 }
