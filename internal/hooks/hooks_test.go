@@ -940,6 +940,48 @@ func TestPreToolUseDeniesInWorkspaceSymlinkToSensitiveFile(t *testing.T) {
 	}
 }
 
+func TestPreToolUseRDDCorrectionSecurityFixes(t *testing.T) {
+	repo, outsideDir := initTestRepo(t), t.TempDir()
+	writeFile(t, filepath.Join(repo, ".env"), "SECRET=1\n")
+	writeFile(t, filepath.Join(repo, "sub", ".npmrc"), "//registry.npmjs.org/:_authToken=secret\n")
+	writeFile(t, filepath.Join(repo, "security", "auth.go"), "package security\nfunc OK() bool { return true }\n")
+	runGit(t, repo, "add", "security/auth.go")
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.Symlink("../.env", filepath.Join(repo, "sub", "link_env")))
+	must(os.Symlink(outsideDir, filepath.Join(repo, "escape-dir")))
+	for _, tc := range []struct{ name, mode, cmd, cwd, want string }{
+		{"r1_1_cwd_aws", config.DelegationModeOrganic, "ls", filepath.Join(repo, ".aws"), DecisionDeny},
+		{"r1_1_cwd_ssh", config.DelegationModeOrganic, "ls", ".ssh", DecisionDeny},
+		{"r1_1_cwd_sub_symlink", config.DelegationModeOrganic, "cat link_env", "sub", DecisionDeny},
+		{"r1_1_cwd_sub_npmrc", config.DelegationModeOrganic, "cat .npmrc", filepath.Join(repo, "sub"), DecisionDeny},
+		{"r1_1_cwd_sub_readme_allow", config.DelegationModeOrganic, "cat ../README.md", "sub", DecisionAllow},
+		{"r1_1_cwd_full_task_allow", config.DelegationModeFull, "echo hi > feat.md", filepath.Join(repo, "odd", "tasks"), DecisionAllow},
+		{"r1_2_attached_in_redir", config.DelegationModeOrganic, "cat<.env", "", DecisionDeny},
+		{"r1_2_attached_out_redir", config.DelegationModeFull, "echo hi>src/app.go", "", DecisionDeny},
+		{"r1_2_flag_equals_env", config.DelegationModeOrganic, "cmd --file=.env", "", DecisionDeny},
+		{"r1_2_short_flag_env", config.DelegationModeOrganic, "cmd -f.env", "", DecisionDeny},
+		{"r1_2_subshell_env", config.DelegationModeOrganic, "(cat .env)", "", DecisionDeny},
+		{"r1_3_env_git_reset", config.DelegationModeOrganic, "GIT_TERMINAL_PROMPT=0 git reset --hard", "", DecisionDeny},
+		{"r1_3_env_gh_pr", config.DelegationModeOrganic, "GH_TOKEN=x gh pr create --title t", "", DecisionDeny},
+		{"r1_3_env_sed_inplace", config.DelegationModeFull, "LC_ALL=C sed -i 's/a/b/' src/app.go", "", DecisionDeny},
+		{"r1_3_wrapper_env_push", config.DelegationModeOrganic, "env git push origin main", "", DecisionDeny},
+		{"r1_4_newfile_symlink_dir", config.DelegationModeOrganic, "touch escape-dir/newfile.txt", "", DecisionDeny},
+	} {
+		cfg := config.DefaultConfig()
+		cfg.DelegationMode, cfg.RDDEnabled = tc.mode, true
+		must(config.SaveConfig(repo, cfg))
+		var out PreToolUseOutput
+		dispatchJSON(t, "PreToolUse", PreToolUseInput{CommonInput: CommonInput{ConversationID: "conv-rdd-sec", WorkspacePaths: []string{repo}}, ToolCall: ToolCall{Name: "run_command", Args: map[string]any{"CommandLine": tc.cmd, "Cwd": tc.cwd}}}, &out)
+		if out.Decision != tc.want {
+			t.Errorf("%s: got %q (%s), want %q", tc.name, out.Decision, out.Reason, tc.want)
+		}
+	}
+}
+
 func TestDispatch_Errors(t *testing.T) {
 	var out bytes.Buffer
 	if err := Dispatch("UnknownEvent", strings.NewReader("{}"), &out); err == nil {

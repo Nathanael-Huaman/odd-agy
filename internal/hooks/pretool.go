@@ -24,6 +24,7 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 
 	toolName := strings.ToLower(strings.TrimSpace(in.ToolCall.Name))
 
+	cmdDir := workspace
 	// Rule A: Sensitive path and workspace-boundary protection.
 	switch toolName {
 	case "view_file", "write_to_file", "replace_file_content", "multi_replace_file_content":
@@ -36,11 +37,14 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 	case "run_command":
 		cmdStr := getCommandLine(in.ToolCall.Args)
 		if cwdArg := getStringArg(in.ToolCall.Args, "Cwd"); cwdArg != "" {
-			if reason := checkPathBoundsOnly(workspace, cwdArg); reason != "" {
+			if reason := checkSensitiveOrOutOfBoundsPath(workspace, cwdArg, nil); reason != "" {
 				return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
 			}
+			if resolved, _ := resolveAndCheckPathBounds(workspace, cwdArg); resolved != "" {
+				cmdDir = resolved
+			}
 		}
-		if reason := checkCommandSensitivePaths(workspace, cmdStr); reason != "" {
+		if reason := checkCommandSensitivePaths(workspace, cmdDir, cmdStr); reason != "" {
 			return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
 		}
 	}
@@ -57,7 +61,7 @@ func handlePreToolUse(in PreToolUseInput) (PreToolUseOutput, error) {
 			}
 		case "run_command":
 			cmdStr := getCommandLine(in.ToolCall.Args)
-			if reason := checkFullDelegationCommandMutation(workspace, cmdStr); reason != "" {
+			if reason := checkFullDelegationCommandMutation(workspace, cmdDir, cmdStr); reason != "" {
 				return PreToolUseOutput{Decision: DecisionDeny, Reason: reason}, nil
 			}
 		}
@@ -132,12 +136,11 @@ func checkSensitiveOrOutOfBoundsPath(workspace, rawPath string, args map[string]
 	return ""
 }
 
-func checkPathBoundsOnly(workspace, rawPath string) string {
-	_, reason := resolveAndCheckPathBounds(workspace, rawPath)
-	return reason
+func resolveAndCheckPathBounds(workspace, rawPath string) (string, string) {
+	return resolvePathBoundsFromBase(workspace, workspace, rawPath)
 }
 
-func resolveAndCheckPathBounds(workspace, rawPath string) (string, string) {
+func resolvePathBoundsFromBase(workspace, baseDir, rawPath string) (string, string) {
 	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
 		return "", ""
@@ -148,7 +151,7 @@ func resolveAndCheckPathBounds(workspace, rawPath string) (string, string) {
 
 	absTarget := trimmed
 	if !filepath.IsAbs(absTarget) {
-		absTarget = filepath.Join(workspace, absTarget)
+		absTarget = filepath.Join(baseDir, absTarget)
 	}
 	realTarget, err := evalSymlinksBestEffort(absTarget)
 	if err != nil {
@@ -193,8 +196,8 @@ func checkSensitivePathPattern(workspace, rawPath string, args map[string]any) s
 	}
 
 	for _, seg := range strings.Split(lower, "/") {
-		if seg == ".ssh" {
-			return fmt.Sprintf("sensitive .ssh directory blocked: %q", rawPath)
+		if seg == ".ssh" || seg == ".aws" || seg == ".gnupg" {
+			return fmt.Sprintf("sensitive %s directory blocked: %q", seg, rawPath)
 		}
 	}
 
@@ -253,25 +256,29 @@ func containsNPMAuth(s string) bool {
 		strings.Contains(lower, "_password")
 }
 
-func checkCommandSensitivePaths(workspace, cmdStr string) string {
+func checkCommandSensitivePaths(workspace, cmdDir, cmdStr string) string {
 	for _, seg := range splitShellCommands(cmdStr) {
 		tokens := splitShellTokens(seg)
 		for _, tok := range tokens {
 			clean := stripRedirectionPrefix(tok)
-			if clean == "" || strings.HasPrefix(clean, "-") || isFDTarget(clean) || clean == "/dev/null" {
-				continue
+			if eq := strings.IndexByte(clean, '='); eq >= 0 {
+				clean = clean[eq+1:]
+			} else if strings.HasPrefix(clean, "-") {
+				if strings.HasPrefix(clean, "--") || len(clean) <= 2 || (!looksLikeFilePathToken(clean[2:]) && !strings.ContainsAny(clean[2:], "/\\.") && checkSensitivePathPattern(cmdDir, clean[2:], nil) == "") {
+					continue
+				}
+				clean = clean[2:]
 			}
-			// Ignore Go package ellipsis patterns like ./... or ./internal/hooks/...
-			if clean == "..." || strings.HasSuffix(clean, "/...") {
+			if clean == "" || clean == "(" || clean == ")" || isFDTarget(clean) || clean == "/dev/null" || clean == "..." || strings.HasSuffix(clean, "/...") {
 				continue
 			}
 			// Check obvious sensitive path references.
-			if reason := checkSensitivePathPattern(workspace, clean, nil); reason != "" {
+			if reason := checkSensitivePathPattern(cmdDir, clean, nil); reason != "" {
 				return reason
 			}
 			// Check path escapes for tokens that look like filesystem paths.
 			if looksLikeFilePathToken(clean) {
-				realTarget, reason := resolveAndCheckPathBounds(workspace, clean)
+				realTarget, reason := resolvePathBoundsFromBase(workspace, cmdDir, clean)
 				if reason != "" {
 					return reason
 				}
@@ -285,9 +292,9 @@ func checkCommandSensitivePaths(workspace, cmdStr string) string {
 			// Also resolve relative path-like or existing workspace entries (including symlinks)
 			// so commands like "cat innocent.txt" (innocent.txt -> secret.pem) are checked against realTarget.
 			if !strings.Contains(clean, "://") && !strings.HasPrefix(clean, "~") {
-				absCandidate := filepath.Join(workspace, clean)
+				absCandidate := filepath.Join(cmdDir, clean)
 				if _, lstatErr := os.Lstat(absCandidate); lstatErr == nil {
-					realTarget, reason := resolveAndCheckPathBounds(workspace, clean)
+					realTarget, reason := resolvePathBoundsFromBase(workspace, cmdDir, clean)
 					if reason != "" {
 						return reason
 					}
@@ -296,10 +303,10 @@ func checkCommandSensitivePaths(workspace, cmdStr string) string {
 							return reason
 						}
 					}
-				} else if realTarget, err := evalSymlinksBestEffort(absCandidate); err == nil {
-					if reason := checkSensitivePathPattern(workspace, realTarget, nil); reason != "" {
-						return reason
-					}
+				} else if realTarget, reason := resolvePathBoundsFromBase(workspace, cmdDir, clean); reason != "" {
+					return reason
+				} else if reason := checkSensitivePathPattern(workspace, realTarget, nil); realTarget != "" && reason != "" {
+					return reason
 				}
 			}
 		}
@@ -309,7 +316,7 @@ func checkCommandSensitivePaths(workspace, cmdStr string) string {
 
 func stripRedirectionPrefix(tok string) string {
 	// Handle tokens attached to redirection operators like ">file" or "2>/tmp/x" or "<.env".
-	for _, op := range []string{"&>>", "&>", ">>", ">|", ">", "<"} {
+	for _, op := range []string{"&>>", "&>", ">>", "<>", ">|", ">", "<"} {
 		if idx := strings.Index(tok, op); idx >= 0 {
 			prefix := tok[:idx]
 			if prefix == "" || isDigits(prefix) {
@@ -374,7 +381,7 @@ func isOddTaskMarkdown(realRoot, realTarget string) bool {
 	return strings.HasSuffix(strings.ToLower(name), ".md")
 }
 
-func checkFullDelegationCommandMutation(workspace, cmdStr string) string {
+func checkFullDelegationCommandMutation(workspace, cmdDir, cmdStr string) string {
 	realRoot, err := evalSymlinksBestEffort(workspace)
 	if err != nil {
 		return fmt.Sprintf("full-delegation guard failed to resolve workspace: %v", err)
@@ -399,19 +406,23 @@ func checkFullDelegationCommandMutation(workspace, cmdStr string) string {
 				target = tokens[i+1]
 				i++
 			}
-			if reason := validateMutationTargetForFullDelegation(realRoot, target); reason != "" {
+			if reason := validateMutationTargetForFullDelegation(realRoot, cmdDir, target); reason != "" {
 				return reason
 			}
 		}
 
+		tokens = effectiveCommandTokens(tokens)
+		if len(tokens) == 0 {
+			continue
+		}
 		cmdName := filepath.Base(tokens[0])
 		// 2. tee [-a] <file...>
 		if cmdName == "tee" {
 			for _, arg := range tokens[1:] {
-				if strings.HasPrefix(arg, "-") {
+				if arg == "(" || arg == ")" || strings.HasPrefix(arg, "-") {
 					continue
 				}
-				if reason := validateMutationTargetForFullDelegation(realRoot, arg); reason != "" {
+				if reason := validateMutationTargetForFullDelegation(realRoot, cmdDir, arg); reason != "" {
 					return reason
 				}
 			}
@@ -419,12 +430,12 @@ func checkFullDelegationCommandMutation(workspace, cmdStr string) string {
 
 		// 3. sed -i / --in-place or perl -i / -pi
 		if cmdName == "sed" && hasInPlaceFlag(tokens[1:], true) {
-			if reason := checkInPlaceCommandTargets(realRoot, tokens[1:], true); reason != "" {
+			if reason := checkInPlaceCommandTargets(realRoot, cmdDir, tokens[1:], true); reason != "" {
 				return reason
 			}
 		}
 		if cmdName == "perl" && hasInPlaceFlag(tokens[1:], false) {
-			if reason := checkInPlaceCommandTargets(realRoot, tokens[1:], false); reason != "" {
+			if reason := checkInPlaceCommandTargets(realRoot, cmdDir, tokens[1:], false); reason != "" {
 				return reason
 			}
 		}
@@ -434,7 +445,7 @@ func checkFullDelegationCommandMutation(workspace, cmdStr string) string {
 
 func parseRedirectionToken(tok string) (target string, hasRedir bool, consumesNext bool) {
 	// Skip fd duplication or input-only operators.
-	for _, op := range []string{"&>>", "&>", ">>", ">|", ">"} {
+	for _, op := range []string{"&>>", "&>", ">>", "<>", ">|", ">"} {
 		idx := strings.Index(tok, op)
 		if idx < 0 {
 			continue
@@ -464,7 +475,7 @@ func hasInPlaceFlag(args []string, allowLongInPlace bool) bool {
 	return false
 }
 
-func checkInPlaceCommandTargets(realRoot string, args []string, isSed bool) string {
+func checkInPlaceCommandTargets(realRoot, realCmdDir string, args []string, isSed bool) string {
 	skipNext := false
 	seenScript := false
 	for i := 0; i < len(args); i++ {
@@ -483,7 +494,7 @@ func checkInPlaceCommandTargets(realRoot string, args []string, isSed bool) stri
 			i++
 			continue
 		}
-		if strings.HasPrefix(a, "-") {
+		if a == "(" || a == ")" || strings.HasPrefix(a, "-") {
 			continue
 		}
 		if !seenScript {
@@ -493,14 +504,14 @@ func checkInPlaceCommandTargets(realRoot string, args []string, isSed bool) stri
 				continue
 			}
 		}
-		if reason := validateMutationTargetForFullDelegation(realRoot, a); reason != "" {
+		if reason := validateMutationTargetForFullDelegation(realRoot, realCmdDir, a); reason != "" {
 			return reason
 		}
 	}
 	return ""
 }
 
-func validateMutationTargetForFullDelegation(realRoot, target string) string {
+func validateMutationTargetForFullDelegation(realRoot, realCmdDir, target string) string {
 	clean := strings.TrimSpace(target)
 	if clean == "" || clean == "/dev/null" || isFDTarget(clean) {
 		return ""
@@ -510,7 +521,7 @@ func validateMutationTargetForFullDelegation(realRoot, target string) string {
 	}
 	absTarget := clean
 	if !filepath.IsAbs(absTarget) {
-		absTarget = filepath.Join(realRoot, absTarget)
+		absTarget = filepath.Join(realCmdDir, absTarget)
 	}
 	realTarget, err := evalSymlinksBestEffort(absTarget)
 	if err != nil {
@@ -533,7 +544,7 @@ func validateMutationTargetForFullDelegation(realRoot, target string) string {
 
 func checkDestructiveCommand(cmdStr string) string {
 	for _, seg := range splitShellCommands(cmdStr) {
-		tokens := splitShellTokens(seg)
+		tokens := effectiveCommandTokens(splitShellTokens(seg))
 		if len(tokens) == 0 {
 			continue
 		}
@@ -617,7 +628,7 @@ func checkDestructiveCommand(cmdStr string) string {
 
 func detectDeliveryCommand(cmdStr string) (string, bool) {
 	for _, seg := range splitShellCommands(cmdStr) {
-		tokens := splitShellTokens(seg)
+		tokens := effectiveCommandTokens(splitShellTokens(seg))
 		if len(tokens) == 0 {
 			continue
 		}
@@ -633,6 +644,41 @@ func detectDeliveryCommand(cmdStr string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func effectiveCommandTokens(tokens []string) []string {
+	vf := map[string]string{"env": " -u --unset -C --chdir -S --split-string ", "nice": " -n --adjustment ", "sudo": " -u -g -C -D -h -p -r -t -U ", "doas": " -u -C ", "exec": " -a ", "command": "", "nohup": "", "time": "", "builtin": ""}
+	for len(tokens) > 0 {
+		if tokens[0] == "(" || isEnvAssignment(tokens[0]) {
+			tokens = tokens[1:]
+			continue
+		}
+		v, ok := vf[filepath.Base(tokens[0])]
+		if !ok {
+			return tokens
+		}
+		for tokens = tokens[1:]; len(tokens) > 0 && len(tokens[0]) > 1 && tokens[0][0] == '-'; {
+			a := tokens[0]
+			tokens = tokens[1:]
+			if a == "--" {
+				break
+			} else if strings.Contains(v, " "+a+" ") && len(tokens) > 0 {
+				tokens = tokens[1:]
+			}
+		}
+	}
+	return tokens
+}
+
+func isEnvAssignment(tok string) bool {
+	eq := strings.IndexByte(tok, '=')
+	for i := 0; eq > 0 && i < eq; i++ {
+		c := tok[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (i > 0 && c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return eq > 0
 }
 
 func checkConflictMarkers(workspace string) string {
@@ -858,8 +904,24 @@ func splitShellTokens(seg string) []string {
 			}
 			continue
 		}
+		if !inSingle && !inDouble {
+			for _, op := range []string{"&>>", "&>", ">>", "<>", ">|", ">", "<", "(", ")"} {
+				if strings.HasPrefix(seg[i:], op) {
+					i += len(op) - 1
+					if ch != '&' && ch != '(' && ch != ')' && hasToken && isDigits(cur.String()) {
+						op = cur.String() + op
+					} else if hasToken {
+						tokens = append(tokens, cur.String())
+					}
+					tokens, hasToken = append(tokens, op), false
+					cur.Reset()
+					goto nextTokChar
+				}
+			}
+		}
 		cur.WriteByte(ch)
 		hasToken = true
+	nextTokChar:
 	}
 	if hasToken {
 		tokens = append(tokens, cur.String())
