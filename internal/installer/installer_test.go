@@ -1720,3 +1720,67 @@ func TestNormalizedFrontmatterPreservesDoctorOK(t *testing.T) {
 	}
 }
 
+func TestDoctorProviderReadinessUsesStoredSecrets(t *testing.T) {
+	ws := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+
+	if _, err := Init(ws, InitOptions{
+		Profile: "deepseek-hybrid",
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	const storedSecret = "sk-doctor-stored-secret-999"
+	if err := config.SetSecret(fakeHome, "DEEPSEEK_API_KEY", storedSecret); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+
+	// 1. Doctor with explicit HomeDir and nil LookupEnv recognizes stored secret.
+	rep1, err := Doctor(ws, DoctorOptions{
+		HomeDir: fakeHome,
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Doctor(nil LookupEnv): %v", err)
+	}
+	if rep1.HasFailures() || rep1.HasWarnings() {
+		t.Fatalf("expected healthy report with stored secret, got %+v", rep1.Checks)
+	}
+	for _, c := range rep1.Checks {
+		if strings.Contains(c.Detail, storedSecret) {
+			t.Fatalf("Doctor leaked stored secret in %s: %s", c.Name, c.Detail)
+		}
+	}
+
+	// 2. Doctor with explicit HomeDir AND non-nil LookupEnv also recognizes stored secret.
+	rep2, err := Doctor(ws, DoctorOptions{
+		HomeDir: fakeHome,
+		LookPath: fakeLookPath(map[string]string{
+			"agy":    "/bin/agy",
+			"engram": "/bin/engram",
+		}),
+		LookupEnv: fakeLookupEnv(nil),
+	})
+	if err != nil {
+		t.Fatalf("Doctor(fakeLookupEnv): %v", err)
+	}
+	if rep2.HasFailures() || rep2.HasWarnings() {
+		t.Fatalf("expected healthy report with HomeDir+LookupEnv and stored secret, got %+v", rep2.Checks)
+	}
+	for _, c := range rep2.Checks {
+		if strings.Contains(c.Detail, storedSecret) {
+			t.Fatalf("Doctor leaked stored secret in %s: %s", c.Name, c.Detail)
+		}
+	}
+}
+
+

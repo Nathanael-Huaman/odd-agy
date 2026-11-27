@@ -415,3 +415,168 @@ func TestStdioMCPEndToEnd(t *testing.T) {
 	}
 	_ = bytes.Buffer{}
 }
+
+func TestMCPDefaultServerUsesStoredSecretsAndEnvPrecedence(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+
+	const storedKey = "sk-mcp-stored-secret-111"
+	const envKey = "sk-mcp-env-override-222"
+	if err := config.SetSecret(fakeHome, "DEEPSEEK_API_KEY", storedKey); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+
+	var gotAuths []string
+	var llmTurns atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuths = append(gotAuths, r.Header.Get("Authorization"))
+		llmTurns.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "m-stored", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role":              "assistant",
+					"content":           "ok from mock",
+					"reasoning_content": "checked",
+				},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	startClient := func(server *Server) (*rpcClient, func()) {
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- server.Serve(ctx, inR, outW)
+			_ = outW.Close()
+		}()
+		cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+		_ = cli.call("initialize", map[string]any{
+			"protocolVersion": "2024-11-05",
+			"clientInfo":      map[string]any{"name": "test-client", "version": "1.0"},
+		})
+		cli.notify("notifications/initialized", map[string]any{})
+		return cli, func() {
+			_ = inW.Close()
+			cancel()
+			if err := <-done; err != nil && err != context.Canceled {
+				t.Fatalf("Serve error: %v", err)
+			}
+		}
+	}
+
+	// 1) Default Server (LookupEnv == nil) reads stored secret from ~/.config/odd-agy/secrets.json.
+	defaultSrv := NewServer(ServerConfig{Workspace: repo})
+	cli, stopDefault := startClient(defaultSrv)
+
+	profOut, isErr := cli.callTool("odd_external_profiles", map[string]any{})
+	if isErr {
+		t.Fatalf("odd_external_profiles failed: %s", profOut)
+	}
+	if strings.Contains(profOut, storedKey) {
+		t.Fatalf("odd_external_profiles leaked stored secret!")
+	}
+	var profSummary struct {
+		Providers map[string]struct {
+			APIKeyPresent bool   `json:"apiKeyPresent"`
+			KeySource     string `json:"keySource"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal([]byte(profOut), &profSummary); err != nil {
+		t.Fatalf("unmarshal profiles summary: %v\n%s", err, profOut)
+	}
+	if !profSummary.Providers["deepseek"].APIKeyPresent || profSummary.Providers["deepseek"].KeySource != "stored" {
+		t.Fatalf("deepseek summary with stored key = %+v, want apiKeyPresent=true keySource=stored", profSummary.Providers["deepseek"])
+	}
+
+	runOut, isErr := cli.callTool("odd_external_run", map[string]any{
+		"role": "verify",
+		"task": "Verify main.go",
+	})
+	if isErr {
+		t.Fatalf("odd_external_run failed: %s", runOut)
+	}
+	var runObj map[string]any
+	if err := json.Unmarshal([]byte(runOut), &runObj); err != nil {
+		t.Fatalf("unmarshal runOut: %v", err)
+	}
+	if runObj["status"] != "completed" {
+		t.Fatalf("odd_external_run status = %v, want completed: %s", runObj["status"], runOut)
+	}
+	if len(gotAuths) != 1 || gotAuths[0] != "Bearer "+storedKey {
+		t.Fatalf("odd_external_run Authorization = %v, want [Bearer %s]", gotAuths, storedKey)
+	}
+
+	taskID := runObj["taskId"].(string)
+	contOut, isErr := cli.callTool("odd_external_continue", map[string]any{
+		"taskId": taskID,
+		"prompt": "Continue with stored key",
+	})
+	if isErr || !strings.Contains(contOut, "ok from mock") {
+		t.Fatalf("odd_external_continue failed (err=%v): %s", isErr, contOut)
+	}
+	if len(gotAuths) != 2 || gotAuths[1] != "Bearer "+storedKey {
+		t.Fatalf("odd_external_continue Authorization = %v, want second call Bearer %s", gotAuths, storedKey)
+	}
+
+	// 2) Environment variable overrides stored secret.
+	t.Setenv("DEEPSEEK_API_KEY", envKey)
+	profEnvOut, isErr := cli.callTool("odd_external_profiles", map[string]any{})
+	if isErr {
+		t.Fatalf("odd_external_profiles (env) failed: %s", profEnvOut)
+	}
+	if err := json.Unmarshal([]byte(profEnvOut), &profSummary); err != nil {
+		t.Fatalf("unmarshal profiles summary (env): %v", err)
+	}
+	if !profSummary.Providers["deepseek"].APIKeyPresent || profSummary.Providers["deepseek"].KeySource != "env" {
+		t.Fatalf("deepseek summary with env override = %+v, want apiKeyPresent=true keySource=env", profSummary.Providers["deepseek"])
+	}
+
+	runEnvOut, isErr := cli.callTool("odd_external_run", map[string]any{
+		"role": "verify",
+		"task": "Verify main.go with env key",
+	})
+	if isErr || !strings.Contains(runEnvOut, "completed") {
+		t.Fatalf("odd_external_run (env) failed (err=%v): %s", isErr, runEnvOut)
+	}
+	if len(gotAuths) != 3 || gotAuths[2] != "Bearer "+envKey {
+		t.Fatalf("env override Authorization = %v, want 3rd call Bearer %s", gotAuths, envKey)
+	}
+	stopDefault()
+
+	// 3) Caller-injected LookupEnv != nil stays 100% hermetic (does NOT read stored secrets).
+	hermeticSrv := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(string) (string, bool) { return "", false },
+	})
+	hCli, stopHermetic := startClient(hermeticSrv)
+	defer stopHermetic()
+
+	hProfOut, isErr := hCli.callTool("odd_external_profiles", map[string]any{})
+	if isErr {
+		t.Fatalf("hermetic odd_external_profiles failed: %s", hProfOut)
+	}
+	if err := json.Unmarshal([]byte(hProfOut), &profSummary); err != nil {
+		t.Fatalf("unmarshal hermetic profiles summary: %v", err)
+	}
+	if profSummary.Providers["deepseek"].APIKeyPresent || profSummary.Providers["deepseek"].KeySource != "missing" {
+		t.Fatalf("hermetic server must ignore stored secrets, got %+v", profSummary.Providers["deepseek"])
+	}
+}

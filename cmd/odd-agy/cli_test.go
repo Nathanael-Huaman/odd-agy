@@ -349,6 +349,7 @@ func TestHookAndMCPCommands(t *testing.T) {
 
 func TestProfileTestAndProvidersHardening(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/models" {
@@ -1322,4 +1323,56 @@ func TestLaunchEffortInjectionAndProfileShow(t *testing.T) {
 		t.Fatalf("launch inherit + effort=low args = %v, want %v", gotArgs, wantInheritEffort)
 	}
 }
+
+func TestProfileTestAndProvidersUseStoredSecrets(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+
+	const storedSecret = "sk-cli-stored-secret-42"
+	if err := config.SetSecret(fakeHome, "DEEPSEEK_API_KEY", storedSecret); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	t.Setenv("DEEPSEEK_BASE_URL", srv.URL+"/v1")
+
+	code, out, errOut := runCLI(t, dir, "profile", "providers")
+	if code != 0 || errOut != "" {
+		t.Fatalf("profile providers => code=%d out=%q err=%q", code, out, errOut)
+	}
+	if !strings.Contains(out, "deepseek") || !strings.Contains(out, "keyStatus=stored") {
+		t.Fatalf("expected keyStatus=stored in profile providers output:\n%s", out)
+	}
+	if strings.Contains(out, storedSecret) {
+		t.Fatalf("profile providers leaked stored secret: %q", out)
+	}
+
+	code, out, errOut = runCLI(t, dir, "profile", "test", "deepseek")
+	if code != 0 || errOut != "" {
+		t.Fatalf("profile test deepseek => code=%d out=%q err=%q", code, out, errOut)
+	}
+	if !strings.Contains(out, "reachable=true") || !strings.Contains(out, "keySource=stored") {
+		t.Fatalf("expected reachable=true and keySource=stored, got:\n%s", out)
+	}
+	if gotAuth != "Bearer "+storedSecret {
+		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer "+storedSecret)
+	}
+	if strings.Contains(out, storedSecret) {
+		t.Fatalf("profile test leaked stored secret: %q", out)
+	}
+}
+
 

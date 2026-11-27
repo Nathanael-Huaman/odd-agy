@@ -2,8 +2,11 @@ package tui
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -950,3 +953,274 @@ func TestCatalogEffortMaxAndEffortOptionsDerivedFromConfig(t *testing.T) {
 		t.Fatalf("findEffortModelVariant(..., max->high) = (%q, %t), want (my-model-high, true)", got, ok)
 	}
 }
+
+func TestProvidersMaskedSetKeySaveClearEscAndProbe(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+
+	var seenAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[{"id":"deepseek-v4-pro"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	// Point deepseek at httptest server and leave ProbeFunc nil so default llm.ProbeProvider is used.
+	profs := config.DefaultProfilesConfig()
+	ds := profs.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profs.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	opts := Options{
+		HomeDir: home,
+		LookPath: func(bin string) (string, error) {
+			if bin == "agy" || bin == "engram" {
+				return "/usr/local/bin/" + bin, nil
+			}
+			return "", os.ErrNotExist
+		},
+		LookupEnv: func(string) (string, bool) { return "", false },
+	}
+	m := NewModel(dir, opts)
+
+	// Navigate to Providers & Probe (item 4).
+	for i := 0; i < 4; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	// Check footer help includes [s] set key, [u], [k], [m], [t].
+	v := m.View()
+	for _, hint := range []string{"[s] set key", "[u]", "[k]", "[m]", "[t]"} {
+		if !strings.Contains(v, hint) {
+			t.Fatalf("providers footer missing %q:\n%s", hint, v)
+		}
+	}
+
+	// Move to deepseek (index 1: 0=9router, 1=deepseek).
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if !strings.Contains(m.View(), "DEEPSEEK_API_KEY(unset)") {
+		t.Fatalf("expected DEEPSEEK_API_KEY(unset) initially:\n%s", m.View())
+	}
+
+	// 1. Press [s], type secret, press Esc -> cancels cleanly without saving.
+	const cancelledSecret = "sk-cancelled-secret-111"
+	m = sendKey(t, m, keyRune('s'))
+	if !strings.Contains(m.View(), "Set API key (DEEPSEEK_API_KEY) [empty to clear]: ") {
+		t.Fatalf("expected masked key prompt:\n%s", m.View())
+	}
+	m = sendText(t, m, cancelledSecret)
+	if strings.Contains(m.View(), cancelledSecret) {
+		t.Fatalf("View() leaked secret during typing:\n%s", m.View())
+	}
+	if !strings.Contains(m.View(), strings.Repeat("•", len([]rune(cancelledSecret)))) {
+		t.Fatalf("View() did not render masked bullets:\n%s", m.View())
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.inputBuffer != "" || m.inputMode != inputNone {
+		t.Fatalf("Esc did not clear input buffer/mode: mode=%v buf=%q", m.inputMode, m.inputBuffer)
+	}
+	loaded, err := config.LoadSecrets(home)
+	if err != nil || len(loaded) != 0 {
+		t.Fatalf("expected no secrets saved after Esc, got %v err=%v", loaded, err)
+	}
+
+	// 2. Press [s], type secret, press Enter -> saves 0600 file, status non-secret, shows (stored).
+	const realSecret = "sk-tui-saved-secret-777"
+	m = sendKey(t, m, keyRune('s'))
+	if m.inputBuffer != "" {
+		t.Fatalf("expected empty input buffer on opening [s], got %q", m.inputBuffer)
+	}
+	m = sendText(t, m, realSecret)
+	if strings.Contains(m.View(), realSecret) {
+		t.Fatalf("View() leaked secret during typing:\n%s", m.View())
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if m.inputBuffer != "" {
+		t.Fatalf("Enter did not clear inputBuffer")
+	}
+
+	afterSaveView := m.View()
+	if strings.Contains(afterSaveView, realSecret) {
+		t.Fatalf("View() leaked secret after saving:\n%s", afterSaveView)
+	}
+	if !strings.Contains(afterSaveView, "Saved API key for DEEPSEEK_API_KEY in ~/.config/odd-agy/secrets.json (0600)") {
+		t.Fatalf("expected saved status message in view:\n%s", afterSaveView)
+	}
+	if !strings.Contains(afterSaveView, "DEEPSEEK_API_KEY(stored)") {
+		t.Fatalf("expected DEEPSEEK_API_KEY(stored) in view:\n%s", afterSaveView)
+	}
+
+	sp, err := config.SecretsPath(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(sp)
+		if err != nil {
+			t.Fatalf("stat secrets.json: %v", err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("secrets.json perm = %04o, want 0600", info.Mode().Perm())
+		}
+	}
+
+	// 3. Press [t] immediately -> ProbeProvider uses stored key.
+	m = sendKey(t, m, keyRune('t'))
+	if seenAuth != "Bearer "+realSecret {
+		t.Fatalf("probe Authorization header = %q, want %q", seenAuth, "Bearer "+realSecret)
+	}
+	probeView := m.View()
+	if strings.Contains(probeView, realSecret) {
+		t.Fatalf("View() leaked secret after probe:\n%s", probeView)
+	}
+	if !strings.Contains(probeView, "reachable") || !strings.Contains(probeView, "200") {
+		t.Fatalf("expected reachable HTTP 200 after [t] probe:\n%s", probeView)
+	}
+
+	// 4. Press [s] again: buffer MUST start empty (never pre-fill existing secret); press Enter with empty input -> clears stored key.
+	m = sendKey(t, m, keyRune('s'))
+	if m.inputBuffer != "" {
+		t.Fatalf("re-opening [s] must NEVER pre-fill existing secret, got len=%d", len(m.inputBuffer))
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	afterClearView := m.View()
+	if !strings.Contains(afterClearView, "Cleared stored API key for DEEPSEEK_API_KEY") {
+		t.Fatalf("expected cleared status message:\n%s", afterClearView)
+	}
+	if !strings.Contains(afterClearView, "DEEPSEEK_API_KEY(unset)") {
+		t.Fatalf("expected DEEPSEEK_API_KEY(unset) after clearing:\n%s", afterClearView)
+	}
+
+	// 5. Env var status shows (env) and takes precedence over stored key.
+	if err := config.SetSecret(home, "DEEPSEEK_API_KEY", realSecret); err != nil {
+		t.Fatal(err)
+	}
+	optsEnv := opts
+	optsEnv.LookupEnv = func(k string) (string, bool) {
+		if k == "DEEPSEEK_API_KEY" {
+			return "sk-env-precedence-123", true
+		}
+		return "", false
+	}
+	mEnv := NewModel(dir, optsEnv)
+	for i := 0; i < 4; i++ {
+		mEnv = sendKey(t, mEnv, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	mEnv = sendKey(t, mEnv, tea.KeyMsg{Type: tea.KeyEnter})
+	mEnv = sendKey(t, mEnv, tea.KeyMsg{Type: tea.KeyDown})
+	if !strings.Contains(mEnv.View(), "DEEPSEEK_API_KEY(env)") {
+		t.Fatalf("expected DEEPSEEK_API_KEY(env) when env is set:\n%s", mEnv.View())
+	}
+
+	// 6. PRESERVE: [u] edit baseUrl and [m] edit defaultModel still work cleanly.
+	mPreserve := NewModel(dir, opts)
+	for i := 0; i < 4; i++ {
+		mPreserve = sendKey(t, mPreserve, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	mPreserve = sendKey(t, mPreserve, tea.KeyMsg{Type: tea.KeyEnter})
+	mPreserve = sendKey(t, mPreserve, tea.KeyMsg{Type: tea.KeyDown}) // deepseek
+
+	mPreserve = sendKey(t, mPreserve, keyRune('u'))
+	for i := 0; i < 50; i++ {
+		mPreserve = sendKey(t, mPreserve, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	mPreserve = sendText(t, mPreserve, "https://api.deepseek.example/v1")
+	mPreserve = sendKey(t, mPreserve, tea.KeyMsg{Type: tea.KeyEnter})
+
+	mPreserve = sendKey(t, mPreserve, keyRune('m'))
+	for i := 0; i < 30; i++ {
+		mPreserve = sendKey(t, mPreserve, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	mPreserve = sendText(t, mPreserve, "deepseek-chat")
+	mPreserve = sendKey(t, mPreserve, tea.KeyMsg{Type: tea.KeyEnter})
+
+	savedProfs, err := config.LoadProfiles(dir)
+	if err != nil {
+		t.Fatalf("LoadProfiles preserve: %v", err)
+	}
+	if got := savedProfs.Providers["deepseek"]; got.BaseURL != "https://api.deepseek.example/v1" || got.DefaultModel != "deepseek-chat" {
+		t.Fatalf("preserved provider edits mismatch: %+v", got)
+	}
+}
+
+func TestProvidersSetKeyControlCharPasteAndSymlinkErrorClearBuffer(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	opts := testOptions(home, nil, nil)
+
+	openDeepSeekProviders := func() Model {
+		m := NewModel(dir, opts)
+		for i := 0; i < 4; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown}) // deepseek
+		return m
+	}
+
+	// 1. Control-character paste (\n, \r, \x00) is rejected without leaking secret and clears inputBuffer/mode.
+	for _, badPaste := range []string{"sk-pasted-secret\nnextline", "sk-pasted-secret\rcarriage", "sk-pasted-secret\x00nul"} {
+		m := openDeepSeekProviders()
+		m = sendKey(t, m, keyRune('s'))
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(badPaste), Paste: true})
+		if strings.Contains(m.View(), "sk-pasted-secret") {
+			t.Fatalf("View() leaked pasted secret before Enter:\n%s", m.View())
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		if m.inputMode != inputNone || m.inputBuffer != "" || m.inputTarget != "" {
+			t.Fatalf("expected input state cleared after rejected paste, got mode=%v buf=%q target=%q", m.inputMode, m.inputBuffer, m.inputTarget)
+		}
+		if m.errMsg == "" {
+			t.Fatalf("expected error message for control-char paste")
+		}
+		if strings.Contains(m.errMsg, "sk-pasted-secret") || strings.Contains(m.View(), "sk-pasted-secret") {
+			t.Fatalf("error/view leaked pasted secret: err=%q view=%s", m.errMsg, m.View())
+		}
+	}
+
+	// 2. Symlink error on secrets.json rejects save, clears inputBuffer/mode, and never leaks secret.
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "outside-secrets.json")
+	cfgDir := filepath.Join(home, ".config", "odd-agy")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(cfgDir, "secrets.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	const symlinkSecret = "sk-symlink-should-clear-buffer"
+	m := openDeepSeekProviders()
+	m = sendKey(t, m, keyRune('s'))
+	m = sendText(t, m, symlinkSecret)
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.inputMode != inputNone || m.inputBuffer != "" || m.inputTarget != "" {
+		t.Fatalf("expected input state cleared after symlink error, got mode=%v buf=%q target=%q", m.inputMode, m.inputBuffer, m.inputTarget)
+	}
+	if m.errMsg == "" || !strings.Contains(m.errMsg, "symlink") {
+		t.Fatalf("expected symlink error message, got errMsg=%q", m.errMsg)
+	}
+	if strings.Contains(m.errMsg, symlinkSecret) || strings.Contains(m.View(), symlinkSecret) {
+		t.Fatalf("symlink error/view leaked secret: err=%q", m.errMsg)
+	}
+	if _, err := os.Lstat(outsideFile); !os.IsNotExist(err) {
+		t.Fatalf("symlink target must not be created, stat err=%v", err)
+	}
+
+	// Re-opening [s] must start with an empty buffer.
+	m = sendKey(t, m, keyRune('s'))
+	if m.inputBuffer != "" {
+		t.Fatalf("expected empty inputBuffer after previous error, got len=%d", len(m.inputBuffer))
+	}
+}
+

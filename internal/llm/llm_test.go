@@ -1001,3 +1001,288 @@ func TestRunShellRDDHardeningR1AndR2(t *testing.T) {
 		}
 	}
 }
+
+func TestProbeProviderAndRoleChainUseStoredSecretsWhenLookupEnvNil(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+
+	const storedKey = "sk-stored-deepseek-test"
+	if err := config.SetSecret(fakeHome, "DEEPSEEK_API_KEY", storedKey); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.URL.Path == "/v1/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"deepseek-v4-pro"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	// nil lookupEnv picks up stored key from HOME/.config/odd-agy/secrets.json.
+	res := ProbeProvider(context.Background(), "deepseek", config.ProviderConfig{
+		BaseURL:       srv.URL + "/v1",
+		APIKeyEnv:     "DEEPSEEK_API_KEY",
+		Compatibility: config.CompatibilityDeepSeekThinking,
+		DefaultModel:  "deepseek-v4-pro",
+	}, nil)
+	if !res.Reachable {
+		t.Fatalf("ProbeProvider with nil lookupEnv and stored secret failed: %+v", res)
+	}
+	if gotAuth != "Bearer "+storedKey {
+		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer "+storedKey)
+	}
+	if res.KeySource != "stored" {
+		t.Fatalf("res.KeySource = %q, want stored", res.KeySource)
+	}
+
+	// Explicit lookupEnv stays hermetic (does NOT fall back to stored secret).
+	hermeticRes := ProbeProvider(context.Background(), "deepseek", config.ProviderConfig{
+		BaseURL:       srv.URL + "/v1",
+		APIKeyEnv:     "DEEPSEEK_API_KEY",
+		Compatibility: config.CompatibilityDeepSeekThinking,
+		DefaultModel:  "deepseek-v4-pro",
+	}, func(string) (string, bool) { return "", false })
+	if hermeticRes.Reachable || !hermeticRes.MissingAPIKey {
+		t.Fatalf("expected explicit empty lookupEnv to remain hermetic and report missing key, got %+v", hermeticRes)
+	}
+
+	// ResolveRoleChain with nil lookupEnv also resolves stored secret.
+	profs := config.DefaultProfilesConfig()
+	profs.ActiveProfile = "deepseek-hybrid"
+	cands, _, err := ResolveRoleChain("verify", profs, "", "", nil)
+	if err != nil {
+		t.Fatalf("ResolveRoleChain: %v", err)
+	}
+	if len(cands) == 0 || cands[0].Skipped || cands[0].Endpoint.APIKey != storedKey {
+		t.Fatalf("ResolveRoleChain did not resolve stored secret: %+v", cands)
+	}
+
+	// Explicit lookupEnv in ResolveRoleChain remains hermetic (skips missing key instead of reading stored secret).
+	hermeticCands, _, err := ResolveRoleChain("verify", profs, "", "", func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("ResolveRoleChain hermetic: %v", err)
+	}
+	if len(hermeticCands) == 0 || !hermeticCands[0].Skipped {
+		t.Fatalf("expected explicit empty lookupEnv in ResolveRoleChain to skip candidate, got %+v", hermeticCands)
+	}
+}
+
+func TestNewRunnerUsesStoredSecretsWhenLookupEnvNilAndHermeticWhenInjected(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+
+	const storedKey = "sk-runner-stored-secret"
+	if err := config.SetSecret(fakeHome, "DEEPSEEK_API_KEY", storedKey); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+
+	var gotAuths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuths = append(gotAuths, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "r1", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": "ok", "reasoning_content": "done"},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	repo := initTestGitRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	// Default runner (LookupEnv == nil) reads stored secret and reports keySource="stored".
+	defaultRunner := NewRunner(RunnerConfig{RepoRoot: repo})
+	sum, err := defaultRunner.ProfilesSummary()
+	if err != nil {
+		t.Fatalf("ProfilesSummary: %v", err)
+	}
+	dsSum := sum.Providers["deepseek"]
+	if !dsSum.APIKeyPresent || dsSum.KeySource != "stored" {
+		t.Fatalf("deepseek summary = %+v, want apiKeyPresent=true keySource=stored", dsSum)
+	}
+	if sum.Providers["9router"].KeySource != "loopback-optional" || sum.Providers["9router"].APIKeyPresent {
+		t.Fatalf("9router summary = %+v, want keySource=loopback-optional apiKeyPresent=false", sum.Providers["9router"])
+	}
+	if sum.Providers["openai-compatible"].KeySource != "missing" || sum.Providers["openai-compatible"].APIKeyPresent {
+		t.Fatalf("openai-compatible summary = %+v, want keySource=missing apiKeyPresent=false", sum.Providers["openai-compatible"])
+	}
+
+	rec, err := defaultRunner.Run(context.Background(), RunRequest{Role: "verify", Task: "Inspect"})
+	if err != nil || rec.Status != TaskStatusCompleted {
+		t.Fatalf("defaultRunner.Run = (%+v, %v), want completed", rec, err)
+	}
+	if len(gotAuths) != 1 || gotAuths[0] != "Bearer "+storedKey {
+		t.Fatalf("gotAuths = %v, want [Bearer %s]", gotAuths, storedKey)
+	}
+
+	// Env var takes precedence over stored secret.
+	t.Setenv("DEEPSEEK_API_KEY", "sk-runner-env-secret")
+	sumEnv, err := defaultRunner.ProfilesSummary()
+	if err != nil {
+		t.Fatalf("ProfilesSummary(env): %v", err)
+	}
+	if !sumEnv.Providers["deepseek"].APIKeyPresent || sumEnv.Providers["deepseek"].KeySource != "env" {
+		t.Fatalf("deepseek summary(env) = %+v, want apiKeyPresent=true keySource=env", sumEnv.Providers["deepseek"])
+	}
+
+	// Explicit LookupEnv != nil stays 100% hermetic.
+	hermeticRunner := NewRunner(RunnerConfig{
+		RepoRoot:  repo,
+		LookupEnv: func(string) (string, bool) { return "", false },
+	})
+	hSum, err := hermeticRunner.ProfilesSummary()
+	if err != nil {
+		t.Fatalf("hermetic ProfilesSummary: %v", err)
+	}
+	if hSum.Providers["deepseek"].APIKeyPresent || hSum.Providers["deepseek"].KeySource != "missing" {
+		t.Fatalf("hermeticRunner leaked stored secret: %+v", hSum.Providers["deepseek"])
+	}
+}
+
+func TestRunShellIsolatesHomeAndBlocksSecretsJSON(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(fakeHome, ".config"))
+
+	const secretVal = "sk-isolated-home-must-not-read"
+	if err := config.SetSecret(fakeHome, "DEEPSEEK_API_KEY", secretVal); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+
+	repo := initTestGitRepo(t)
+	writeRepoFile(t, repo, "go.mod", "module example.com/demo\n\ngo 1.22\n")
+	writeRepoFile(t, repo, "src/app_test.go", `package src
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestValueAndIsolatedEnv(t *testing.T) {
+	if Value() != 1 {
+		t.Fatal("bad")
+	}
+	home := os.Getenv("HOME")
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	fmt.Printf("ISOLATED_HOME=%s\nISOLATED_XDG=%s\n", home, xdg)
+	if _, err := os.Stat(filepath.Join(home, ".config", "odd-agy", "secrets.json")); !os.IsNotExist(err) {
+		t.Fatalf("secrets.json unexpectedly present in child HOME %s", home)
+	}
+}
+`)
+
+	// Also plant an in-workspace secrets.json and .config/odd-agy/data.json and a symlink named secrets.json.
+	writeRepoFile(t, repo, "secrets.json", `{"leak":"direct"}`)
+	writeRepoFile(t, repo, ".config/odd-agy/token.txt", "leak-dir")
+	if err := os.MkdirAll(filepath.Join(repo, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(fakeHome, ".config", "odd-agy", "secrets.json"), filepath.Join(repo, "sub", "secrets.json")); err != nil {
+		t.Fatalf("symlink secrets.json: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{RepoRoot: repo})
+
+	// 1) sanitizedShellEnv must never forward the user's real HOME or XDG_CONFIG_HOME.
+	for _, entry := range sanitizedShellEnv() {
+		k, v, _ := strings.Cut(entry, "=")
+		if k == "HOME" && v == fakeHome {
+			t.Fatalf("sanitizedShellEnv forwarded real HOME %q", fakeHome)
+		}
+		if k == "XDG_CONFIG_HOME" && v == filepath.Join(fakeHome, ".config") {
+			t.Fatalf("sanitizedShellEnv forwarded real XDG_CONFIG_HOME %q", v)
+		}
+	}
+
+	// 2) go env preserves GOPATH, GOMODCACHE, GOCACHE; go test works cleanly and receives isolated HOME/XDG_CONFIG_HOME.
+	goEnvOut := runner.toolRunShell("verify", nil, "go env GOPATH GOMODCACHE GOCACHE")
+	if strings.Contains(goEnvOut, `"error"`) {
+		t.Fatalf("go env failed: %s", goEnvOut)
+	}
+	var goEnvRes struct {
+		ExitCode int    `json:"exitCode"`
+		Output   string `json:"output"`
+	}
+	if err := json.Unmarshal([]byte(goEnvOut), &goEnvRes); err != nil || goEnvRes.ExitCode != 0 {
+		t.Fatalf("go env unexpected: %s", goEnvOut)
+	}
+	goEnvLines := strings.Split(strings.TrimSpace(goEnvRes.Output), "\n")
+	if len(goEnvLines) != 3 || strings.TrimSpace(goEnvLines[0]) == "" || strings.TrimSpace(goEnvLines[1]) == "" || strings.TrimSpace(goEnvLines[2]) == "" {
+		t.Fatalf("expected non-empty GOPATH, GOMODCACHE, GOCACHE from go env, got %q", goEnvRes.Output)
+	}
+
+	goTestOut := runner.toolRunShell("verify", nil, "go test -v ./src")
+	var goTestRes struct {
+		ExitCode int    `json:"exitCode"`
+		Output   string `json:"output"`
+	}
+	if err := json.Unmarshal([]byte(goTestOut), &goTestRes); err != nil {
+		t.Fatalf("unmarshal goTestOut: %v (%s)", err, goTestOut)
+	}
+	if goTestRes.ExitCode != 0 {
+		t.Fatalf("go test -v ./src inside toolRunShell failed: exit=%d out=%s", goTestRes.ExitCode, goTestRes.Output)
+	}
+	var childHome, childXDG string
+	for _, line := range strings.Split(goTestRes.Output, "\n") {
+		if strings.HasPrefix(line, "ISOLATED_HOME=") {
+			childHome = strings.TrimPrefix(line, "ISOLATED_HOME=")
+		}
+		if strings.HasPrefix(line, "ISOLATED_XDG=") {
+			childXDG = strings.TrimPrefix(line, "ISOLATED_XDG=")
+		}
+	}
+	if childHome == "" || childHome == fakeHome || !strings.Contains(filepath.Base(childHome), "odd-agy-shell-home-") {
+		t.Fatalf("child HOME = %q, must be isolated odd-agy-shell-home-* != %q", childHome, fakeHome)
+	}
+	if childXDG != filepath.Join(childHome, ".config") {
+		t.Fatalf("child XDG_CONFIG_HOME = %q, want %q", childXDG, filepath.Join(childHome, ".config"))
+	}
+	// Temp shell HOME directory must be cleaned up after toolRunShell returns.
+	if _, err := os.Stat(childHome); !os.IsNotExist(err) {
+		t.Fatalf("expected shellHome %q to be removed after toolRunShell, stat err=%v", childHome, err)
+	}
+
+	if pyPath, err := exec.LookPath("python3"); err == nil && pyPath != "" {
+		pyOut := runner.toolRunShell("verify", nil, `python3 -c "import os, pathlib; p = pathlib.Path(os.environ['HOME']) / '.config' / 'odd-agy' / 'secrets.json'; print(os.environ['HOME'], p.exists())"`)
+		if strings.Contains(pyOut, `"error"`) || strings.Contains(pyOut, secretVal) || strings.Contains(pyOut, "True") || strings.Contains(pyOut, fakeHome) {
+			t.Fatalf("python3 saw host HOME or secrets.json: %s", pyOut)
+		}
+	}
+
+	// 3) secrets.json and .config/odd-agy are blocked by isSensitiveRelPath in shell & file tools.
+	for _, blockedCmd := range []string{
+		"cat secrets.json",
+		"cat sub/secrets.json",
+		"cat .config/odd-agy/token.txt",
+	} {
+		if out := runner.toolRunShell("verify", nil, blockedCmd); !strings.Contains(out, `"error"`) {
+			t.Fatalf("expected %q to be blocked, got: %s", blockedCmd, out)
+		}
+	}
+	for _, blockedPath := range []string{"secrets.json", "sub/secrets.json", ".config/odd-agy/token.txt"} {
+		if out := runner.toolReadFile(blockedPath, 0, 0); !strings.Contains(out, `"error"`) {
+			t.Fatalf("expected read_file(%q) to be blocked, got: %s", blockedPath, out)
+		}
+	}
+}
+

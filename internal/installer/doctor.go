@@ -25,13 +25,15 @@ func Doctor(workspaceRoot string, opts DoctorOptions) (DoctorReport, error) {
 	if lookPath == nil {
 		lookPath = exec.LookPath
 	}
-	lookupEnv := opts.LookupEnv
-	if lookupEnv == nil {
-		lookupEnv = os.LookupEnv
-	}
 	homeDir := strings.TrimSpace(opts.HomeDir)
 	if homeDir == "" {
 		homeDir, _ = os.UserHomeDir()
+	}
+	lookupEnv := opts.LookupEnv
+	if lookupEnv == nil {
+		lookupEnv = config.NewSecretsLookupEnv(homeDir, os.LookupEnv)
+	} else if strings.TrimSpace(opts.HomeDir) != "" {
+		lookupEnv = config.NewSecretsLookupEnv(opts.HomeDir, lookupEnv)
 	}
 
 	var checks []Check
