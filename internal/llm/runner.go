@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/build"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -119,12 +120,13 @@ type RunnerConfig struct {
 
 // Runner executes sandboxed multi-turn agentic tasks against OpenAI-compatible providers.
 type Runner struct {
-	mu              sync.Mutex
-	repoRoot        string
-	client          *Client
-	lookupEnv       func(string) (string, bool)
-	defaultMaxTurns int
-	defaultTimeout  time.Duration
+	mu                sync.Mutex
+	repoRoot          string
+	client            *Client
+	lookupEnv         func(string) (string, bool)
+	usedDefaultLookup bool
+	defaultMaxTurns   int
+	defaultTimeout    time.Duration
 }
 
 // NewRunner constructs a Runner rooted at cfg.RepoRoot.
@@ -133,9 +135,10 @@ func NewRunner(cfg RunnerConfig) *Runner {
 	if client == nil {
 		client = NewClient(nil)
 	}
+	usedDefaultLookup := cfg.LookupEnv == nil
 	lookupEnv := cfg.LookupEnv
 	if lookupEnv == nil {
-		lookupEnv = os.LookupEnv
+		lookupEnv = config.NewSecretsLookupEnv("", os.LookupEnv)
 	}
 	maxTurns := cfg.DefaultMaxTurns
 	if maxTurns <= 0 {
@@ -146,11 +149,12 @@ func NewRunner(cfg RunnerConfig) *Runner {
 		timeout = defaultTaskTimeout
 	}
 	return &Runner{
-		repoRoot:        cfg.RepoRoot,
-		client:          client,
-		lookupEnv:       lookupEnv,
-		defaultMaxTurns: maxTurns,
-		defaultTimeout:  timeout,
+		repoRoot:          cfg.RepoRoot,
+		client:            client,
+		lookupEnv:         lookupEnv,
+		usedDefaultLookup: usedDefaultLookup,
+		defaultMaxTurns:   maxTurns,
+		defaultTimeout:    timeout,
 	}
 }
 
@@ -174,10 +178,15 @@ func (r *Runner) ProfilesSummary() (ProfilesSummary, error) {
 			FastModel:     p.FastModel,
 		}
 		if resolveErr == nil {
+			if r.usedDefaultLookup && ep.KeySource == "env" {
+				if _, src := config.LookupSecret("", p.APIKeyEnv, os.Getenv); src == "stored" {
+					ep.KeySource = "stored"
+				}
+			}
 			summary.BaseURL = RedactURL(ep.BaseURL)
 			summary.IsLoopback = ep.IsLoopback
 			summary.KeySource = ep.KeySource
-			summary.APIKeyPresent = !ep.MissingAPIKey && ep.KeySource == "env"
+			summary.APIKeyPresent = !ep.MissingAPIKey && (ep.KeySource == "env" || ep.KeySource == "stored")
 		} else {
 			summary.KeySource = "invalid"
 		}
@@ -962,17 +971,23 @@ func (r *Runner) toolRunShell(role string, allowedSurfaces []string, command str
 	if err := validateShellCommand(role, allowedSurfaces, r.repoRoot, command); err != nil {
 		return toolErrJSON(err.Error())
 	}
+	shellHome, err := os.MkdirTemp("", "odd-agy-shell-home-*")
+	if err != nil {
+		return toolErrJSON(fmt.Sprintf("create isolated shell home: %v", err))
+	}
+	defer os.RemoveAll(shellHome)
+
 	ctx, cancel := context.WithTimeout(context.Background(), defaultShellTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = r.repoRoot
-	cmd.Env = sanitizedShellEnv()
+	cmd.Env = sanitizedShellEnvForHome(shellHome)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
-	err := cmd.Run()
+	err = cmd.Run()
 	out := buf.String()
 	if len(out) > maxToolOutputBytes {
 		out = out[:maxToolOutputBytes] + "\n...[truncated]"
@@ -994,17 +1009,65 @@ func (r *Runner) toolRunShell(role string, allowedSurfaces []string, command str
 }
 
 var allowedShellEnvVars = map[string]bool{
-	"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+	"PATH": true, "USER": true, "LOGNAME": true, "SHELL": true,
 	"LANG": true, "TERM": true, "TZ": true, "GOPATH": true, "GOMODCACHE": true,
 	"GOCACHE": true, "GOROOT": true, "NODE_ENV": true, "PNPM_HOME": true,
 	"NO_COLOR": true, "CI": true, "TMPDIR": true,
 }
 
 func sanitizedShellEnv() []string {
+	return sanitizedShellEnvForHome("")
+}
+
+func sanitizedShellEnvForHome(shellHome string) []string {
+	gopath := strings.TrimSpace(os.Getenv("GOPATH"))
+	if gopath == "" {
+		gopath = strings.TrimSpace(build.Default.GOPATH)
+	}
+	gomodcache := strings.TrimSpace(os.Getenv("GOMODCACHE"))
+	if gomodcache == "" && gopath != "" {
+		if list := filepath.SplitList(gopath); len(list) > 0 && list[0] != "" {
+			gomodcache = filepath.Join(list[0], "pkg", "mod")
+		}
+	}
+	gocache := strings.TrimSpace(os.Getenv("GOCACHE"))
+	if gocache == "" {
+		if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+			gocache = filepath.Join(cacheDir, "go-build")
+		}
+	}
+	goroot := strings.TrimSpace(os.Getenv("GOROOT"))
+	if goroot == "" {
+		goroot = strings.TrimSpace(build.Default.GOROOT)
+	}
+
 	out := make([]string, 0)
+	seen := make(map[string]bool)
 	for _, entry := range os.Environ() {
 		if k, _, ok := strings.Cut(entry, "="); ok && (allowedShellEnvVars[k] || strings.HasPrefix(k, "LC_")) {
 			out = append(out, entry)
+			seen[k] = true
+		}
+	}
+
+	targetHome := strings.TrimSpace(shellHome)
+	if targetHome == "" {
+		targetHome = filepath.Join(os.TempDir(), "odd-agy-shell-home-isolated")
+	}
+	out = append(out, "HOME="+targetHome)
+	out = append(out, "XDG_CONFIG_HOME="+filepath.Join(targetHome, ".config"))
+
+	for _, kv := range []struct {
+		key string
+		val string
+	}{
+		{"GOPATH", gopath},
+		{"GOMODCACHE", gomodcache},
+		{"GOCACHE", gocache},
+		{"GOROOT", goroot},
+	} {
+		if !seen[kv.key] && kv.val != "" {
+			out = append(out, kv.key+"="+kv.val)
 		}
 	}
 	return out
@@ -1272,8 +1335,11 @@ func isSensitiveRelPath(slashPath string) bool {
 	if lower == ".aws" || strings.HasPrefix(lower, ".aws/") || strings.Contains(lower, "/.aws/") {
 		return true
 	}
+	if lower == ".config/odd-agy" || strings.HasPrefix(lower, ".config/odd-agy/") || strings.Contains(lower, "/.config/odd-agy/") {
+		return true
+	}
 	switch base {
-	case "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".netrc", ".npmrc", ".pypirc":
+	case "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".netrc", ".npmrc", ".pypirc", "secrets.json":
 		return true
 	}
 	ext := filepath.Ext(base)

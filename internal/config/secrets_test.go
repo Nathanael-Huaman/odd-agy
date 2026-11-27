@@ -247,3 +247,113 @@ func TestLookupSecretPrecedenceAndEnvWrappers(t *testing.T) {
 		t.Fatalf("NewSecretsEnvLookup(MISSING_KEY) = %q, want \"\"", got)
 	}
 }
+
+func TestSecretsDanglingSymlinksTightenPermsAndByteIdenticalOnReject(t *testing.T) {
+	// 1. Dangling symlink on secrets.json rejected by LoadSecrets & SetSecret; target remains absent.
+	home1 := t.TempDir()
+	outside1 := t.TempDir()
+	danglingFileTarget := filepath.Join(outside1, "nonexistent-secrets.json")
+	cfgDir1 := filepath.Join(home1, ".config", "odd-agy")
+	if err := os.MkdirAll(cfgDir1, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(danglingFileTarget, filepath.Join(cfgDir1, "secrets.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadSecrets(home1); err == nil {
+		t.Fatal("expected LoadSecrets to reject dangling file symlink")
+	}
+	if err := SetSecret(home1, "DEEPSEEK_API_KEY", "sk-dangling-secret"); err == nil {
+		t.Fatal("expected SetSecret to reject dangling file symlink")
+	} else if strings.Contains(err.Error(), "sk-dangling-secret") {
+		t.Fatalf("SetSecret leaked secret in dangling symlink error: %v", err)
+	}
+	if _, err := os.Lstat(danglingFileTarget); !os.IsNotExist(err) {
+		t.Fatalf("dangling file symlink target must not be created, stat err=%v", err)
+	}
+
+	// 2. Dangling symlink on ~/.config/odd-agy directory rejected; target remains absent.
+	home2 := t.TempDir()
+	outside2 := t.TempDir()
+	danglingDirTarget := filepath.Join(outside2, "nonexistent-odd-agy-dir")
+	if err := os.MkdirAll(filepath.Join(home2, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(danglingDirTarget, filepath.Join(home2, ".config", "odd-agy")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadSecrets(home2); err == nil {
+		t.Fatal("expected LoadSecrets to reject dangling directory symlink")
+	}
+	if err := SetSecret(home2, "DEEPSEEK_API_KEY", "sk-dangling-dir-secret"); err == nil {
+		t.Fatal("expected SetSecret to reject dangling directory symlink")
+	}
+	if _, err := os.Lstat(danglingDirTarget); !os.IsNotExist(err) {
+		t.Fatalf("dangling dir symlink target must not be created, stat err=%v", err)
+	}
+
+	// 3. Loose pre-existing directory/file permissions are tightened to 0700 / 0600 on SetSecret.
+	home3 := t.TempDir()
+	sp3, err := SecretsPath(home3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir3 := filepath.Dir(sp3)
+	if err := os.MkdirAll(dir3, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir3, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sp3, []byte("{\n  \"schemaVersion\": 1,\n  \"keys\": {\n    \"OPENAI_API_KEY\": \"sk-keep\"\n  }\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sp3, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetSecret(home3, "DEEPSEEK_API_KEY", "sk-tightened"); err != nil {
+		t.Fatalf("SetSecret tighten perms: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		dInfo, err := os.Stat(dir3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dInfo.Mode().Perm() != 0o700 {
+			t.Fatalf("dir perm = %04o, want 0700", dInfo.Mode().Perm())
+		}
+		fInfo, err := os.Stat(sp3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fInfo.Mode().Perm() != 0o600 {
+			t.Fatalf("file perm = %04o, want 0600", fInfo.Mode().Perm())
+		}
+	}
+
+	// 4. Existing secrets.json stays byte-identical on rejected SetSecret calls.
+	beforeBytes, err := os.ReadFile(sp3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, reject := range []struct {
+		key string
+		val string
+	}{
+		{"DEEPSEEK_API_KEY", "sk-bad\nline"},
+		{"DEEPSEEK_API_KEY", "sk-bad\rreturn"},
+		{"DEEPSEEK_API_KEY", "sk-bad\x00nul"},
+		{"BAD-KEY-NAME", "sk-valid-val"},
+	} {
+		if err := SetSecret(home3, reject.key, reject.val); err == nil {
+			t.Fatalf("expected SetSecret(%q, ...) to fail", reject.key)
+		}
+		afterBytes, err := os.ReadFile(sp3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(afterBytes) != string(beforeBytes) {
+			t.Fatalf("secrets.json mutated on rejected SetSecret(%q): before=%q after=%q", reject.key, string(beforeBytes), string(afterBytes))
+		}
+	}
+}

@@ -1152,3 +1152,75 @@ func TestProvidersMaskedSetKeySaveClearEscAndProbe(t *testing.T) {
 	}
 }
 
+func TestProvidersSetKeyControlCharPasteAndSymlinkErrorClearBuffer(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	opts := testOptions(home, nil, nil)
+
+	openDeepSeekProviders := func() Model {
+		m := NewModel(dir, opts)
+		for i := 0; i < 4; i++ {
+			m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown}) // deepseek
+		return m
+	}
+
+	// 1. Control-character paste (\n, \r, \x00) is rejected without leaking secret and clears inputBuffer/mode.
+	for _, badPaste := range []string{"sk-pasted-secret\nnextline", "sk-pasted-secret\rcarriage", "sk-pasted-secret\x00nul"} {
+		m := openDeepSeekProviders()
+		m = sendKey(t, m, keyRune('s'))
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(badPaste), Paste: true})
+		if strings.Contains(m.View(), "sk-pasted-secret") {
+			t.Fatalf("View() leaked pasted secret before Enter:\n%s", m.View())
+		}
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		if m.inputMode != inputNone || m.inputBuffer != "" || m.inputTarget != "" {
+			t.Fatalf("expected input state cleared after rejected paste, got mode=%v buf=%q target=%q", m.inputMode, m.inputBuffer, m.inputTarget)
+		}
+		if m.errMsg == "" {
+			t.Fatalf("expected error message for control-char paste")
+		}
+		if strings.Contains(m.errMsg, "sk-pasted-secret") || strings.Contains(m.View(), "sk-pasted-secret") {
+			t.Fatalf("error/view leaked pasted secret: err=%q view=%s", m.errMsg, m.View())
+		}
+	}
+
+	// 2. Symlink error on secrets.json rejects save, clears inputBuffer/mode, and never leaks secret.
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "outside-secrets.json")
+	cfgDir := filepath.Join(home, ".config", "odd-agy")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(cfgDir, "secrets.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	const symlinkSecret = "sk-symlink-should-clear-buffer"
+	m := openDeepSeekProviders()
+	m = sendKey(t, m, keyRune('s'))
+	m = sendText(t, m, symlinkSecret)
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.inputMode != inputNone || m.inputBuffer != "" || m.inputTarget != "" {
+		t.Fatalf("expected input state cleared after symlink error, got mode=%v buf=%q target=%q", m.inputMode, m.inputBuffer, m.inputTarget)
+	}
+	if m.errMsg == "" || !strings.Contains(m.errMsg, "symlink") {
+		t.Fatalf("expected symlink error message, got errMsg=%q", m.errMsg)
+	}
+	if strings.Contains(m.errMsg, symlinkSecret) || strings.Contains(m.View(), symlinkSecret) {
+		t.Fatalf("symlink error/view leaked secret: err=%q", m.errMsg)
+	}
+	if _, err := os.Lstat(outsideFile); !os.IsNotExist(err) {
+		t.Fatalf("symlink target must not be created, stat err=%v", err)
+	}
+
+	// Re-opening [s] must start with an empty buffer.
+	m = sendKey(t, m, keyRune('s'))
+	if m.inputBuffer != "" {
+		t.Fatalf("expected empty inputBuffer after previous error, got len=%d", len(m.inputBuffer))
+	}
+}
+
