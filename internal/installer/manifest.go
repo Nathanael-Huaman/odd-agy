@@ -1,6 +1,7 @@
 package installer
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,9 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/Nathanael-Huaman/odd-agy/internal/assets"
+	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 )
 
 const (
@@ -322,4 +326,210 @@ func mergeMCPConfigJSON(workspaceRoot, binaryCommand string, includeEngram, prev
 		return false, err
 	}
 	return engramManaged, nil
+}
+
+func roleForAgentRelPath(relSlash string) (string, bool) {
+	for _, role := range config.AllRoles {
+		if p, ok := config.RoleAgentRelPath(role); ok && p == relSlash {
+			return role, true
+		}
+	}
+	return "", false
+}
+
+func renderAssetForProfile(af assets.AssetFile, pf *config.ProfileConfig) []byte {
+	if pf == nil || af.Category != assets.CategoryAgent {
+		return af.Content
+	}
+	role, ok := roleForAgentRelPath(".agents/" + af.RelPath)
+	if !ok {
+		return af.Content
+	}
+	ra, hasRole := pf.Roles[role]
+	if !hasRole || ra.Runtime != config.RuntimeAgyNative {
+		return af.Content
+	}
+	model := strings.TrimSpace(ra.Model)
+	if model == "" {
+		return af.Content
+	}
+	updated, _, err := replaceFrontmatterModel(af.Content, model)
+	if err != nil {
+		return af.Content
+	}
+	return updated
+}
+
+func replaceFrontmatterModel(data []byte, model string) ([]byte, bool, error) {
+	trimmedModel := strings.TrimSpace(model)
+	if trimmedModel == "" {
+		return data, false, errors.New("model must not be empty")
+	}
+	for _, r := range trimmedModel {
+		if r < 0x20 || r == 0x7f {
+			return data, false, errors.New("model must not contain control characters")
+		}
+	}
+
+	lines := strings.Split(string(data), "\n")
+	if len(lines) < 3 || strings.TrimSuffix(lines[0], "\r") != "---" {
+		return data, false, nil
+	}
+
+	closeIdx := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSuffix(lines[i], "\r") == "---" {
+			closeIdx = i
+			break
+		}
+	}
+	if closeIdx == -1 {
+		return data, false, nil
+	}
+
+	replaced := false
+	for i := 1; i < closeIdx; i++ {
+		hadCR := strings.HasSuffix(lines[i], "\r")
+		trimmed := strings.TrimSpace(strings.TrimSuffix(lines[i], "\r"))
+		if key, _, ok := strings.Cut(trimmed, ":"); ok && strings.TrimSpace(key) == "model" {
+			newLine := "model: " + trimmedModel
+			if hadCR {
+				newLine += "\r"
+			}
+			lines[i] = newLine
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		return data, false, nil
+	}
+
+	out := []byte(strings.Join(lines, "\n"))
+	if bytes.Equal(out, data) {
+		return data, false, nil
+	}
+	return out, true, nil
+}
+
+// ApplyActiveProfileModels syncs YAML frontmatter model lines in existing .agents/agents/*.md
+// files to match the active profile in .agents/odd/profiles.json, updating manifest hashes
+// only for files whose previous on-disk hash matched the manifest.
+func ApplyActiveProfileModels(workspaceRoot string) (int, error) {
+	ws, err := validateWorkspaceRoot(workspaceRoot)
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := os.Stat(ManifestPath(ws)); errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	} else if err != nil {
+		return 0, fmt.Errorf("stat manifest: %w", err)
+	}
+
+	manifest, err := LoadManifest(ws)
+	if err != nil {
+		return 0, err
+	}
+
+	profs, err := config.LoadProfiles(ws)
+	if err != nil {
+		return 0, fmt.Errorf("load profiles: %w", err)
+	}
+	activeProf, ok := profs.Profiles[profs.ActiveProfile]
+	if !ok {
+		return 0, fmt.Errorf("active profile %q not found", profs.ActiveProfile)
+	}
+
+	agentAssets, err := assets.Agents()
+	if err != nil {
+		return 0, fmt.Errorf("load embedded agents: %w", err)
+	}
+
+	type plannedWrite struct {
+		relSlash        string
+		targetPath      string
+		content         []byte
+		wasCleanManaged bool
+	}
+	var planned []plannedWrite
+
+	for _, af := range agentAssets {
+		relSlash := ".agents/" + af.RelPath
+		role, ok := roleForAgentRelPath(relSlash)
+		if !ok {
+			continue
+		}
+		ra, hasRole := activeProf.Roles[role]
+		if !hasRole {
+			continue
+		}
+
+		target, err := resolveContainedPath(ws, relSlash)
+		if err != nil {
+			return 0, err
+		}
+
+		diskBytes, err := os.ReadFile(target)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return 0, fmt.Errorf("read %s: %w", relSlash, err)
+		}
+
+		var desiredModel string
+		if ra.Runtime == config.RuntimeAgyNative && strings.TrimSpace(ra.Model) != "" {
+			desiredModel = strings.TrimSpace(ra.Model)
+		} else {
+			fm, _, err := assets.ParseFrontmatter(af.Content)
+			if err != nil {
+				return 0, fmt.Errorf("parse embedded %s frontmatter: %w", af.RelPath, err)
+			}
+			desiredModel = strings.TrimSpace(fm.Model)
+		}
+		if desiredModel == "" {
+			continue
+		}
+
+		updated, changed, err := replaceFrontmatterModel(diskBytes, desiredModel)
+		if err != nil {
+			return 0, fmt.Errorf("update %s model: %w", relSlash, err)
+		}
+		if !changed {
+			continue
+		}
+
+		prevHash := sha256PrefixedHex(diskBytes)
+		manifestHash, inManifest := manifest.Files[relSlash]
+		planned = append(planned, plannedWrite{
+			relSlash:        relSlash,
+			targetPath:      target,
+			content:         updated,
+			wasCleanManaged: inManifest && prevHash == manifestHash,
+		})
+	}
+
+	if len(planned) == 0 {
+		return 0, nil
+	}
+
+	manifestChanged := false
+	for _, w := range planned {
+		if err := writeFileAtomic(w.targetPath, w.content, 0o644); err != nil {
+			return 0, err
+		}
+		if w.wasCleanManaged {
+			manifest.Files[w.relSlash] = sha256PrefixedHex(w.content)
+			manifestChanged = true
+		}
+	}
+
+	if manifestChanged {
+		if err := saveManifest(ws, manifest); err != nil {
+			return 0, fmt.Errorf("save manifest: %w", err)
+		}
+	}
+
+	return len(planned), nil
 }

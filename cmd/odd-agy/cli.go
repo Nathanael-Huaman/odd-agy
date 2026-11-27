@@ -381,14 +381,47 @@ func runLaunch(args []string, stdin io.Reader, stdout, stderr io.Writer, cwd str
 		return exitError
 	}
 
-	agyArgs := make([]string, 0, 4+len(extraArgs))
+	var orchestratorModel string
+	if !noAgent && agentName == "odd-orchestrator" && !hasModelFlag(extraArgs) {
+		if _, err := os.Stat(config.ProfilesPath(cwd)); err == nil {
+			profs, err := config.LoadProfiles(cwd)
+			if err != nil {
+				fmt.Fprintf(stderr, "odd-agy launch: %v\n", err)
+				return exitError
+			}
+			if prof, ok := profs.Profiles[profs.ActiveProfile]; ok {
+				ra := prof.Roles[config.RoleOrchestrator]
+				model := strings.TrimSpace(ra.Model)
+				if ra.Runtime == config.RuntimeAgyNative && model != "" && model != "inherit" {
+					orchestratorModel = model
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "odd-agy launch: stat profiles: %v\n", err)
+			return exitError
+		}
+	}
+
+	agyArgs := make([]string, 0, 6+len(extraArgs))
 	if !noAgent {
 		agyArgs = append(agyArgs, "--agent", agentName)
+		if orchestratorModel != "" {
+			agyArgs = append(agyArgs, "--model", orchestratorModel)
+		}
 	}
 	agyArgs = append(agyArgs, "--settings", absSettings)
 	agyArgs = append(agyArgs, extraArgs...)
 
 	return runExternalCmd(cwd, stdin, stdout, stderr, agyBin, agyArgs...)
+}
+
+func hasModelFlag(args []string) bool {
+	for _, a := range args {
+		if a == "--model" || strings.HasPrefix(a, "--model=") {
+			return true
+		}
+	}
+	return false
 }
 
 func runPermissions(args []string, stdout, stderr io.Writer) int {
@@ -646,6 +679,10 @@ func runProfile(args []string, stdout, stderr io.Writer, cwd string) int {
 		}
 		cfg.ActiveProfile = name
 		if err := config.SaveProfiles(cwd, cfg); err != nil {
+			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
+			return exitError
+		}
+		if _, err := installer.ApplyActiveProfileModels(cwd); err != nil {
 			fmt.Fprintf(stderr, "odd-agy profile use: %v\n", err)
 			return exitError
 		}

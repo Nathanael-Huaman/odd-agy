@@ -199,7 +199,7 @@ func TestRulesContractAndBudget(t *testing.T) {
 	}
 
 	orch := string(byPath["rules/odd-02-orchestrator.md"].Content)
-	for _, needle := range []string{"full-delegation", "organic", "gentle-ai-worker", "gentle-ai-explore", "gentle-ai-verify", "Allowed edit surfaces", "odd_external_run", "odd_external_continue", "profiles.json"} {
+	for _, needle := range []string{"full-delegation", "organic", "gentle-ai-worker", "gentle-ai-explore", "gentle-ai-verify", "Allowed edit surfaces", "odd_external_run", "odd_external_continue", "profiles.json", "3 bounded reads", "manage_subagents", "duplicate"} {
 		if !strings.Contains(orch, needle) {
 			t.Errorf("odd-02-orchestrator.md missing %q", needle)
 		}
@@ -246,7 +246,7 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 		t.Errorf("odd-orchestrator must omit replace_file_content and multi_replace_file_content")
 	}
 	orchAgent := string(byPath["agents/odd-orchestrator.md"].Content)
-	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined"} {
+	for _, needle := range []string{"odd_review_consent", "consent_required", "ask_question", "granted", "declined", "3 bounded reads", "manage_subagents", "duplicate"} {
 		if !strings.Contains(orchAgent, needle) {
 			t.Errorf("odd-orchestrator.md missing %q", needle)
 		}

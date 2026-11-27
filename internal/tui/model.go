@@ -248,11 +248,7 @@ func (m *Model) commitInput(val string) error {
 		route.Model = val
 		prof.Roles[m.inputTarget] = route
 		m.profiles.Profiles[m.profiles.ActiveProfile] = prof
-		if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-			return err
-		}
-		m.errMsg = ""
-		m.statusMsg = fmt.Sprintf("Updated %s model to %s", m.inputTarget, val)
+		return m.persistProfileChange(fmt.Sprintf("Updated %s model to %s", m.inputTarget, val))
 
 	case inputProviderURL:
 		prov := m.profiles.Providers[m.inputTarget]
@@ -418,12 +414,7 @@ func (m Model) handleOverviewKey(key string) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.profiles.ActiveProfile = m.profileNames[nextIdx]
-			if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-				m.errMsg = err.Error()
-				return m, nil
-			}
-			m.errMsg = ""
-			m.statusMsg = fmt.Sprintf("Active profile set to %s", m.profiles.ActiveProfile)
+			_ = m.persistProfileChange(fmt.Sprintf("Active profile set to %s", m.profiles.ActiveProfile))
 			return m, nil
 		}
 		m.screen = screenProfiles
@@ -460,12 +451,9 @@ func (m Model) handleProfilesKey(key string) (tea.Model, tea.Cmd) {
 	}
 	chosen := m.profileNames[m.cursor]
 	m.profiles.ActiveProfile = chosen
-	if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-		m.errMsg = err.Error()
+	if err := m.persistProfileChange(fmt.Sprintf("Active profile set to %s", chosen)); err != nil {
 		return m, nil
 	}
-	m.errMsg = ""
-	m.statusMsg = fmt.Sprintf("Active profile set to %s", chosen)
 	m.screen = screenOverview
 	m.cursor = 2
 	return m, nil
@@ -481,6 +469,11 @@ func (m Model) handleRolesKey(key string) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "t", "enter", " ":
+		if role == config.RoleOrchestrator {
+			m.errMsg = ""
+			m.statusMsg = "orchestrator always runs on agy-native (press [m] to edit its model)"
+			return m, nil
+		}
 		if route.Runtime == config.RuntimeAgyNative {
 			if len(m.providerNames) == 0 {
 				m.errMsg = "No providers configured"
@@ -504,15 +497,14 @@ func (m Model) handleRolesKey(key string) (tea.Model, tea.Cmd) {
 		}
 		prof.Roles[role] = route
 		m.profiles.Profiles[m.profiles.ActiveProfile] = prof
-		if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-			m.errMsg = err.Error()
-			m.reload()
-			return m, nil
-		}
-		m.errMsg = ""
-		m.statusMsg = fmt.Sprintf("Role %s runtime set to %s", role, route.Runtime)
+		_ = m.persistProfileChange(fmt.Sprintf("Role %s runtime set to %s", role, route.Runtime))
 
 	case "p":
+		if role == config.RoleOrchestrator {
+			m.errMsg = ""
+			m.statusMsg = "orchestrator always runs on agy-native (press [m] to edit its model)"
+			return m, nil
+		}
 		if len(m.providerNames) == 0 {
 			m.errMsg = "No providers configured"
 			return m, nil
@@ -532,13 +524,7 @@ func (m Model) handleRolesKey(key string) (tea.Model, tea.Cmd) {
 		route.Model = m.profiles.Providers[nextProv].DefaultModel
 		prof.Roles[role] = route
 		m.profiles.Profiles[m.profiles.ActiveProfile] = prof
-		if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
-			m.errMsg = err.Error()
-			m.reload()
-			return m, nil
-		}
-		m.errMsg = ""
-		m.statusMsg = fmt.Sprintf("Role %s provider set to %s", role, nextProv)
+		_ = m.persistProfileChange(fmt.Sprintf("Role %s provider set to %s", role, nextProv))
 
 	case "m":
 		m.inputMode = inputRoleModel
@@ -667,6 +653,27 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) persistProfileChange(baseStatus string) error {
+	if err := config.SaveProfiles(m.cwd, m.profiles); err != nil {
+		m.reload()
+		m.errMsg = err.Error()
+		return err
+	}
+	updated, err := installer.ApplyActiveProfileModels(m.cwd)
+	if err != nil {
+		m.reload()
+		m.errMsg = err.Error()
+		return err
+	}
+	m.errMsg = ""
+	if updated > 0 {
+		m.statusMsg = fmt.Sprintf("%s (%d .agents/agents/*.md synced; restart odd-agy launch to apply)", baseStatus, updated)
+	} else {
+		m.statusMsg = baseStatus
+	}
+	return nil
 }
 
 func boolOnOff(v bool) string {

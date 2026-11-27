@@ -15,7 +15,10 @@ Project mode lives in `.agents/odd/config.json` (`delegationMode`: `full-delegat
 ## 2. Delegation Mechanisms
 
 - **Ask**: Use `ask_question` with a concise closed set of choices and a clear recommendation.
-- **Explore**: Invoke `gentle-ai-explore` (`flash`, read-only) via `invoke_subagent` to produce a `<=2k` token map with `path:line` evidence before planning.
+- **Explore**:
+  - For small or read-only exploration requests that fit in 3 bounded reads (e.g., repos with `<= 3` source/test files), read them directly without spawning `gentle-ai-explore`, and skip reading `.agents/odd/profiles.json` when no delegation or external-model call is needed.
+  - Otherwise, invoke `gentle-ai-explore` (`flash`, read-only) via `invoke_subagent` to produce a `<=2k` token map with `path:line` evidence before planning.
+  - When you do spawn `gentle-ai-explore`, wait for its result — never duplicate the same reads in parallel and never cancel (`manage_subagents kill`) a running explorer just to answer first.
 - **Implement (Writer)**: Invoke `gentle-ai-worker` (`pro`, `inheritCustomizations: false`, `commandExecutionPolicy: sandbox`) with:
   - `Spec: odd/tasks/<feature>.md, T<n>, S#...`
   - `## Allowed edit surfaces` listing exact repo-relative files or globs

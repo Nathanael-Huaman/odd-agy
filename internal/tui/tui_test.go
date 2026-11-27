@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Nathanael-Huaman/odd-agy/internal/assets"
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 	"github.com/Nathanael-Huaman/odd-agy/internal/installer"
 	"github.com/Nathanael-Huaman/odd-agy/internal/llm"
@@ -72,6 +73,9 @@ func TestMainMenuToggleDelegationAndRDD(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "full-delegation") || !strings.Contains(view, "agy-oauth") || !strings.Contains(view, "not initialized") {
 		t.Fatalf("unexpected initial overview:\n%s", view)
+	}
+	if !strings.Contains(view, "Roles Editor (12 roles)") {
+		t.Fatalf("expected dynamic role count 'Roles Editor (12 roles)' in overview:\n%s", view)
 	}
 
 	// Item 0: Toggle Delegation Mode (full-delegation -> organic)
@@ -138,11 +142,47 @@ func TestRolesEditorToggleRuntimeProviderAndModel(t *testing.T) {
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 
-	if !strings.Contains(m.View(), "explore") || !strings.Contains(m.View(), "review-refuter") {
+	if !strings.Contains(m.View(), "orchestrator") || !strings.Contains(m.View(), "explore") || !strings.Contains(m.View(), "review-refuter") {
 		t.Fatalf("expected all roles in editor view:\n%s", m.View())
 	}
 
-	// Cursor is on role 0 ("explore"). Toggle runtime agy-native -> external-mcp.
+	// Cursor is on role 0 ("orchestrator"). Toggling or cycling provider must keep it on agy-native.
+	for _, k := range []tea.KeyMsg{keyRune('t'), {Type: tea.KeyEnter}, {Type: tea.KeySpace}, keyRune('p')} {
+		m = sendKey(t, m, k)
+		if !strings.Contains(m.View(), "orchestrator always runs on agy-native (press [m] to edit its model)") {
+			t.Fatalf("expected orchestrator guard status after key %v:\n%s", k, m.View())
+		}
+		profCfg, err := config.LoadProfiles(dir)
+		if err != nil {
+			t.Fatalf("LoadProfiles: %v", err)
+		}
+		orch := profCfg.Profiles[profCfg.ActiveProfile].Roles[config.RoleOrchestrator]
+		if orch.Runtime != config.RuntimeAgyNative || orch.Provider != "" || orch.Model != "inherit" {
+			t.Fatalf("orchestrator mutated unexpectedly: %+v", orch)
+		}
+	}
+
+	// Pressing 'm' on agy-native orchestrator shows Antigravity model IDs/aliases hint.
+	m = sendKey(t, m, keyRune('m'))
+	hintView := m.View()
+	for _, wantID := range []string{
+		"inherit",
+		"flash",
+		"gemini-3.8-flash-high",
+		"gemini-3.8-flash-medium",
+		"gemini-3.8-flash-low",
+		"gemini-4-hydrogen-high",
+		"claude-sonnet-4-6",
+		"claude-opus-4-6-thinking",
+	} {
+		if !strings.Contains(hintView, wantID) {
+			t.Fatalf("expected Antigravity model hint %q in view:\n%s", wantID, hintView)
+		}
+	}
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	// Move down to role 1 ("explore"). Toggle runtime agy-native -> external-mcp.
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
 	m = sendKey(t, m, keyRune('t'))
 	profCfg, err := config.LoadProfiles(dir)
 	if err != nil {
@@ -165,8 +205,11 @@ func TestRolesEditorToggleRuntimeProviderAndModel(t *testing.T) {
 		t.Fatalf("expected provider to cycle from %q, got %+v", firstProvider, route)
 	}
 
-	// Edit model with 'm', backspace existing, enter new model
+	// Edit model with 'm', backspace existing, enter new model; external-mcp should NOT show Antigravity hint.
 	m = sendKey(t, m, keyRune('m'))
+	if strings.Contains(m.View(), "gemini-3.8-flash-high") {
+		t.Fatalf("did not expect agy-native model hint while editing external-mcp role:\n%s", m.View())
+	}
 	for i := 0; i < 40; i++ {
 		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
 	}
@@ -321,5 +364,147 @@ func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
 	}
 	if !strings.Contains(m.View(), "Allow MCP globally (~/.gemini)") {
 		t.Fatalf("expected Allow MCP globally label after revoke:\n%s", m.View())
+	}
+}
+
+func TestRolesEditorAndProfileSwitchSyncAgentFrontmatterAndDoctor(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	opts := testOptions(home, nil, nil)
+
+	if _, err := installer.Init(dir, installer.InitOptions{
+		LookPath: opts.LookPath,
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	m := NewModel(dir, opts)
+
+	// Navigate to Item 3: Roles Editor
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	// Edit orchestrator (role 0) model -> gemini-3.8-flash-high
+	m = sendKey(t, m, keyRune('m'))
+	for i := 0; i < 20; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = sendText(t, m, "gemini-3.8-flash-high")
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(m.View(), ".agents/agents/*.md") || !strings.Contains(m.View(), "odd-agy launch") {
+		t.Fatalf("expected agent sync + restart odd-agy launch status after orchestrator edit:\n%s", m.View())
+	}
+
+	// Move down to explore (role 1) and edit model -> gemini-3.8-flash-low
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, keyRune('m'))
+	for i := 0; i < 20; i++ {
+		m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = sendText(t, m, "gemini-3.8-flash-low")
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(m.View(), ".agents/agents/*.md") || !strings.Contains(m.View(), "odd-agy launch") {
+		t.Fatalf("expected agent sync + restart odd-agy launch status after explore edit:\n%s", m.View())
+	}
+
+	assertAgentModel := func(rel, want string) {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", rel, err)
+		}
+		fm, _, err := assets.ParseFrontmatter(data)
+		if err != nil {
+			t.Fatalf("ParseFrontmatter(%s): %v", rel, err)
+		}
+		if fm.Model != want {
+			t.Fatalf("%s frontmatter model = %q, want %q", rel, fm.Model, want)
+		}
+	}
+
+	assertAgentModel(".agents/agents/odd-orchestrator.md", "gemini-3.8-flash-high")
+	assertAgentModel(".agents/agents/gentle-ai-explore.md", "gemini-3.8-flash-low")
+
+	rep, err := installer.Doctor(dir, installer.DoctorOptions{
+		HomeDir:   home,
+		LookPath:  opts.LookPath,
+		LookupEnv: opts.LookupEnv,
+	})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if rep.HasFailures() {
+		t.Fatalf("Doctor reported failures after TUI model edits: %+v", rep.Checks)
+	}
+	for _, c := range rep.Checks {
+		if c.Name == "managed-files" && c.Status != installer.CheckOK {
+			t.Fatalf("managed-files check = %+v, want ok", c)
+		}
+	}
+
+	// Return to Overview, switch to deepseek-hybrid via Profiles screen, and verify frontmatter resets to deepseek-hybrid's defaults.
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	// Sorted profiles: 0=9router-hybrid, 1=agy-oauth (current), 2=deepseek-hybrid
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(m.View(), ".agents/agents/*.md") || !strings.Contains(m.View(), "odd-agy launch") {
+		t.Fatalf("expected agent sync + restart odd-agy launch status after profile switch:\n%s", m.View())
+	}
+
+	assertAgentModel(".agents/agents/odd-orchestrator.md", "inherit")
+	assertAgentModel(".agents/agents/gentle-ai-explore.md", "flash")
+
+	rep2, err := installer.Doctor(dir, installer.DoctorOptions{
+		HomeDir:   home,
+		LookPath:  opts.LookPath,
+		LookupEnv: opts.LookupEnv,
+	})
+	if err != nil || rep2.HasFailures() {
+		t.Fatalf("Doctor after profile switch: err=%v checks=%+v", err, rep2.Checks)
+	}
+	for _, c := range rep2.Checks {
+		if c.Name == "managed-files" && c.Status != installer.CheckOK {
+			t.Fatalf("managed-files check after profile switch = %+v, want ok", c)
+		}
+	}
+}
+
+func TestSaveProfilesFailureReloadsInMemoryState(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	// Save initial profiles.json so file exists, then replace it with a non-empty directory so SaveProfiles fails.
+	if err := config.SaveProfiles(dir, config.DefaultProfilesConfig()); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	m := NewModel(dir, testOptions(home, nil, nil))
+	// Navigate to Roles Editor -> explore (index 1)
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyDown})
+
+	// Break profiles.json path on disk with a non-empty directory so atomic rename fails.
+	profPath := config.ProfilesPath(dir)
+	if err := os.Remove(profPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(profPath, "blocker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempt to toggle explore runtime -> SaveProfiles fails -> reload restores persisted/default state (no unpersisted external-mcp in memory) and sets errMsg.
+	m = sendKey(t, m, keyRune('t'))
+	if m.errMsg == "" {
+		t.Fatalf("expected error message when SaveProfiles fails, view:\n%s", m.View())
+	}
+	if got := m.profiles.Profiles[m.profiles.ActiveProfile].Roles["explore"].Runtime; got != config.RuntimeAgyNative {
+		t.Fatalf("in-memory explore runtime = %q after SaveProfiles failure, want %q", got, config.RuntimeAgyNative)
 	}
 }

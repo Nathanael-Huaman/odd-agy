@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nathanael-Huaman/odd-agy/internal/assets"
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 	"github.com/Nathanael-Huaman/odd-agy/internal/installer"
 	"github.com/Nathanael-Huaman/odd-agy/internal/version"
@@ -685,5 +686,221 @@ func TestRunExternalCmdExitAndSignalHandling(t *testing.T) {
 			t.Fatalf("expected non-empty signal diagnostic on stderr, got %q", errOut)
 		}
 	})
+}
+
+func TestProfileUseSyncsAgentFrontmatterInInitializedWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	code, _, errOut := runCLI(t, dir, "init")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+
+	profs, err := config.LoadProfiles(dir)
+	if err != nil {
+		t.Fatalf("LoadProfiles: %v", err)
+	}
+	ds := profs.Profiles["deepseek-hybrid"]
+	ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-high"}
+	ds.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-3.8-flash-low"}
+	profs.Profiles["deepseek-hybrid"] = ds
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	code, out, errOut := runCLI(t, dir, "profile", "use", "deepseek-hybrid")
+	if code != 0 || errOut != "" || !strings.Contains(out, "deepseek-hybrid") {
+		t.Fatalf("profile use deepseek-hybrid => code=%d out=%q err=%q", code, out, errOut)
+	}
+
+	orchBytes, err := os.ReadFile(filepath.Join(dir, ".agents", "agents", "odd-orchestrator.md"))
+	if err != nil {
+		t.Fatalf("read odd-orchestrator.md: %v", err)
+	}
+	orchFM, _, err := assets.ParseFrontmatter(orchBytes)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter orchestrator: %v", err)
+	}
+	if orchFM.Model != "gemini-3.8-flash-high" {
+		t.Fatalf("odd-orchestrator.md model = %q, want gemini-3.8-flash-high", orchFM.Model)
+	}
+
+	expBytes, err := os.ReadFile(filepath.Join(dir, ".agents", "agents", "gentle-ai-explore.md"))
+	if err != nil {
+		t.Fatalf("read gentle-ai-explore.md: %v", err)
+	}
+	expFM, _, err := assets.ParseFrontmatter(expBytes)
+	if err != nil {
+		t.Fatalf("ParseFrontmatter explore: %v", err)
+	}
+	if expFM.Model != "gemini-3.8-flash-low" {
+		t.Fatalf("gentle-ai-explore.md model = %q, want gemini-3.8-flash-low", expFM.Model)
+	}
+
+	syncRes, err := installer.Sync(dir, installer.SyncOptions{})
+	if err != nil || len(syncRes.Conflicts) != 0 || len(syncRes.Updated) != 0 {
+		t.Fatalf("Sync after profile use: res=%+v err=%v", syncRes, err)
+	}
+
+	// Error from ApplyActiveProfileModels (symlink escape) must be printed to stderr and return exitError.
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.md")
+	const sentinel = "---\nname: outside\nmodel: original\n---\n\nbody\n"
+	if err := os.WriteFile(outsideFile, []byte(sentinel), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	explorePath := filepath.Join(dir, ".agents", "agents", "gentle-ai-explore.md")
+	if err := os.Remove(explorePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, explorePath); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut = runCLI(t, dir, "profile", "use", "agy-oauth")
+	if code != exitError || errOut == "" {
+		t.Fatalf("profile use with symlink escape => code=%d err=%q, want code=%d and stderr error", code, errOut, exitError)
+	}
+	if got, _ := os.ReadFile(outsideFile); string(got) != sentinel {
+		t.Fatalf("external symlink target was mutated: %q", string(got))
+	}
+}
+
+func TestLaunchModelInjection(t *testing.T) {
+	dir := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	origLookPath := lookPath
+	origRunner := runExternalCmd
+	defer func() {
+		lookPath = origLookPath
+		runExternalCmd = origRunner
+	}()
+
+	var gotArgs []string
+	lookPath = func(bin string) (string, error) {
+		if bin == "agy" {
+			return "/usr/local/bin/agy", nil
+		}
+		return "", errors.New("not found")
+	}
+	runExternalCmd = func(_ string, _ io.Reader, _, _ io.Writer, _ string, args ...string) int {
+		gotArgs = append([]string(nil), args...)
+		return 0
+	}
+
+	code, _, errOut := runCLI(t, dir, "init")
+	if code != 0 || errOut != "" {
+		t.Fatalf("init => code=%d err=%q", code, errOut)
+	}
+	absSettings, err := filepath.Abs(installer.SessionSettingsPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Update active profile orchestrator model to gemini-3.8-flash-high.
+	profs, err := config.LoadProfiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := profs.Profiles[profs.ActiveProfile]
+	active.Roles[config.RoleOrchestrator] = config.RoleRoute{
+		Runtime: config.RuntimeAgyNative,
+		Model:   "gemini-3.8-flash-high",
+	}
+	profs.Profiles[profs.ActiveProfile] = active
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Default odd-orchestrator without --model injects --model from active profile.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch => code=%d err=%q", code, errOut)
+	}
+	wantInjected := []string{"--agent", "odd-orchestrator", "--model", "gemini-3.8-flash-high", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantInjected) {
+		t.Fatalf("launch injected args = %v, want %v", gotArgs, wantInjected)
+	}
+
+	// 2. Explicit --model <id> in extraArgs suppresses injection.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--", "--model", "flash", "-p", "hi")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch with --model => code=%d err=%q", code, errOut)
+	}
+	wantExplicitSpace := []string{"--agent", "odd-orchestrator", "--settings", absSettings, "--model", "flash", "-p", "hi"}
+	if !reflect.DeepEqual(gotArgs, wantExplicitSpace) {
+		t.Fatalf("launch with --model args = %v, want %v", gotArgs, wantExplicitSpace)
+	}
+
+	// 3. Explicit --model=<id> in extraArgs suppresses injection.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--", "--model=claude-sonnet-4-6")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch with --model= => code=%d err=%q", code, errOut)
+	}
+	wantExplicitEq := []string{"--agent", "odd-orchestrator", "--settings", absSettings, "--model=claude-sonnet-4-6"}
+	if !reflect.DeepEqual(gotArgs, wantExplicitEq) {
+		t.Fatalf("launch with --model= args = %v, want %v", gotArgs, wantExplicitEq)
+	}
+
+	// 4. --no-agent suppresses injection.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--no-agent")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch --no-agent => code=%d err=%q", code, errOut)
+	}
+	wantNoAgent := []string{"--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantNoAgent) {
+		t.Fatalf("launch --no-agent args = %v, want %v", gotArgs, wantNoAgent)
+	}
+
+	// 5. Custom --agent=<other> suppresses injection.
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch", "--agent=custom-agent")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch --agent=custom-agent => code=%d err=%q", code, errOut)
+	}
+	wantCustomAgent := []string{"--agent", "custom-agent", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantCustomAgent) {
+		t.Fatalf("launch --agent=custom-agent args = %v, want %v", gotArgs, wantCustomAgent)
+	}
+
+	// 6. orchestrator model == "inherit" suppresses injection.
+	active.Roles[config.RoleOrchestrator] = config.RoleRoute{
+		Runtime: config.RuntimeAgyNative,
+		Model:   "inherit",
+	}
+	profs.Profiles[profs.ActiveProfile] = active
+	if err := config.SaveProfiles(dir, profs); err != nil {
+		t.Fatal(err)
+	}
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch inherit => code=%d err=%q", code, errOut)
+	}
+	wantInherit := []string{"--agent", "odd-orchestrator", "--settings", absSettings}
+	if !reflect.DeepEqual(gotArgs, wantInherit) {
+		t.Fatalf("launch inherit args = %v, want %v", gotArgs, wantInherit)
+	}
+
+	// 7. Missing profiles.json suppresses injection cleanly.
+	if err := os.Remove(config.ProfilesPath(dir)); err != nil {
+		t.Fatal(err)
+	}
+	gotArgs = nil
+	code, _, errOut = runCLI(t, dir, "launch")
+	if code != 0 || errOut != "" {
+		t.Fatalf("launch without profiles.json => code=%d err=%q", code, errOut)
+	}
+	if !reflect.DeepEqual(gotArgs, wantInherit) {
+		t.Fatalf("launch without profiles.json args = %v, want %v", gotArgs, wantInherit)
+	}
 }
 

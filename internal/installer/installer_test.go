@@ -1215,3 +1215,230 @@ func TestDoctorFailsWhenSessionSettingsMissingFromManifest(t *testing.T) {
 	}
 }
 
+func TestInitAndSyncRenderAgyNativeModelsIntoAgentFrontmatter(t *testing.T) {
+	ws := t.TempDir()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+
+	// Seed custom profiles.json before Init (simulates preserving existing profiles.json on Init without Force).
+	profs := config.DefaultProfilesConfig()
+	profs.ActiveProfile = "deepseek-hybrid"
+	ds := profs.Profiles["deepseek-hybrid"]
+	ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-pro"}
+	ds.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-flash"}
+	ds.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-sonnet-4.5"}
+	// verify remains external-mcp (deepseek-v4-pro) -> embedded frontmatter must keep default "pro".
+	profs.Profiles["deepseek-hybrid"] = ds
+	if err := config.SaveProfiles(ws, profs); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+	}); err != nil {
+		t.Fatalf("Init with preserved profiles.json: %v", err)
+	}
+
+	assertFrontmatterModel := func(relSlash, wantModel string) {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(ws, filepath.FromSlash(relSlash)))
+		if err != nil {
+			t.Fatalf("read %s: %v", relSlash, err)
+		}
+		fm, _, err := assets.ParseFrontmatter(data)
+		if err != nil {
+			t.Fatalf("ParseFrontmatter(%s): %v", relSlash, err)
+		}
+		if fm.Model != wantModel {
+			t.Fatalf("%s frontmatter model = %q, want %q", relSlash, fm.Model, wantModel)
+		}
+	}
+
+	assertFrontmatterModel(".agents/agents/odd-orchestrator.md", "gemini-2.5-pro")
+	assertFrontmatterModel(".agents/agents/gentle-ai-explore.md", "gemini-2.5-flash")
+	assertFrontmatterModel(".agents/agents/gentle-ai-worker.md", "claude-sonnet-4.5")
+	assertFrontmatterModel(".agents/agents/gentle-ai-verify.md", "pro")
+
+	// Doctor must report managed-files OK (manifest hashes match rendered agent files).
+	docRep, err := Doctor(ws, DoctorOptions{
+		HomeDir:   fakeHome,
+		LookPath:  fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+		LookupEnv: fakeLookupEnv(map[string]string{"DEEPSEEK_API_KEY": "sk-test"}),
+	})
+	if err != nil {
+		t.Fatalf("Doctor: %v", err)
+	}
+	if docRep.HasFailures() || docRep.HasWarnings() {
+		t.Fatalf("expected healthy doctor report, got %+v", docRep.Checks)
+	}
+
+	// Update profiles.json and run Sync without Force: must NOT report conflicts, must update agent frontmatter.
+	profs.Profiles["deepseek-hybrid"].Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-pro-latest"}
+	if err := config.SaveProfiles(ws, profs); err != nil {
+		t.Fatalf("SaveProfiles update: %v", err)
+	}
+
+	syncRes, err := Sync(ws, SyncOptions{Force: false})
+	if err != nil {
+		t.Fatalf("Sync after profile model change failed: %v", err)
+	}
+	if len(syncRes.Conflicts) != 0 {
+		t.Fatalf("unexpected Sync conflicts: %v", syncRes.Conflicts)
+	}
+	if !slices.Contains(syncRes.Updated, ".agents/agents/gentle-ai-worker.md") {
+		t.Fatalf("expected gentle-ai-worker.md in Sync Updated, got %v", syncRes.Updated)
+	}
+	assertFrontmatterModel(".agents/agents/gentle-ai-worker.md", "gemini-2.5-pro-latest")
+
+	// Immediate second Sync must report all unchanged.
+	syncRes2, err := Sync(ws, SyncOptions{Force: false})
+	if err != nil {
+		t.Fatalf("second Sync failed: %v", err)
+	}
+	if len(syncRes2.Updated) != 0 || len(syncRes2.Created) != 0 || len(syncRes2.Conflicts) != 0 {
+		t.Fatalf("expected no-op second Sync, got %+v", syncRes2)
+	}
+}
+
+func TestApplyActiveProfileModels(t *testing.T) {
+	// 1. Uninitialized workspace returns (0, nil) without error.
+	uninit := t.TempDir()
+	n, err := ApplyActiveProfileModels(uninit)
+	if err != nil || n != 0 {
+		t.Fatalf("ApplyActiveProfileModels(uninit) = (%d, %v), want (0, nil)", n, err)
+	}
+
+	// 2. Initialized workspace updates agy-native agent files & manifest cleanly.
+	ws := t.TempDir()
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	profs, err := config.LoadProfiles(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profs.ActiveProfile = "deepseek-hybrid"
+	ds := profs.Profiles["deepseek-hybrid"]
+	ds.Roles[config.RoleOrchestrator] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-pro"}
+	ds.Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-flash"}
+	ds.Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "claude-opus-4-6"}
+	profs.Profiles["deepseek-hybrid"] = ds
+	if err := config.SaveProfiles(ws, profs); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := ApplyActiveProfileModels(ws)
+	if err != nil {
+		t.Fatalf("ApplyActiveProfileModels: %v", err)
+	}
+	if updated != 3 {
+		t.Fatalf("updated = %d, want 3", updated)
+	}
+
+	// Idempotent second call returns (0, nil).
+	updated2, err := ApplyActiveProfileModels(ws)
+	if err != nil || updated2 != 0 {
+		t.Fatalf("second ApplyActiveProfileModels = (%d, %v), want (0, nil)", updated2, err)
+	}
+
+	// Manifest hashes updated so Sync reports zero changes and zero conflicts.
+	syncRes, err := Sync(ws, SyncOptions{})
+	if err != nil || len(syncRes.Updated) != 0 || len(syncRes.Conflicts) != 0 {
+		t.Fatalf("Sync after ApplyActiveProfileModels: res=%+v err=%v", syncRes, err)
+	}
+
+	// 3. User-modified agent body is preserved and its manifest hash is NOT overwritten.
+	workerRel := ".agents/agents/gentle-ai-worker.md"
+	workerPath := filepath.Join(ws, filepath.FromSlash(workerRel))
+	workerData, err := os.ReadFile(workerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Also put a "model: keep-in-body" line in body to prove only frontmatter is rewritten.
+	customBodyNote := "\n\nmodel: body-literal-must-stay\n"
+	if err := os.WriteFile(workerPath, append(workerData, []byte(customBodyNote)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	profs.Profiles["deepseek-hybrid"].Roles["worker"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "gemini-2.5-pro"}
+	if err := config.SaveProfiles(ws, profs); err != nil {
+		t.Fatal(err)
+	}
+
+	updated3, err := ApplyActiveProfileModels(ws)
+	if err != nil || updated3 != 1 {
+		t.Fatalf("ApplyActiveProfileModels on user-edited agent = (%d, %v), want (1, nil)", updated3, err)
+	}
+	afterWorker, err := os.ReadFile(workerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm, body, err := assets.ParseFrontmatter(afterWorker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fm.Model != "gemini-2.5-pro" {
+		t.Fatalf("worker frontmatter model = %q, want gemini-2.5-pro", fm.Model)
+	}
+	if !strings.Contains(body, "model: body-literal-must-stay") {
+		t.Fatalf("user body edit or body 'model:' line was clobbered:\n%s", body)
+	}
+	// Sync without Force must STILL detect workerRel as a conflict (manifest hash was NOT updated for dirty file).
+	refused, syncErr := Sync(ws, SyncOptions{Force: false})
+	if syncErr == nil || !slices.Contains(refused.Conflicts, workerRel) {
+		t.Fatalf("expected Sync conflict on user-modified %s, got err=%v conflicts=%v", workerRel, syncErr, refused.Conflicts)
+	}
+
+	// 4. Missing agent file on disk is skipped cleanly.
+	explorePath := filepath.Join(ws, ".agents", "agents", "gentle-ai-explore.md")
+	if err := os.Remove(explorePath); err != nil {
+		t.Fatal(err)
+	}
+	profs.Profiles["deepseek-hybrid"].Roles["explore"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "flash"}
+	if err := config.SaveProfiles(ws, profs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyActiveProfileModels(ws); err != nil {
+		t.Fatalf("ApplyActiveProfileModels with missing file failed: %v", err)
+	}
+
+	// 5. Symlink escape is rejected before mutating external target.
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.md")
+	const sentinel = "---\nname: outside\nmodel: original\n---\n\nbody\n"
+	if err := os.WriteFile(outsideFile, []byte(sentinel), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, explorePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyActiveProfileModels(ws); err == nil {
+		t.Fatalf("expected ApplyActiveProfileModels to reject symlink escape")
+	}
+	if got, _ := os.ReadFile(outsideFile); string(got) != sentinel {
+		t.Fatalf("external symlink target was mutated: %q", string(got))
+	}
+}
+
+func TestSyncPreservesEmbeddedDefaultsWhenProfilesMissing(t *testing.T) {
+	ws := t.TempDir()
+	if _, err := Init(ws, InitOptions{
+		LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy"}),
+	}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := os.Remove(config.ProfilesPath(ws)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Sync(ws, SyncOptions{})
+	if err != nil {
+		t.Fatalf("Sync without profiles.json failed: %v", err)
+	}
+	if len(res.Conflicts) != 0 || len(res.Updated) != 0 || len(res.Created) != 0 {
+		t.Fatalf("expected clean no-op Sync without profiles.json, got %+v", res)
+	}
+}
+

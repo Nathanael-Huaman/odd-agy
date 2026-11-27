@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +36,24 @@ func TestDefaultProfilesConfig(t *testing.T) {
 		t.Fatalf("unexpected omniroute provider: %+v", got)
 	}
 
+	wantRoles := []string{
+		RoleOrchestrator,
+		"explore",
+		"worker",
+		"verify",
+		"jd-judge-a",
+		"jd-judge-b",
+		"jd-fix-agent",
+		"review-risk",
+		"review-resilience",
+		"review-readability",
+		"review-reliability",
+		"review-refuter",
+	}
+	if !slices.Equal(AllRoles, wantRoles) {
+		t.Fatalf("AllRoles = %v, want %v", AllRoles, wantRoles)
+	}
+
 	for _, profName := range []string{"agy-oauth", "deepseek-hybrid", "9router-hybrid", "omniroute-hybrid"} {
 		prof, ok := cfg.Profiles[profName]
 		if !ok {
@@ -43,6 +63,10 @@ func TestDefaultProfilesConfig(t *testing.T) {
 			if _, ok := prof.Roles[role]; !ok {
 				t.Fatalf("profile %q missing role %q", profName, role)
 			}
+		}
+		orch := prof.Roles[RoleOrchestrator]
+		if orch.Runtime != RuntimeAgyNative || orch.Model != "inherit" {
+			t.Fatalf("profile %q orchestrator = %+v, want agy-native/inherit", profName, orch)
 		}
 	}
 
@@ -95,6 +119,61 @@ func TestValidateProfilesRejectsInvalid(t *testing.T) {
 			prof := c.Profiles["agy-oauth"]
 			delete(prof.Roles, "review-refuter")
 			c.Profiles["agy-oauth"] = prof
+		}},
+		{"missing orchestrator role", func(c *ProfilesConfig) {
+			prof := c.Profiles["agy-oauth"]
+			delete(prof.Roles, RoleOrchestrator)
+			c.Profiles["agy-oauth"] = prof
+		}},
+		{"orchestrator external-mcp rejected", func(c *ProfilesConfig) {
+			prof := c.Profiles["deepseek-hybrid"]
+			prof.Roles[RoleOrchestrator] = RoleRoute{
+				Runtime:  RuntimeExternalMCP,
+				Provider: "deepseek",
+				Model:    "deepseek-v4-pro",
+			}
+			c.Profiles["deepseek-hybrid"] = prof
+		}},
+		{"orchestrator fallback external-mcp rejected", func(c *ProfilesConfig) {
+			prof := c.Profiles["deepseek-hybrid"]
+			prof.Roles[RoleOrchestrator] = RoleRoute{
+				Runtime: RuntimeAgyNative,
+				Model:   "inherit",
+				Fallback: []RoleTarget{{
+					Runtime:  RuntimeExternalMCP,
+					Provider: "deepseek",
+					Model:    "deepseek-v4-pro",
+				}},
+			}
+			c.Profiles["deepseek-hybrid"] = prof
+		}},
+		{"model newline rejected", func(c *ProfilesConfig) {
+			prof := c.Profiles["agy-oauth"]
+			r := prof.Roles["worker"]
+			r.Model = "pro\ntools: [run_command]"
+			prof.Roles["worker"] = r
+			c.Profiles["agy-oauth"] = prof
+		}},
+		{"model carriage return rejected", func(c *ProfilesConfig) {
+			prof := c.Profiles["agy-oauth"]
+			r := prof.Roles["worker"]
+			r.Model = "pro\rinjected"
+			prof.Roles["worker"] = r
+			c.Profiles["agy-oauth"] = prof
+		}},
+		{"model null byte rejected", func(c *ProfilesConfig) {
+			prof := c.Profiles["agy-oauth"]
+			r := prof.Roles["worker"]
+			r.Model = "pro\x00"
+			prof.Roles["worker"] = r
+			c.Profiles["agy-oauth"] = prof
+		}},
+		{"fallback model control char rejected", func(c *ProfilesConfig) {
+			prof := c.Profiles["deepseek-hybrid"]
+			r := prof.Roles["verify"]
+			r.Fallback = []RoleTarget{{Runtime: RuntimeAgyNative, Model: "pro\nfoo"}}
+			prof.Roles["verify"] = r
+			c.Profiles["deepseek-hybrid"] = prof
 		}},
 	}
 
@@ -210,4 +289,130 @@ func TestResolveProviderEndpoint(t *testing.T) {
 			t.Fatalf("expected error for invalid BaseURL")
 		}
 	})
+}
+
+func TestLoadProfilesBackfillsMissingOrchestrator(t *testing.T) {
+	dir := t.TempDir()
+	// Simulate a v0.1.0 profiles.json omitting "orchestrator" in every profile.
+	v010JSON := `{
+  "schemaVersion": 1,
+  "activeProfile": "deepseek-hybrid",
+  "providers": {
+    "deepseek": {
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "compatibility": "deepseek-thinking",
+      "defaultModel": "deepseek-v4-pro"
+    }
+  },
+  "profiles": {
+    "agy-oauth": {
+      "roles": {
+        "explore": {"runtime": "agy-native", "model": "flash"},
+        "worker": {"runtime": "agy-native", "model": "pro"},
+        "verify": {"runtime": "agy-native", "model": "pro"},
+        "jd-judge-a": {"runtime": "agy-native", "model": "pro"},
+        "jd-judge-b": {"runtime": "agy-native", "model": "pro"},
+        "jd-fix-agent": {"runtime": "agy-native", "model": "pro"},
+        "review-risk": {"runtime": "agy-native", "model": "pro"},
+        "review-resilience": {"runtime": "agy-native", "model": "pro"},
+        "review-readability": {"runtime": "agy-native", "model": "pro"},
+        "review-reliability": {"runtime": "agy-native", "model": "pro"},
+        "review-refuter": {"runtime": "agy-native", "model": "pro"}
+      }
+    },
+    "deepseek-hybrid": {
+      "roles": {
+        "explore": {"runtime": "agy-native", "model": "flash"},
+        "worker": {"runtime": "agy-native", "model": "pro"},
+        "verify": {"runtime": "external-mcp", "provider": "deepseek", "model": "deepseek-v4-pro"},
+        "jd-judge-a": {"runtime": "agy-native", "model": "pro"},
+        "jd-judge-b": {"runtime": "external-mcp", "provider": "deepseek", "model": "deepseek-v4-pro"},
+        "jd-fix-agent": {"runtime": "agy-native", "model": "pro"},
+        "review-risk": {"runtime": "external-mcp", "provider": "deepseek", "model": "deepseek-v4-pro"},
+        "review-resilience": {"runtime": "external-mcp", "provider": "deepseek", "model": "deepseek-v4-pro"},
+        "review-readability": {"runtime": "external-mcp", "provider": "deepseek", "model": "deepseek-v4-pro"},
+        "review-reliability": {"runtime": "external-mcp", "provider": "deepseek", "model": "deepseek-v4-pro"},
+        "review-refuter": {"runtime": "external-mcp", "provider": "deepseek", "model": "deepseek-v4-pro"}
+      }
+    }
+  }
+}`
+	p := ProfilesPath(dir)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(v010JSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadProfiles(dir)
+	if err != nil {
+		t.Fatalf("LoadProfiles v0.1.0 failed: %v", err)
+	}
+	for _, pname := range []string{"agy-oauth", "deepseek-hybrid"} {
+		orch, ok := loaded.Profiles[pname].Roles[RoleOrchestrator]
+		if !ok {
+			t.Fatalf("profile %q missing backfilled orchestrator", pname)
+		}
+		if orch.Runtime != RuntimeAgyNative || orch.Model != "inherit" {
+			t.Fatalf("profile %q backfilled orchestrator = %+v, want agy-native/inherit", pname, orch)
+		}
+	}
+
+	// Preserve: explicit custom orchestrator model is NOT overwritten by backfill, and incomplete v0.1.0 profiles missing other roles still fail.
+	customDir := t.TempDir()
+	customP := ProfilesPath(customDir)
+	_ = os.MkdirAll(filepath.Dir(customP), 0o755)
+	customJSON := strings.Replace(v010JSON, `"explore": {"runtime": "agy-native", "model": "flash"},`, `"orchestrator": {"runtime": "agy-native", "model": "gemini-2.5-pro"}, "explore": {"runtime": "agy-native", "model": "flash"},`, 1)
+	if err := os.WriteFile(customP, []byte(customJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loadedCustom, err := LoadProfiles(customDir)
+	if err != nil {
+		t.Fatalf("LoadProfiles custom orchestrator failed: %v", err)
+	}
+	if got := loadedCustom.Profiles["agy-oauth"].Roles[RoleOrchestrator].Model; got != "gemini-2.5-pro" {
+		t.Fatalf("explicit orchestrator model overwritten: got %q, want gemini-2.5-pro", got)
+	}
+
+	incompleteDir := t.TempDir()
+	incompleteP := ProfilesPath(incompleteDir)
+	_ = os.MkdirAll(filepath.Dir(incompleteP), 0o755)
+	incompleteJSON := strings.Replace(v010JSON, `"worker": {"runtime": "agy-native", "model": "pro"},`, ``, 1)
+	if err := os.WriteFile(incompleteP, []byte(incompleteJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadProfiles(incompleteDir); err == nil {
+		t.Fatalf("expected LoadProfiles to reject incomplete profile missing worker")
+	}
+}
+
+func TestRoleAgentRelPath(t *testing.T) {
+	want := map[string]string{
+		RoleOrchestrator:     ".agents/agents/odd-orchestrator.md",
+		"explore":            ".agents/agents/gentle-ai-explore.md",
+		"worker":             ".agents/agents/gentle-ai-worker.md",
+		"verify":             ".agents/agents/gentle-ai-verify.md",
+		"jd-judge-a":         ".agents/agents/jd-judge-a.md",
+		"jd-judge-b":         ".agents/agents/jd-judge-b.md",
+		"jd-fix-agent":       ".agents/agents/jd-fix-agent.md",
+		"review-risk":        ".agents/agents/review-risk.md",
+		"review-resilience":  ".agents/agents/review-resilience.md",
+		"review-readability": ".agents/agents/review-readability.md",
+		"review-reliability": ".agents/agents/review-reliability.md",
+		"review-refuter":     ".agents/agents/review-refuter.md",
+	}
+	for _, role := range AllRoles {
+		got, ok := RoleAgentRelPath(role)
+		if !ok || got != want[role] {
+			t.Errorf("RoleAgentRelPath(%q) = (%q, %t), want (%q, true)", role, got, ok, want[role])
+		}
+		if !strings.HasPrefix(got, ".agents/agents/") || !strings.HasSuffix(got, ".md") {
+			t.Errorf("unexpected agent path %q", got)
+		}
+	}
+	if got, ok := RoleAgentRelPath("unknown-role"); ok || got != "" {
+		t.Errorf("RoleAgentRelPath(unknown) = (%q, %t), want (\"\", false)", got, ok)
+	}
 }

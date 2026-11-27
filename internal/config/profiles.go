@@ -17,10 +17,13 @@ const (
 
 	CompatibilityStandard         = "standard"
 	CompatibilityDeepSeekThinking = "deepseek-thinking"
+
+	RoleOrchestrator = "orchestrator"
 )
 
-// AllRoles enumerates every subagent/review role supported by odd-agy profiles.
+// AllRoles enumerates every orchestrator/subagent/review role supported by odd-agy profiles.
 var AllRoles = []string{
+	RoleOrchestrator,
 	"explore",
 	"worker",
 	"verify",
@@ -32,6 +35,27 @@ var AllRoles = []string{
 	"review-readability",
 	"review-reliability",
 	"review-refuter",
+}
+
+var roleAgentRelPaths = map[string]string{
+	RoleOrchestrator:     ".agents/agents/odd-orchestrator.md",
+	"explore":            ".agents/agents/gentle-ai-explore.md",
+	"worker":             ".agents/agents/gentle-ai-worker.md",
+	"verify":             ".agents/agents/gentle-ai-verify.md",
+	"jd-judge-a":         ".agents/agents/jd-judge-a.md",
+	"jd-judge-b":         ".agents/agents/jd-judge-b.md",
+	"jd-fix-agent":       ".agents/agents/jd-fix-agent.md",
+	"review-risk":        ".agents/agents/review-risk.md",
+	"review-resilience":  ".agents/agents/review-resilience.md",
+	"review-readability": ".agents/agents/review-readability.md",
+	"review-reliability": ".agents/agents/review-reliability.md",
+	"review-refuter":     ".agents/agents/review-refuter.md",
+}
+
+// RoleAgentRelPath returns the workspace-relative .agents/agents/<file>.md path for a known role.
+func RoleAgentRelPath(role string) (string, bool) {
+	p, ok := roleAgentRelPaths[role]
+	return p, ok
 }
 
 // ProviderConfig defines an OpenAI-compatible or DeepSeek-thinking provider template.
@@ -148,7 +172,10 @@ func buildNativeProfile() ProfileConfig {
 	roles := make(map[string]RoleRoute, len(AllRoles))
 	for _, role := range AllRoles {
 		model := "pro"
-		if role == "explore" {
+		switch role {
+		case RoleOrchestrator:
+			model = "inherit"
+		case "explore":
 			model = "flash"
 		}
 		roles[role] = RoleRoute{
@@ -175,6 +202,7 @@ func buildHybridProfile(description, provider, model string) ProfileConfig {
 	return ProfileConfig{
 		Description: description,
 		Roles: map[string]RoleRoute{
+			RoleOrchestrator:     {Runtime: RuntimeAgyNative, Model: "inherit"},
 			"explore":            {Runtime: RuntimeAgyNative, Model: "flash"},
 			"worker":             {Runtime: RuntimeAgyNative, Model: "pro"},
 			"verify":             cloneRoute(ext),
@@ -240,6 +268,9 @@ func ValidateProfiles(cfg ProfilesConfig) error {
 			}
 		}
 		for roleName, route := range prof.Roles {
+			if roleName == RoleOrchestrator && route.Runtime != RuntimeAgyNative {
+				return fmt.Errorf("profile %q role %q: runtime %q is not allowed (Antigravity CLI runs odd-orchestrator as the native main agent; must be %q)", profName, roleName, route.Runtime, RuntimeAgyNative)
+			}
 			if err := validateTarget(cfg.Providers, RoleTarget{
 				Runtime:  route.Runtime,
 				Provider: route.Provider,
@@ -248,6 +279,9 @@ func ValidateProfiles(cfg ProfilesConfig) error {
 				return fmt.Errorf("profile %q role %q: %w", profName, roleName, err)
 			}
 			for i, fb := range route.Fallback {
+				if roleName == RoleOrchestrator && fb.Runtime != RuntimeAgyNative {
+					return fmt.Errorf("profile %q role %q fallback[%d]: runtime %q is not allowed for orchestrator (must be %q)", profName, roleName, i, fb.Runtime, RuntimeAgyNative)
+				}
 				if err := validateTarget(cfg.Providers, fb); err != nil {
 					return fmt.Errorf("profile %q role %q fallback[%d]: %w", profName, roleName, i, err)
 				}
@@ -261,6 +295,9 @@ func ValidateProfiles(cfg ProfilesConfig) error {
 func validateTarget(providers map[string]ProviderConfig, t RoleTarget) error {
 	if strings.TrimSpace(t.Model) == "" {
 		return errors.New("model must not be empty")
+	}
+	if hasControlChar(t.Model) {
+		return errors.New("model must not contain control characters or newlines")
 	}
 	switch t.Runtime {
 	case RuntimeAgyNative:
@@ -280,6 +317,15 @@ func validateTarget(providers map[string]ProviderConfig, t RoleTarget) error {
 	return nil
 }
 
+func hasControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
 // LoadProfiles reads .agents/odd/profiles.json under cwd, returning DefaultProfilesConfig if missing.
 func LoadProfiles(cwd string) (ProfilesConfig, error) {
 	path := ProfilesPath(cwd)
@@ -294,6 +340,17 @@ func LoadProfiles(cwd string) (ProfilesConfig, error) {
 	var cfg ProfilesConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return ProfilesConfig{}, fmt.Errorf("parse profiles %s: %w", path, err)
+	}
+	for profName, prof := range cfg.Profiles {
+		if prof.Roles != nil {
+			if _, ok := prof.Roles[RoleOrchestrator]; !ok {
+				prof.Roles[RoleOrchestrator] = RoleRoute{
+					Runtime: RuntimeAgyNative,
+					Model:   "inherit",
+				}
+				cfg.Profiles[profName] = prof
+			}
+		}
 	}
 	if err := ValidateProfiles(cfg); err != nil {
 		return ProfilesConfig{}, fmt.Errorf("validate profiles %s: %w", path, err)
