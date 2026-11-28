@@ -246,8 +246,8 @@ func runInit(args []string, stdout, stderr io.Writer, cwd string) int {
 		return exitError
 	}
 	if allowMCP {
-		fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t globalMCP=enabled settings=%s mcpConfig=%s)\n",
-			len(res.InstalledFiles), res.ManifestPath, res.PreservedConfig, res.AddedEngramMCP, res.GlobalSettingsPath, res.GlobalMCPConfigPath)
+		fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t globalMCP=enabled settings=%s appConfig=%s mcpConfig=%s)\n",
+			len(res.InstalledFiles), res.ManifestPath, res.PreservedConfig, res.AddedEngramMCP, res.GlobalSettingsPath, res.GlobalAppConfigPath, res.GlobalMCPConfigPath)
 		return exitOK
 	}
 	fmt.Fprintf(stdout, "initialized %d asset(s) under .agents/ (manifest=%s preservedConfig=%t engramMCP=%t)\n",
@@ -498,6 +498,11 @@ func runPermissions(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "odd-agy permissions status: %v\n", err)
 			return exitError
 		}
+		appEnabled, err := installer.CheckGlobalAppMCPPermissions("")
+		if err != nil {
+			fmt.Fprintf(stderr, "odd-agy permissions status: %v\n", err)
+			return exitError
+		}
 		registered, regCmd, err := installer.GlobalMCPServerRegistered("")
 		if err != nil {
 			fmt.Fprintf(stderr, "odd-agy permissions status: %v\n", err)
@@ -507,11 +512,16 @@ func runPermissions(args []string, stdout, stderr io.Writer) int {
 		if enabled {
 			permState = "enabled"
 		}
+		appPermState := "disabled"
+		if appEnabled {
+			appPermState = "enabled"
+		}
 		regState := "unregistered"
 		if registered {
 			regState = fmt.Sprintf("registered command=%s", regCmd)
 		}
-		fmt.Fprintf(stdout, "global MCP permissions: %s (%s)\n", permState, installer.GlobalSettingsPath(""))
+		fmt.Fprintf(stdout, "global CLI MCP permissions: %s (%s)\n", permState, installer.GlobalSettingsPath(""))
+		fmt.Fprintf(stdout, "global Desktop App MCP permissions: %s (%s)\n", appPermState, installer.GlobalAppConfigPath(""))
 		fmt.Fprintf(stdout, "global MCP registration: %s (%s)\n", regState, installer.GlobalMCPConfigPath(""))
 		return exitOK
 
@@ -526,6 +536,10 @@ func runPermissions(args []string, stdout, stderr io.Writer) int {
 		if permRes.BackupPath != "" {
 			fmt.Fprintf(stdout, " backup=%s", permRes.BackupPath)
 		}
+		fmt.Fprintf(stdout, "; appConfig=%s appChanged=%t", permRes.AppConfigPath, permRes.AppChanged)
+		if permRes.AppBackupPath != "" {
+			fmt.Fprintf(stdout, " appBackup=%s", permRes.AppBackupPath)
+		}
 		fmt.Fprintf(stdout, "; mcpConfig=%s command=%s changed=%t", regRes.ConfigPath, regRes.Command, regRes.Changed)
 		if regRes.BackupPath != "" {
 			fmt.Fprintf(stdout, " mcpBackup=%s", regRes.BackupPath)
@@ -539,8 +553,15 @@ func runPermissions(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "odd-agy permissions %s: %v\n", sub, err)
 			return exitError
 		}
-		fmt.Fprintf(stdout, "global MCP permissions revoked (settings=%s changed=%t; mcpConfig=%s changed=%t",
-			permRes.SettingsPath, permRes.Changed, regRes.ConfigPath, regRes.Changed)
+		fmt.Fprintf(stdout, "global MCP permissions revoked (settings=%s changed=%t", permRes.SettingsPath, permRes.Changed)
+		if permRes.BackupPath != "" {
+			fmt.Fprintf(stdout, " backup=%s", permRes.BackupPath)
+		}
+		fmt.Fprintf(stdout, "; appConfig=%s appChanged=%t", permRes.AppConfigPath, permRes.AppChanged)
+		if permRes.AppBackupPath != "" {
+			fmt.Fprintf(stdout, " appBackup=%s", permRes.AppBackupPath)
+		}
+		fmt.Fprintf(stdout, "; mcpConfig=%s changed=%t", regRes.ConfigPath, regRes.Changed)
 		if regRes.BackupPath != "" {
 			fmt.Fprintf(stdout, " mcpBackup=%s", regRes.BackupPath)
 		}
