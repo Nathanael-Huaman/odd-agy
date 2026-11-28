@@ -1609,3 +1609,306 @@ func TestChatCompletionsSSEErrorAndEmptyChoicesRedactAPIKey(t *testing.T) {
 	})
 }
 
+type mockReviewHost struct {
+	eng *rdd.Engine
+}
+
+func (m *mockReviewHost) Scope(lineageID string, cursor int) (any, error) {
+	return m.eng.Scope(lineageID, cursor, 0)
+}
+
+func (m *mockReviewHost) Submit(lineageID, role string, findings []rdd.Finding, verdicts []rdd.RefuterVerdict) (any, error) {
+	return m.eng.Submit(rdd.SubmitRequest{
+		LineageID: lineageID,
+		Lens:      role,
+		Findings:  findings,
+		Verdicts:  verdicts,
+	})
+}
+
+func TestExternalReviewRoleWithReviewHostUsesFrozenScopeAndSubmitsDirectly(t *testing.T) {
+	repo := initTestGitRepo(t)
+	writeRepoFile(t, repo, "src/app.go", "package src\n\nfunc Value() int {\n\treturn 99\n}\n")
+
+	eng := rdd.NewEngine(repo)
+	startRes, err := eng.Start(rdd.StartRequest{
+		Lenses:       []string{"risk", "reliability"},
+		LensesReason: "check Value change",
+	})
+	if err != nil {
+		t.Fatalf("rdd.Start: %v", err)
+	}
+	if _, err := eng.AnswerConsent(startRes.LineageID, "granted"); err != nil {
+		t.Fatalf("rdd.AnswerConsent: %v", err)
+	}
+
+	var step atomic.Int32
+	var seenToolNames []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		n := step.Add(1)
+		if n == 1 {
+			for _, item := range payload["tools"].([]any) {
+				seenToolNames = append(seenToolNames, item.(map[string]any)["function"].(map[string]any)["name"].(string))
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch n {
+		case 1:
+			// Attempt to call forbidden live-tree read_file tool AND read_review_scope with omitted lineageId (bound from task).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "r1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading scope",
+						"tool_calls": []map[string]any{
+							{
+								"id":   "call_forbidden",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "read_file",
+									"arguments": `{"path":"src/app.go"}`,
+								},
+							},
+							{
+								"id":   "call_forbidden_list",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "list_files",
+									"arguments": `{}`,
+								},
+							},
+							{
+								"id":   "call_forbidden_shell",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "run_shell",
+									"arguments": `{"command":"cat src/app.go"}`,
+								},
+							},
+							{
+								"id":   "call_forbidden_write",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "write_file",
+									"arguments": `{"path":"src/app.go","content":"x"}`,
+								},
+							},
+							{
+								"id":   "call_forbidden_edit",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "edit_file",
+									"arguments": `{"path":"src/app.go","oldText":"99","newText":"1"}`,
+								},
+							},
+							{
+								"id":   "call_scope",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "read_review_scope",
+									"arguments": `{"cursor":0}`,
+								},
+							},
+						},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		case 2:
+			// Submit a BLOCKER finding directly via submit_review_findings (with omitted lineageId).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "r2", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submitting findings",
+						"tool_calls": []map[string]any{{
+							"id":   "call_submit",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": `{"findings":[{"id":"RISK-1","severity":"BLOCKER","causality":"candidate","location":"src/app.go:4","claim":"returns magic 99"}]}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "r3", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "Submitted review-risk findings.",
+						"reasoning_content": "done",
+					},
+					"finish_reason": "stop",
+				}},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{
+		RepoRoot: repo,
+		ReviewHost: &mockReviewHost{
+			eng: eng,
+		},
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-key", true
+			}
+			return "", false
+		},
+	})
+
+	// LineageID omitted in RunRequest, extracted from task text as convenience fallback.
+	rec, err := runner.Run(context.Background(), RunRequest{
+		Role: "review-risk",
+		Task: "Inspect frozen snapshot for " + startRes.LineageID + " and submit findings.",
+	})
+	if err != nil {
+		t.Fatalf("Runner.Run(review-risk) failed: %v", err)
+	}
+	if rec.Status != TaskStatusCompleted {
+		t.Fatalf("status = %q, want completed (%s)", rec.Status, rec.Error)
+	}
+	if !rec.SubmittedToLineage {
+		t.Fatalf("expected SubmittedToLineage=true, got false")
+	}
+
+	// Verify ONLY read_review_scope and submit_review_findings were exposed.
+	if len(seenToolNames) != 2 {
+		t.Fatalf("expected exactly 2 tools for review-risk with ReviewHost, got %v", seenToolNames)
+	}
+	toolSet := map[string]bool{}
+	for _, n := range seenToolNames {
+		toolSet[n] = true
+	}
+	if !toolSet["read_review_scope"] || !toolSet["submit_review_findings"] {
+		t.Fatalf("unexpected tool set for review-risk: %v", seenToolNames)
+	}
+
+	// Verify forbidden live-tree tool rejections and read_review_scope content.
+	rejectedTools := map[string]bool{}
+	var sawScopeOutput bool
+	for _, m := range rec.Messages {
+		if m.Role == "tool" && strings.Contains(m.Content, "not permitted") {
+			rejectedTools[m.Name] = true
+		}
+		if m.Role == "tool" && m.Name == "read_review_scope" && strings.Contains(m.Content, "src/app.go") {
+			sawScopeOutput = true
+		}
+	}
+	for _, forbidden := range []string{"read_file", "list_files", "run_shell", "write_file", "edit_file"} {
+		if !rejectedTools[forbidden] {
+			t.Fatalf("expected %q tool call to be rejected for review-risk", forbidden)
+		}
+	}
+	if !sawScopeOutput {
+		t.Fatal("expected read_review_scope tool output to contain src/app.go")
+	}
+
+	// Verify finding was actually recorded in rdd.Engine under "risk" lens as SEVERE blocker.
+	st, err := eng.Status(startRes.LineageID)
+	if err != nil {
+		t.Fatalf("eng.Status: %v", err)
+	}
+	if len(st.CompletedLenses) != 1 || st.CompletedLenses[0] != "risk" {
+		t.Fatalf("CompletedLenses = %v, want [risk]", st.CompletedLenses)
+	}
+	if len(st.Blockers) != 1 || st.Blockers[0].ID != "RISK-1" || st.Blockers[0].Severity != rdd.SeveritySEVERE {
+		t.Fatalf("Blockers = %+v, want [RISK-1 SEVERE]", st.Blockers)
+	}
+
+	// Complete reliability lens, then run review-refuter with explicit LineageID to confirm refuter submission.
+	if _, err := eng.Submit(rdd.SubmitRequest{LineageID: startRes.LineageID, Lens: "reliability"}); err != nil {
+		t.Fatalf("Submit reliability: %v", err)
+	}
+
+	var refStep atomic.Int32
+	refSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := refStep.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "ref1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "refuting RISK-1",
+						"tool_calls": []map[string]any{{
+							"id":   "call_ref_submit",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": `{"refuterVerdicts":[{"findingId":"RISK-1","verdict":"refuted","rationale":"false positive"}]}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "ref2", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role":              "assistant",
+					"content":           "Refuter finished.",
+					"reasoning_content": "done",
+				},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer refSrv.Close()
+
+	ds.BaseURL = refSrv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles(refSrv): %v", err)
+	}
+
+	refRec, err := runner.Run(context.Background(), RunRequest{
+		Role:      "review-refuter",
+		LineageID: startRes.LineageID,
+		Task:      "Refute or confirm blockers.",
+	})
+	if err != nil {
+		t.Fatalf("Runner.Run(review-refuter) failed: %v", err)
+	}
+	if refRec.Status != TaskStatusCompleted || !refRec.SubmittedToLineage {
+		t.Fatalf("unexpected review-refuter result: %+v", refRec)
+	}
+	stAfterRef, err := eng.Status(startRes.LineageID)
+	if err != nil {
+		t.Fatalf("eng.Status after refuter: %v", err)
+	}
+	if stAfterRef.Status != rdd.StatusApprovedPending {
+		t.Fatalf("status after refuter = %q, want %q", stAfterRef.Status, rdd.StatusApprovedPending)
+	}
+}
+

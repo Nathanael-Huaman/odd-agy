@@ -137,8 +137,15 @@ Running `odd-agy init` installs:
 ### Unified MCP Server (`odd-agy mcp`)
 
 - **Todo**: `todo` (`write`, `add`, `update`, `list`, `clear`) persisted under `.git/odd-agy/todo.json`.
-- **Frozen-Snapshot RDD**: `odd_review_mode`, `odd_review_assess`, `odd_review_start`, `odd_review_consent`, `odd_review_scope` (paginated + SHA-256 verified), `odd_review_submit` (4R lenses + refuter, max 1 correction), `odd_review_apply_correction`, `odd_review_status`, `odd_review_ack`.
-- **Sandboxed External Runner**: `odd_external_profiles`, `odd_external_run`, `odd_external_continue`, `odd_external_status` — enforces `## Allowed edit surfaces` in code, blocks secrets/destructive commands/`git push`, and persists `reasoning_content` history under `.git/odd-agy/tasks/<taskId>.json`.
+- **Frozen-Snapshot RDD**: `odd_review_mode`, `odd_review_assess`, `odd_review_start`, `odd_review_consent` (always preceded by a plain-language explanation of risk tier, lenses, and consent impact), `odd_review_scope` (paginated + SHA-256 verified), `odd_review_submit` (strict `id`/`severity`/`causality`/`location`/`claim` schema for 4R lenses + refuter, max 1 correction), `odd_review_apply_correction`, `odd_review_status`, `odd_review_ack`.
+- **Sandboxed External Runner**: `odd_external_profiles`, `odd_external_run`, `odd_external_continue`, `odd_external_status` — executes concurrent MCP requests in parallel, enforces `## Allowed edit surfaces` in code, blocks secrets/destructive commands/`git push`, and persists `reasoning_content` history under `.git/odd-agy/tasks/<taskId>.json`. For `review-*` roles given `lineageId`, reviewers run in a frozen-snapshot-only sandbox (`read_review_scope` with sensitive-file redaction + direct `submit_review_findings`, returning `submittedToLineage: true`).
+
+### What's New in `v0.1.2`
+
+- **Concurrent MCP dispatch**: The stdio MCP server handles parallel tool calls concurrently so multiple `review-*` lenses execute in parallel.
+- **Frozen-snapshot-only external reviewer sandbox**: Passing `lineageId` to `odd_external_run` for `review-*` roles restricts the reviewer to `read_review_scope` (with sensitive-file content redaction) and direct `submit_review_findings` (`submittedToLineage: true`), preventing live-worktree reads or manual finding copying.
+- **Strict `odd_review_submit` schema**: Enforces structured `id`, `severity` (`BLOCKER`/`SEVERE`/`WARNING`/`SUGGESTION`), `causality` (`candidate`/`pre_existing`/`unknown`), `location` (`file:line`), and `claim` fields.
+- **Aligned pre-consent & `Risk:` closing protocol**: Rules, skills, and orchestrator prompts require explaining risk tier, lenses, and grant/decline impact before invoking `odd_review_consent`, and closing code-changing replies with `Risk: none` or `Risk: item N (<short reason>)`.
 
 ---
 

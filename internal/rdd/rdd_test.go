@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
@@ -811,6 +812,169 @@ func TestAssessIgnoresUntrackedAgentsHarnessButTracksCommittedAgentsEdits(t *tes
 	}
 	if trackedRes.Risk != RiskHigh || !trackedRes.ReviewDue {
 		t.Fatalf("expected RiskHigh and ReviewDue=true for modified tracked .agents/hooks.json, got %+v", trackedRes)
+	}
+}
+
+func TestScopeRedactsSensitiveFilesAndIsConcurrencySafe(t *testing.T) {
+	dir := initTempRepo(t)
+	eng := NewEngine(dir)
+
+	writeFile(t, dir, "src/app.go", "package src\nfunc Run() int { return 1 }\n", 0o644)
+	writeFile(t, dir, ".env", "OLD_SECRET=initial-secret\n", 0o644)
+	runGit(t, dir, "add", "src/app.go", ".env")
+	runGit(t, dir, "commit", "-m", "base")
+
+	// Modify .env, add .env.production, certs, secrets.json, ssh keys, and code file.
+	writeFile(t, dir, "src/app.go", "package src\nfunc Run() int { return 2 }\n", 0o644)
+	writeFile(t, dir, ".env", "API_KEY=super-secret-env-val\n", 0o644)
+	writeFile(t, dir, ".env.production", "PROD_KEY=prod-secret-val\n", 0o644)
+	writeFile(t, dir, "certs/server.key", "PRIVATE-KEY-MATERIAL\n", 0o644)
+	writeFile(t, dir, "certs/ca.pem", "PEM-CERT-MATERIAL\n", 0o644)
+	writeFile(t, dir, "secrets.json", `{"token":"json-secret-val"}`+"\n", 0o644)
+	writeFile(t, dir, "keys/id_rsa", "SSH-RSA-SECRET\n", 0o644)
+	writeFile(t, dir, "keys/id_ed25519", "SSH-ED25519-SECRET\n", 0o644)
+
+	assessRes, err := eng.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess failed: %v", err)
+	}
+	if assessRes.Risk != RiskHigh || !assessRes.ReviewDue {
+		t.Fatalf("expected RiskHigh and ReviewDue=true, got %+v", assessRes)
+	}
+
+	// Also verify .env.production alone (without .env) is classified RiskHigh.
+	dir2 := initTempRepo(t)
+	eng2 := NewEngine(dir2)
+	writeFile(t, dir2, "README.md", "# Hi\n", 0o644)
+	runGit(t, dir2, "add", "README.md")
+	runGit(t, dir2, "commit", "-m", "base")
+	writeFile(t, dir2, "keys/id_ed25519", "SSH-ED25519-SECRET\n", 0o644)
+	assess2, err := eng2.Assess(AssessRequest{})
+	if err != nil {
+		t.Fatalf("Assess dir2 failed: %v", err)
+	}
+	if assess2.Risk != RiskHigh {
+		t.Fatalf("expected RiskHigh for keys/id_ed25519, got %+v", assess2)
+	}
+
+	st, err := eng.Start(StartRequest{
+		Lenses:       []string{"risk", "resilience", "readability"},
+		LensesReason: "check redaction and concurrency",
+	})
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if _, err := eng.AnswerConsent(st.LineageID, "granted"); err != nil {
+		t.Fatalf("AnswerConsent failed: %v", err)
+	}
+
+	page, err := eng.Scope(st.LineageID, 0, 50)
+	if err != nil {
+		t.Fatalf("Scope failed: %v", err)
+	}
+
+	sensitivePaths := map[string]bool{
+		".env":               true,
+		".env.production":    true,
+		"certs/server.key":   true,
+		"certs/ca.pem":       true,
+		"secrets.json":       true,
+		"keys/id_rsa":        true,
+		"keys/id_ed25519":    true,
+	}
+	secretNeedles := []string{
+		"super-secret-env-val",
+		"prod-secret-val",
+		"PRIVATE-KEY-MATERIAL",
+		"PEM-CERT-MATERIAL",
+		"json-secret-val",
+		"SSH-RSA-SECRET",
+		"SSH-ED25519-SECRET",
+	}
+
+	seenSensitive := 0
+	sawAppGo := false
+	for _, f := range page.Files {
+		if f.Path == "src/app.go" {
+			sawAppGo = true
+			if !strings.Contains(f.Content, "return 2") {
+				t.Fatalf("expected src/app.go unredacted content, got %q", f.Content)
+			}
+		}
+		if sensitivePaths[f.Path] {
+			seenSensitive++
+			if f.Content != "[REDACTED SENSITIVE FILE CONTENT]" {
+				t.Fatalf("sensitive file %s content = %q, want [REDACTED SENSITIVE FILE CONTENT]", f.Path, f.Content)
+			}
+			if f.Diff != "[REDACTED SENSITIVE FILE CONTENT]" {
+				t.Fatalf("sensitive file %s diff = %q, want [REDACTED SENSITIVE FILE CONTENT]", f.Path, f.Diff)
+			}
+			for _, needle := range secretNeedles {
+				if strings.Contains(f.Content, needle) || strings.Contains(f.Diff, needle) {
+					t.Fatalf("sensitive file %s leaked secret %q", f.Path, needle)
+				}
+			}
+		}
+	}
+	if !sawAppGo {
+		t.Fatal("expected src/app.go in Scope output")
+	}
+	if seenSensitive != len(sensitivePaths) {
+		t.Fatalf("seenSensitive = %d, want %d", seenSensitive, len(sensitivePaths))
+	}
+
+	// Concurrent Scope + Status + Submit under -race.
+	var wg sync.WaitGroup
+	lenses := []string{"risk", "resilience", "readability"}
+	errs := make(chan error, 20)
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := eng.Scope(st.LineageID, 0, 5); err != nil {
+				errs <- err
+			}
+			if _, err := eng.Status(st.LineageID); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	for _, l := range lenses {
+		lens := l
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := eng.Submit(SubmitRequest{LineageID: st.LineageID, Lens: lens}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent engine call failed: %v", err)
+	}
+
+	// Verify deleted sensitive file also has its Diff redacted in Scope.
+	dirDel := initTempRepo(t)
+	engDel := NewEngine(dirDel)
+	writeFile(t, dirDel, ".env", "DELETED_SECRET=must-not-appear-in-diff\n", 0o644)
+	runGit(t, dirDel, "add", ".env")
+	runGit(t, dirDel, "commit", "-m", "add env")
+	runGit(t, dirDel, "rm", ".env")
+	stDel, err := engDel.Start(StartRequest{Lenses: []string{"risk"}, LensesReason: "deleted env check"})
+	if err != nil {
+		t.Fatalf("Start deleted env: %v", err)
+	}
+	if _, err := engDel.AnswerConsent(stDel.LineageID, "granted"); err != nil {
+		t.Fatalf("AnswerConsent deleted env: %v", err)
+	}
+	delPage, err := engDel.Scope(stDel.LineageID, 0, 10)
+	if err != nil {
+		t.Fatalf("Scope deleted env: %v", err)
+	}
+	if len(delPage.Files) != 1 || delPage.Files[0].Status != "D" || delPage.Files[0].Diff != "[REDACTED SENSITIVE FILE CONTENT]" {
+		t.Fatalf("expected deleted .env diff redacted while preserving Status=D, got %+v", delPage.Files)
 	}
 }
 

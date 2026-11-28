@@ -19,7 +19,8 @@ import (
 )
 
 const (
-	protocolVersion = "2024-11-05"
+	protocolVersion       = "2024-11-05"
+	maxConcurrentRequests = 8
 
 	errCodeParse          = -32700
 	errCodeInvalidRequest = -32600
@@ -44,20 +45,40 @@ type Server struct {
 	writeMu   sync.Mutex
 }
 
+type serverReviewHost struct {
+	rdd *rdd.Engine
+}
+
+func (h *serverReviewHost) Scope(lineageID string, cursor int) (any, error) {
+	return h.rdd.Scope(lineageID, cursor, 0)
+}
+
+func (h *serverReviewHost) Submit(lineageID, role string, findings []rdd.Finding, verdicts []rdd.RefuterVerdict) (any, error) {
+	lens := strings.TrimPrefix(strings.TrimSpace(role), "review-")
+	return h.rdd.Submit(rdd.SubmitRequest{
+		LineageID: lineageID,
+		Lens:      lens,
+		Findings:  findings,
+		Verdicts:  verdicts,
+	})
+}
+
 // NewServer creates a Server rooted at cfg.Workspace.
 func NewServer(cfg ServerConfig) *Server {
 	ws := cfg.Workspace
 	if strings.TrimSpace(ws) == "" {
 		ws, _ = os.Getwd()
 	}
+	eng := rdd.NewEngine(ws)
 	return &Server{
 		workspace: ws,
 		todos:     todo.NewStore(ws),
-		rdd:       rdd.NewEngine(ws),
+		rdd:       eng,
 		runner: llm.NewRunner(llm.RunnerConfig{
-			RepoRoot:  ws,
-			Client:    cfg.LLMClient,
-			LookupEnv: cfg.LookupEnv,
+			RepoRoot:   ws,
+			Client:     cfg.LLMClient,
+			LookupEnv:  cfg.LookupEnv,
+			ReviewHost: &serverReviewHost{rdd: eng},
 		}),
 	}
 }
@@ -69,31 +90,164 @@ func (s *Server) ServeStdio(ctx context.Context) error {
 
 // Serve runs the JSON-RPC 2.0 loop over r and w until r reaches EOF or ctx is canceled.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+
+	type readItem struct {
+		line []byte
+		err  error
+	}
+
 	reader := bufio.NewReader(r)
-
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) > 0 {
-				if resp := s.handleRawMessage(ctx, trimmed); resp != nil {
-					if writeErr := s.writeResponse(w, resp); writeErr != nil {
-						return writeErr
+	lines := make(chan readItem)
+	go func() {
+		defer close(lines)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				trimmed := bytes.TrimSpace(line)
+				if len(trimmed) > 0 {
+					cp := append([]byte(nil), trimmed...)
+					select {
+					case lines <- readItem{line: cp}:
+					case <-serveCtx.Done():
+						return
 					}
 				}
 			}
-		}
-
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+			if err != nil {
+				select {
+				case lines <- readItem{err: err}:
+				case <-serveCtx.Done():
+				}
+				return
 			}
-			return fmt.Errorf("read mcp input: %w", err)
 		}
+	}()
+
+	sem := make(chan struct{}, maxConcurrentRequests)
+	var wg sync.WaitGroup
+	var writeErrMu sync.Mutex
+	var firstWriteErr error
+
+	recordWriteErr := func(err error) {
+		if err == nil {
+			return
+		}
+		writeErrMu.Lock()
+		if firstWriteErr == nil {
+			firstWriteErr = err
+			cancelServe()
+		}
+		writeErrMu.Unlock()
+	}
+
+	getWriteErr := func() error {
+		writeErrMu.Lock()
+		defer writeErrMu.Unlock()
+		return firstWriteErr
+	}
+
+	for {
+		select {
+		case <-serveCtx.Done():
+			wg.Wait()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if wErr := getWriteErr(); wErr != nil {
+				return wErr
+			}
+			return serveCtx.Err()
+
+		case item, ok := <-lines:
+			if !ok {
+				wg.Wait()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return getWriteErr()
+			}
+			if item.err != nil {
+				wg.Wait()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if wErr := getWriteErr(); wErr != nil {
+					return wErr
+				}
+				if errors.Is(item.err, io.EOF) {
+					return nil
+				}
+				return fmt.Errorf("read mcp input: %w", item.err)
+			}
+
+			if isConcurrentMethod(item.line) {
+				select {
+				case sem <- struct{}{}:
+				case <-serveCtx.Done():
+					wg.Wait()
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					if wErr := getWriteErr(); wErr != nil {
+						return wErr
+					}
+					return serveCtx.Err()
+				}
+				wg.Add(1)
+				go func(raw []byte) {
+					defer func() {
+						<-sem
+						wg.Done()
+					}()
+					if resp := s.handleRawMessage(serveCtx, raw); resp != nil {
+						if writeErr := s.writeResponse(w, resp); writeErr != nil {
+							recordWriteErr(writeErr)
+						}
+					}
+				}(item.line)
+				continue
+			}
+
+			if resp := s.handleRawMessage(serveCtx, item.line); resp != nil {
+				if writeErr := s.writeResponse(w, resp); writeErr != nil {
+					recordWriteErr(writeErr)
+					wg.Wait()
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return getWriteErr()
+				}
+			}
+		}
+	}
+}
+
+func isConcurrentMethod(raw []byte) bool {
+	var peek struct {
+		ID     json.RawMessage `json:"id,omitempty"`
+		Method string          `json:"method"`
+	}
+	if err := json.Unmarshal(raw, &peek); err != nil {
+		return false
+	}
+	trimmedID := bytes.TrimSpace(peek.ID)
+	if len(trimmedID) == 0 || string(trimmedID) == "null" {
+		return false
+	}
+	if strings.HasPrefix(peek.Method, "notifications/") {
+		return false
+	}
+	switch peek.Method {
+	case "", "initialize", "ping", "tools/list":
+		return false
+	default:
+		return true
 	}
 }
 
@@ -442,6 +596,9 @@ func (s *Server) handleReviewSubmit(rawArgs json.RawMessage) (callToolResult, *r
 		}
 
 		sev := strings.ToUpper(strings.TrimSpace(f.Severity))
+		if sev == "BLOCKER" {
+			sev = rdd.SeveritySEVERE
+		}
 		findings = append(findings, rdd.Finding{
 			ID:        f.ID,
 			Severity:  sev,
@@ -523,6 +680,7 @@ func (s *Server) handleExternalRun(ctx context.Context, rawArgs json.RawMessage)
 	var args struct {
 		Role            string   `json:"role"`
 		Task            string   `json:"task"`
+		LineageID       string   `json:"lineageId"`
 		Provider        string   `json:"provider"`
 		Model           string   `json:"model"`
 		MaxTurns        int      `json:"maxTurns"`
@@ -534,6 +692,7 @@ func (s *Server) handleExternalRun(ctx context.Context, rawArgs json.RawMessage)
 	res, err := s.runner.Run(ctx, llm.RunRequest{
 		Role:            args.Role,
 		Task:            args.Task,
+		LineageID:       args.LineageID,
 		Provider:        args.Provider,
 		Model:           args.Model,
 		MaxTurns:        args.MaxTurns,
@@ -698,10 +857,36 @@ func (s *Server) toolDefinitions() []toolSpec {
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"lineageId":       map[string]any{"type": "string"},
-					"role":            map[string]any{"type": "string"},
-					"findings":        map[string]any{"type": "array"},
-					"refuterVerdicts": map[string]any{"type": "array"},
+					"lineageId": map[string]any{"type": "string", "description": "RDD review lineage ID"},
+					"role":      map[string]any{"type": "string", "description": "Reviewer role or lens (risk, resilience, readability, reliability, refuter)"},
+					"findings": map[string]any{
+						"type":        "array",
+						"description": "Structured findings for a 4R lens (empty array if none)",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"id":        map[string]any{"type": "string", "description": "Unique finding identifier"},
+								"severity":  map[string]any{"type": "string", "enum": []string{"BLOCKER", "WARNING", "SUGGESTION"}},
+								"causality": map[string]any{"type": "string", "enum": []string{"candidate", "pre_existing", "unknown"}},
+								"location":  map[string]any{"type": "string", "description": "file:line"},
+								"claim":     map[string]any{"type": "string", "description": "Concise evidence-backed finding"},
+							},
+							"required": []string{"id", "severity", "causality", "location", "claim"},
+						},
+					},
+					"refuterVerdicts": map[string]any{
+						"type":        "array",
+						"description": "Refuter verdicts for severe blockers when role is refuter",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"findingId": map[string]any{"type": "string"},
+								"verdict":   map[string]any{"type": "string", "enum": []string{"confirmed", "refuted", "unknown"}},
+								"rationale": map[string]any{"type": "string"},
+							},
+							"required": []string{"findingId", "verdict"},
+						},
+					},
 				},
 				"required": []string{"lineageId", "role"},
 			},
@@ -755,6 +940,7 @@ func (s *Server) toolDefinitions() []toolSpec {
 				"properties": map[string]any{
 					"role":            map[string]any{"type": "string"},
 					"task":            map[string]any{"type": "string"},
+					"lineageId":       map[string]any{"type": "string", "description": "Optional RDD review lineage ID (recommended for review-* roles to bind frozen-snapshot inspection and direct finding submission)"},
 					"provider":        map[string]any{"type": "string"},
 					"model":           map[string]any{"type": "string"},
 					"maxTurns":        map[string]any{"type": "integer"},
