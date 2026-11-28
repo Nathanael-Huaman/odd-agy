@@ -266,7 +266,7 @@ func (m Model) renderProviders(b *strings.Builder) {
 
 func (m Model) renderActions(b *strings.Builder) {
 	globalMCPAction := "Allow MCP globally (~/.gemini)"
-	if m.globalMCPAllowed && m.globalMCPRegistered {
+	if m.globalPermsEnabled && m.globalAppPermsEnabled && m.globalMCPRegistered {
 		globalMCPAction = "Revoke global MCP rule & registration"
 	}
 	actions := []string{
@@ -284,15 +284,20 @@ func (m Model) renderActions(b *strings.Builder) {
 
 	b.WriteByte('\n')
 	permState := "disabled"
-	if m.globalMCPAllowed {
+	if m.globalPermsEnabled {
 		permState = "enabled"
+	}
+	appPermState := "disabled"
+	if m.globalAppPermsEnabled {
+		appPermState = "enabled"
 	}
 	regState := "not registered"
 	if m.globalMCPRegistered {
 		regState = fmt.Sprintf("registered (command=%s)", m.globalMCPCommand)
 	}
 	b.WriteString("Global ~/.gemini/ Status:\n")
-	b.WriteString(fmt.Sprintf("  Permissions (%s): %s\n", installer.GlobalSettingsPath(m.opts.HomeDir), permState))
+	b.WriteString(fmt.Sprintf("  CLI Perms   (%s): %s\n", installer.GlobalSettingsPath(m.opts.HomeDir), permState))
+	b.WriteString(fmt.Sprintf("  App Perms   (%s): %s\n", installer.GlobalAppConfigPath(m.opts.HomeDir), appPermState))
 	b.WriteString(fmt.Sprintf("  MCP server  (%s): %s\n", installer.GlobalMCPConfigPath(m.opts.HomeDir), regState))
 
 	if m.doctorReport != nil {

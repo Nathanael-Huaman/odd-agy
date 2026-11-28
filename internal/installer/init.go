@@ -226,8 +226,10 @@ func Init(workspaceRoot string, opts InitOptions) (InitResult, error) {
 			return InitResult{}, fmt.Errorf("enable global MCP: %w", err)
 		}
 		out.GlobalMCPAllowed = permRes.Enabled
+		out.GlobalAppMCPAllowed = permRes.AppEnabled
 		out.GlobalMCPRegistered = regRes.Registered
 		out.GlobalSettingsPath = permRes.SettingsPath
+		out.GlobalAppConfigPath = permRes.AppConfigPath
 		out.GlobalMCPConfigPath = regRes.ConfigPath
 	}
 

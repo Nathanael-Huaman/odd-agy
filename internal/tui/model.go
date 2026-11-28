@@ -63,12 +63,13 @@ type Model struct {
 	cwd  string
 	opts Options
 
-	cfg                 config.Config
-	profiles            config.ProfilesConfig
-	installed           bool
-	globalMCPAllowed    bool
-	globalMCPRegistered bool
-	globalMCPCommand    string
+	cfg                   config.Config
+	profiles              config.ProfilesConfig
+	installed             bool
+	globalPermsEnabled    bool
+	globalAppPermsEnabled bool
+	globalMCPRegistered   bool
+	globalMCPCommand      string
 
 	screen        screenKind
 	cursor        int
@@ -142,9 +143,14 @@ func (m *Model) reload() {
 		m.installed = false
 	}
 	if allowed, err := installer.CheckGlobalMCPPermissions(m.opts.HomeDir); err == nil {
-		m.globalMCPAllowed = allowed
+		m.globalPermsEnabled = allowed
 	} else {
-		m.globalMCPAllowed = false
+		m.globalPermsEnabled = false
+	}
+	if appAllowed, err := installer.CheckGlobalAppMCPPermissions(m.opts.HomeDir); err == nil {
+		m.globalAppPermsEnabled = appAllowed
+	} else {
+		m.globalAppPermsEnabled = false
 	}
 	if registered, cmd, err := installer.GlobalMCPServerRegistered(m.opts.HomeDir); err == nil {
 		m.globalMCPRegistered = registered
@@ -827,8 +833,8 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 		m.errMsg = ""
 		m.statusMsg = "Confirm uninstall of managed .agents/ files"
 
-	case 4: // Toggle global MCP permissions + registration (~/.gemini/)
-		if m.globalMCPAllowed && m.globalMCPRegistered {
+	case 4: // Toggle global MCP permissions (CLI + Desktop App) + registration (~/.gemini/)
+		if m.globalPermsEnabled && m.globalAppPermsEnabled && m.globalMCPRegistered {
 			permRes, regRes, err := installer.DisableGlobalMCP(m.opts.HomeDir)
 			if err != nil {
 				m.reload()
@@ -837,7 +843,7 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 			}
 			m.reload()
 			m.errMsg = ""
-			m.statusMsg = fmt.Sprintf("Revoked global MCP permission & registration (%s, %s)", permRes.SettingsPath, regRes.ConfigPath)
+			m.statusMsg = fmt.Sprintf("Revoked global MCP permissions & registration (%s, %s, %s)", permRes.SettingsPath, permRes.AppConfigPath, regRes.ConfigPath)
 		} else {
 			permRes, regRes, err := installer.EnableGlobalMCP(m.opts.HomeDir, installer.ResolveBinaryPath(""))
 			if err != nil {
@@ -847,10 +853,10 @@ func (m Model) handleActionsKey(key string) (tea.Model, tea.Cmd) {
 			}
 			m.reload()
 			m.errMsg = ""
-			if permRes.BackupPath != "" || regRes.BackupPath != "" {
-				m.statusMsg = fmt.Sprintf("Allowed & registered MCP globally (backups created; %s, %s)", permRes.SettingsPath, regRes.ConfigPath)
+			if permRes.BackupPath != "" || permRes.AppBackupPath != "" || regRes.BackupPath != "" {
+				m.statusMsg = fmt.Sprintf("Allowed & registered MCP globally (backups created; %s, %s, %s)", permRes.SettingsPath, permRes.AppConfigPath, regRes.ConfigPath)
 			} else {
-				m.statusMsg = fmt.Sprintf("Allowed & registered MCP globally (%s, %s)", permRes.SettingsPath, regRes.ConfigPath)
+				m.statusMsg = fmt.Sprintf("Allowed & registered MCP globally (%s, %s, %s)", permRes.SettingsPath, permRes.AppConfigPath, regRes.ConfigPath)
 			}
 		}
 	}

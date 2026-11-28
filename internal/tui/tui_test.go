@@ -361,8 +361,8 @@ func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
 	if !strings.Contains(m.View(), "Allow MCP globally (~/.gemini)") {
 		t.Fatalf("expected Allow MCP globally action in Project Actions:\n%s", m.View())
 	}
-	if !strings.Contains(m.View(), "settings.json") || !strings.Contains(m.View(), "mcp_config.json") {
-		t.Fatalf("expected both settings.json and mcp_config.json status in Project Actions:\n%s", m.View())
+	if !strings.Contains(m.View(), "settings.json") || !strings.Contains(m.View(), "config.json") || !strings.Contains(m.View(), "mcp_config.json") {
+		t.Fatalf("expected settings.json, config.json, and mcp_config.json status in Project Actions:\n%s", m.View())
 	}
 
 	// Move down to Item 4: Allow MCP globally (~/.gemini)
@@ -375,6 +375,10 @@ func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
 	if err != nil || !enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after TUI grant = (%t, %v)", enabled, err)
 	}
+	appEnabled, err := installer.CheckGlobalAppMCPPermissions(home)
+	if err != nil || !appEnabled {
+		t.Fatalf("CheckGlobalAppMCPPermissions after TUI grant = (%t, %v)", appEnabled, err)
+	}
 	reg, _, err := installer.GlobalMCPServerRegistered(home)
 	if err != nil || !reg {
 		t.Fatalf("GlobalMCPServerRegistered after TUI grant = (%t, %v)", reg, err)
@@ -383,11 +387,15 @@ func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
 		t.Fatalf("expected Revoke global MCP rule label after grant:\n%s", m.View())
 	}
 
-	// Toggle again -> Revoke global MCP rule & unregister
+	// Toggle again -> Revoke global MCP rule & unregister across all 3 files
 	m = sendKey(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 	enabled, err = installer.CheckGlobalMCPPermissions(home)
 	if err != nil || enabled {
 		t.Fatalf("CheckGlobalMCPPermissions after TUI revoke = (%t, %v)", enabled, err)
+	}
+	appEnabled, err = installer.CheckGlobalAppMCPPermissions(home)
+	if err != nil || appEnabled {
+		t.Fatalf("CheckGlobalAppMCPPermissions after TUI revoke = (%t, %v)", appEnabled, err)
 	}
 	reg, _, err = installer.GlobalMCPServerRegistered(home)
 	if err != nil || reg {
@@ -395,6 +403,32 @@ func TestProjectActionsGlobalMCPGrantAndRevoke(t *testing.T) {
 	}
 	if !strings.Contains(m.View(), "Allow MCP globally (~/.gemini)") {
 		t.Fatalf("expected Allow MCP globally label after revoke:\n%s", m.View())
+	}
+
+	// Partial state (CLI + MCP enabled, App config.json disabled) -> action stays Allow and Enter enables all 3.
+	if _, err := installer.GrantGlobalMCPPermissions(home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.RegisterGlobalMCPServer(home, "odd-agy"); err != nil {
+		t.Fatal(err)
+	}
+	mPartial := NewModel(dir, testOptions(home, nil, nil))
+	for i := 0; i < 5; i++ {
+		mPartial = sendKey(t, mPartial, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	mPartial = sendKey(t, mPartial, tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(mPartial.View(), "Allow MCP globally (~/.gemini)") {
+		t.Fatalf("expected Allow label when App perms still disabled:\n%s", mPartial.View())
+	}
+	for i := 0; i < 4; i++ {
+		mPartial = sendKey(t, mPartial, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	mPartial = sendKey(t, mPartial, tea.KeyMsg{Type: tea.KeyEnter})
+	if appEnabled, err := installer.CheckGlobalAppMCPPermissions(home); err != nil || !appEnabled {
+		t.Fatalf("expected TUI partial toggle to enable App permissions: (%t, %v)", appEnabled, err)
+	}
+	if !strings.Contains(mPartial.View(), "Revoke global MCP rule") {
+		t.Fatalf("expected Revoke label after all 3 enabled:\n%s", mPartial.View())
 	}
 }
 

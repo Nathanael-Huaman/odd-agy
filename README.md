@@ -39,7 +39,7 @@ This keeps all permission rules 100% project-scoped (`mcp(odd-agy/*)` allowed, `
 
 ### Optional global opt-in (`--allow-mcp` / `odd-agy permissions`)
 
-Plain `odd-agy init` remains 100% project-scoped. If you prefer running `agy` directly without `odd-agy launch`, or need global registration for `external-mcp` / RDD tools, you can opt in to registering the `odd-agy` MCP server in `~/.gemini/config/mcp_config.json` and adding the MCP permission rules to `~/.gemini/antigravity-cli/settings.json` (creates timestamped `0600` `.odd-agy.bak.*` backups, enforces symlink guards, and preserves existing keys and rules):
+Plain `odd-agy init` remains 100% project-scoped. If you prefer running `agy` directly without `odd-agy launch`, or need global registration for `external-mcp` / RDD tools (including Antigravity Desktop App), you can opt in to registering the `odd-agy` MCP server in `~/.gemini/config/mcp_config.json` and adding the MCP permission rules to both Antigravity CLI (`~/.gemini/antigravity-cli/settings.json`) and Antigravity Desktop App (`~/.gemini/config/config.json`) (creates timestamped `0600` `.odd-agy.bak.*` backups, enforces symlink guards, and preserves existing keys and rules):
 
 ```bash
 odd-agy init --allow-mcp
@@ -68,7 +68,7 @@ Every TUI setting has an equivalent non-interactive CLI command:
 |---|---|
 | `odd-agy init [--mode=local\|standalone] [--delegation=full-delegation\|organic] [--profile=agy-oauth] [--binary=...] [--allow-mcp] [--force]` | Install `.agents/` rules, agents, skills, hooks, MCP config, and `.agents/odd/agy-session-settings.json` (use `--allow-mcp` only to opt into global `~/.gemini/antigravity-cli/settings.json`) |
 | `odd-agy launch [--agent=<name>] [--no-agent] [-- <extra agy args...>]` | Recommended zero-global-config launcher passing `--agent`, orchestrator `--model` / `--effort`, and `--settings <abs-path-to-.agents/odd/agy-session-settings.json>` to `agy` |
-| `odd-agy permissions [status\|enable\|disable\|allow-mcp\|revoke-mcp] [--binary=<path>]` | Inspect, grant, or revoke optional global `~/.gemini/` MCP permission rules and `~/.gemini/config/mcp_config.json` registration |
+| `odd-agy permissions [status\|enable\|disable\|allow-mcp\|revoke-mcp] [--binary=<path>]` | Inspect, grant, or revoke optional global `~/.gemini/` MCP permission rules (`antigravity-cli/settings.json` + `config/config.json`) and `~/.gemini/config/mcp_config.json` registration |
 | `odd-agy sync [--binary=...] [--force]` | Refresh managed `.agents/` files against `.agents/odd/.managed-manifest.json` |
 | `odd-agy doctor` | Verify `agy`, `engram`, `.agents/` assets, hooks, MCP config, provider readiness, and global `~/.gemini/` collisions |
 | `odd-agy uninstall` | Remove only managed `.agents/` files and `odd-agy` hook/MCP entries, keeping user entries intact |
@@ -142,6 +142,7 @@ Running `odd-agy init` installs:
 
 ### What's New in `v0.1.3`
 
+- **Antigravity Desktop App global permissions (`odd-agy permissions enable` / `--allow-mcp`)**: Also manages `userSettings.globalPermissionGrants` (`allow`: `mcp(odd-agy/*)`, `ask`: `mcp(odd-agy/odd_review_consent)`) inside `~/.gemini/config/config.json` alongside Antigravity CLI (`~/.gemini/antigravity-cli/settings.json`) and `~/.gemini/config/mcp_config.json`, preserving all existing keys and rules with timestamped `0600` backups and three-file symlink/JSON preflight.
 - **Antigravity Desktop App multi-project `workspaceRoot` & MCP `rootUri`**: All 15 MCP tools accept an optional `workspaceRoot` parameter and `initialize` adopts `rootUri`/`rootPath`/`workspaceFolders` when started in `/`, keeping per-workspace `todo`, RDD, and external runner state isolated across concurrent projects.
 - **Code-enforced parallel native lens batching (`PreToolUse`)**: `PreToolUse` blocks one-by-one `invoke_subagent` calls for pending `agy-native` 4R review lenses and requires launching all pending native lenses together in a single parallel batch (permitting single-lens calls only for `fallback_to_native` or a single remaining lens).
 - **Grouped external review tool (`odd_review_run_lenses`)**: Executes all pending `external-mcp` 4R lenses concurrently for a `lineageId`, aggregates submission results, and reports `nativeLensesPending` (including any `fallback_to_native` lenses) for single-batch native dispatch.

@@ -2317,4 +2317,397 @@ func TestGlobalMCPPermissionsRejectSymlinks(t *testing.T) {
 	}
 }
 
+func TestGlobalAppMCPPermissionsGrantCheckAndRevoke(t *testing.T) {
+	fakeHome := t.TempDir()
+	appCfgPath := GlobalAppConfigPath(fakeHome)
+	wantPath := filepath.Join(fakeHome, ".gemini", "config", "config.json")
+	if appCfgPath != wantPath {
+		t.Fatalf("GlobalAppConfigPath = %q, want %q", appCfgPath, wantPath)
+	}
+
+	// Missing file -> Check false, Revoke no-op.
+	enabled, err := CheckGlobalAppMCPPermissions(fakeHome)
+	if err != nil || enabled {
+		t.Fatalf("initial CheckGlobalAppMCPPermissions = (%t, %v), want (false, nil)", enabled, err)
+	}
+	rev0, err := RevokeGlobalAppMCPPermissions(fakeHome)
+	if err != nil || rev0.Changed || rev0.Enabled {
+		t.Fatalf("Revoke on missing = %+v, err=%v", rev0, err)
+	}
+
+	// Seed existing Desktop App config.json with plugins, sidecars, userSettings metadata, and existing rules.
+	if err := os.MkdirAll(filepath.Dir(appCfgPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := map[string]any{
+		"plugins":  map[string]any{"sample": map[string]any{"enabled": true}},
+		"sidecars": []string{"helper-a"},
+		"userSettings": map[string]any{
+			"permissionGrantsV2Migrated":  true,
+			"remoteControlHostname":       "workstation.local",
+			"sandboxEnabledAtV2Migration": true,
+			"globalPermissionGrants": map[string]any{
+				"allow": []string{"Bash(ls)"},
+				"ask":   []string{"Bash(git push)"},
+				"deny":  []string{"Bash(rm -rf *)"},
+			},
+		},
+	}
+	writeJSONFile(t, appCfgPath, original)
+	origBytes, err := os.ReadFile(appCfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Grant creates 0600 backup, preserves all unrelated keys & rules, sets 0600.
+	grant1, err := GrantGlobalAppMCPPermissions(fakeHome)
+	if err != nil {
+		t.Fatalf("GrantGlobalAppMCPPermissions: %v", err)
+	}
+	if !grant1.Changed || !grant1.Enabled || grant1.BackupPath == "" {
+		t.Fatalf("unexpected grant1 result: %+v", grant1)
+	}
+	if !strings.HasPrefix(grant1.BackupPath, appCfgPath+".odd-agy.bak.") {
+		t.Fatalf("unexpected backup path: %q", grant1.BackupPath)
+	}
+	bakInfo, err := os.Stat(grant1.BackupPath)
+	if err != nil {
+		t.Fatalf("stat backup: %v", err)
+	}
+	if bakInfo.Mode().Perm() != 0o600 {
+		t.Errorf("backup perm = %o, want 0600", bakInfo.Mode().Perm())
+	}
+	bakBytes, err := os.ReadFile(grant1.BackupPath)
+	if err != nil || string(bakBytes) != string(origBytes) {
+		t.Fatalf("backup mismatch: err=%v\ngot:\n%s\nwant:\n%s", err, bakBytes, origBytes)
+	}
+
+	info, err := os.Stat(appCfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("config.json perm = %o, want 0600", info.Mode().Perm())
+	}
+
+	doc := readJSONFile(t, appCfgPath)
+	if plugins, ok := doc["plugins"].(map[string]any); !ok || plugins["sample"] == nil {
+		t.Errorf("plugins lost: %#v", doc["plugins"])
+	}
+	if sidecars, ok := doc["sidecars"].([]any); !ok || len(sidecars) != 1 || sidecars[0] != "helper-a" {
+		t.Errorf("sidecars lost: %#v", doc["sidecars"])
+	}
+	us := doc["userSettings"].(map[string]any)
+	if us["permissionGrantsV2Migrated"] != true || us["remoteControlHostname"] != "workstation.local" || us["sandboxEnabledAtV2Migration"] != true {
+		t.Errorf("userSettings fields lost: %#v", us)
+	}
+	grants := us["globalPermissionGrants"].(map[string]any)
+	if gotAllow := grants["allow"].([]any); len(gotAllow) != 2 || gotAllow[0] != "Bash(ls)" || gotAllow[1] != "mcp(odd-agy/*)" {
+		t.Errorf("allow = %#v", gotAllow)
+	}
+	if gotAsk := grants["ask"].([]any); len(gotAsk) != 2 || gotAsk[0] != "Bash(git push)" || gotAsk[1] != "mcp(odd-agy/odd_review_consent)" {
+		t.Errorf("ask = %#v", gotAsk)
+	}
+	if gotDeny := grants["deny"].([]any); len(gotDeny) != 1 || gotDeny[0] != "Bash(rm -rf *)" {
+		t.Errorf("deny = %#v", gotDeny)
+	}
+
+	enabled, err = CheckGlobalAppMCPPermissions(fakeHome)
+	if err != nil || !enabled {
+		t.Fatalf("CheckGlobalAppMCPPermissions after grant = (%t, %v)", enabled, err)
+	}
+
+	// Idempotent second grant does not rewrite or create a backup.
+	grant2, err := GrantGlobalAppMCPPermissions(fakeHome)
+	if err != nil {
+		t.Fatalf("second GrantGlobalAppMCPPermissions: %v", err)
+	}
+	if grant2.Changed || !grant2.Enabled || grant2.BackupPath != "" {
+		t.Fatalf("expected idempotent grant2 Changed=false Enabled=true BackupPath=\"\", got %+v", grant2)
+	}
+
+	// Revoke writes 0600 backup first, removes ONLY the two odd-agy rules, preserves everything else.
+	rev1, err := RevokeGlobalAppMCPPermissions(fakeHome)
+	if err != nil {
+		t.Fatalf("RevokeGlobalAppMCPPermissions: %v", err)
+	}
+	if !rev1.Changed || rev1.Enabled || rev1.BackupPath == "" {
+		t.Fatalf("unexpected rev1 result: %+v", rev1)
+	}
+	revBakInfo, err := os.Stat(rev1.BackupPath)
+	if err != nil || revBakInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("revoke backup stat/perm invalid: err=%v perm=%v", err, revBakInfo)
+	}
+
+	docAfterRev := readJSONFile(t, appCfgPath)
+	if docAfterRev["plugins"] == nil || docAfterRev["sidecars"] == nil {
+		t.Errorf("top-level keys lost after revoke: %#v", docAfterRev)
+	}
+	usAfter := docAfterRev["userSettings"].(map[string]any)
+	if usAfter["permissionGrantsV2Migrated"] != true || usAfter["remoteControlHostname"] != "workstation.local" || usAfter["sandboxEnabledAtV2Migration"] != true {
+		t.Errorf("userSettings fields lost after revoke: %#v", usAfter)
+	}
+	grantsAfter := usAfter["globalPermissionGrants"].(map[string]any)
+	if gotAllow := grantsAfter["allow"].([]any); len(gotAllow) != 1 || gotAllow[0] != "Bash(ls)" {
+		t.Errorf("allow after revoke = %#v", gotAllow)
+	}
+	if gotAsk := grantsAfter["ask"].([]any); len(gotAsk) != 1 || gotAsk[0] != "Bash(git push)" {
+		t.Errorf("ask after revoke = %#v", gotAsk)
+	}
+	if gotDeny := grantsAfter["deny"].([]any); len(gotDeny) != 1 || gotDeny[0] != "Bash(rm -rf *)" {
+		t.Errorf("deny after revoke = %#v", gotDeny)
+	}
+
+	enabled, err = CheckGlobalAppMCPPermissions(fakeHome)
+	if err != nil || enabled {
+		t.Fatalf("CheckGlobalAppMCPPermissions after revoke = (%t, %v)", enabled, err)
+	}
+
+	// Idempotent second revoke creates no backup.
+	rev2, err := RevokeGlobalAppMCPPermissions(fakeHome)
+	if err != nil || rev2.Changed || rev2.Enabled || rev2.BackupPath != "" {
+		t.Fatalf("second RevokeGlobalAppMCPPermissions = %+v, err=%v", rev2, err)
+	}
+
+	// Fresh home without pre-existing config.json -> Grant works without backup, Revoke creates backup and cleans up.
+	freshHome := t.TempDir()
+	grantFresh, err := GrantGlobalAppMCPPermissions(freshHome)
+	if err != nil {
+		t.Fatalf("Grant on fresh home: %v", err)
+	}
+	if !grantFresh.Changed || !grantFresh.Enabled || grantFresh.BackupPath != "" {
+		t.Fatalf("unexpected fresh grant: %+v", grantFresh)
+	}
+	revFresh, err := RevokeGlobalAppMCPPermissions(freshHome)
+	if err != nil || !revFresh.Changed || revFresh.Enabled || revFresh.BackupPath == "" {
+		t.Fatalf("unexpected fresh revoke: %+v, err=%v", revFresh, err)
+	}
+	freshDoc := readJSONFile(t, GlobalAppConfigPath(freshHome))
+	if _, hasUS := freshDoc["userSettings"]; hasUS {
+		t.Fatalf("expected empty userSettings pruned on fresh revoke, got %#v", freshDoc)
+	}
+}
+
+func TestGlobalAppMCPPermissionsRejectsSymlinksAndInvalidJSON(t *testing.T) {
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "outside-config.json")
+	outsideDir := filepath.Join(outside, "outside-dir")
+	const sentinel = `{"plugins":{"keep":true}}` + "\n"
+	if err := os.WriteFile(outsideFile, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Symlink at ~/.gemini/config/config.json
+	homeFileSym := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(homeFileSym, ".gemini", "config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, GlobalAppConfigPath(homeFileSym)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckGlobalAppMCPPermissions(homeFileSym); err == nil {
+		t.Fatalf("expected CheckGlobalAppMCPPermissions to reject config.json symlink")
+	}
+	if _, err := GrantGlobalAppMCPPermissions(homeFileSym); err == nil {
+		t.Fatalf("expected GrantGlobalAppMCPPermissions to reject config.json symlink")
+	}
+	if _, err := RevokeGlobalAppMCPPermissions(homeFileSym); err == nil {
+		t.Fatalf("expected RevokeGlobalAppMCPPermissions to reject config.json symlink")
+	}
+	if got, _ := os.ReadFile(outsideFile); string(got) != sentinel {
+		t.Fatalf("external symlink target altered: %q", string(got))
+	}
+
+	// 2. Symlink at ~/.gemini/config
+	homeDirSym := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(homeDirSym, ".gemini"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(homeDirSym, ".gemini", "config")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := GrantGlobalAppMCPPermissions(homeDirSym); err == nil {
+		t.Fatalf("expected GrantGlobalAppMCPPermissions to reject config dir symlink")
+	}
+	if entries, _ := os.ReadDir(outsideDir); len(entries) != 0 {
+		t.Fatalf("Grant wrote through config dir symlink: %v", entries)
+	}
+
+	// 3. Corrupt JSON and invalid nested types leave config.json byte-identical with zero backups.
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{name: "malformed_json", raw: `{"userSettings": `},
+		{name: "non_object_user_settings", raw: "{\n  \"userSettings\": \"invalid\"\n}\n"},
+		{name: "non_object_global_grants", raw: "{\n  \"userSettings\": {\n    \"globalPermissionGrants\": 123\n  }\n}\n"},
+		{name: "non_array_allow", raw: "{\n  \"userSettings\": {\n    \"globalPermissionGrants\": {\n      \"allow\": {}\n    }\n  }\n}\n"},
+		{name: "non_array_ask", raw: "{\n  \"userSettings\": {\n    \"globalPermissionGrants\": {\n      \"ask\": \"bad\"\n    }\n  }\n}\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			homeBad := t.TempDir()
+			p := GlobalAppConfigPath(homeBad)
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := CheckGlobalAppMCPPermissions(homeBad); err == nil {
+				t.Fatalf("expected Check error for %s", tc.name)
+			}
+			if _, err := GrantGlobalAppMCPPermissions(homeBad); err == nil {
+				t.Fatalf("expected Grant error for %s", tc.name)
+			}
+			if _, err := RevokeGlobalAppMCPPermissions(homeBad); err == nil {
+				t.Fatalf("expected Revoke error for %s", tc.name)
+			}
+			if got, _ := os.ReadFile(p); string(got) != tc.raw {
+				t.Fatalf("invalid config.json mutated for %s", tc.name)
+			}
+			if matches, _ := filepath.Glob(p + ".odd-agy.bak.*"); len(matches) != 0 {
+				t.Fatalf("unexpected backups on invalid config.json: %v", matches)
+			}
+		})
+	}
+}
+
+func TestEnableAndDisableGlobalMCPPreflightAcrossAllThreeFiles(t *testing.T) {
+	t.Run("corrupt_app_config_leaves_settings_and_mcp_config_identical", func(t *testing.T) {
+		home := t.TempDir()
+		settingsPath := GlobalSettingsPath(home)
+		appCfgPath := GlobalAppConfigPath(home)
+		mcpPath := GlobalMCPConfigPath(home)
+
+		for p, content := range map[string]string{
+			settingsPath: "{\n  \"theme\": \"dark\"\n}\n",
+			appCfgPath:   `{"userSettings": `,
+			mcpPath:      "{\n  \"mcpServers\": {}\n}\n",
+		} {
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if _, _, err := EnableGlobalMCP(home, "odd-agy"); err == nil {
+			t.Fatalf("expected EnableGlobalMCP to fail on corrupt config.json")
+		}
+		if _, _, err := DisableGlobalMCP(home); err == nil {
+			t.Fatalf("expected DisableGlobalMCP to fail on corrupt config.json")
+		}
+		if got, _ := os.ReadFile(settingsPath); string(got) != "{\n  \"theme\": \"dark\"\n}\n" {
+			t.Fatalf("settings.json mutated despite config.json preflight failure: %q", string(got))
+		}
+		if got, _ := os.ReadFile(mcpPath); string(got) != "{\n  \"mcpServers\": {}\n}\n" {
+			t.Fatalf("mcp_config.json mutated despite config.json preflight failure: %q", string(got))
+		}
+		if matches, _ := filepath.Glob(settingsPath + ".odd-agy.bak.*"); len(matches) != 0 {
+			t.Fatalf("unexpected settings backups: %v", matches)
+		}
+		if matches, _ := filepath.Glob(mcpPath + ".odd-agy.bak.*"); len(matches) != 0 {
+			t.Fatalf("unexpected mcp_config backups: %v", matches)
+		}
+	})
+
+	t.Run("symlinked_app_config_leaves_settings_and_mcp_config_identical", func(t *testing.T) {
+		home := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "outside.json")
+		if err := os.WriteFile(outside, []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		settingsPath := GlobalSettingsPath(home)
+		appCfgPath := GlobalAppConfigPath(home)
+		mcpPath := GlobalMCPConfigPath(home)
+		if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(appCfgPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(mcpPath, []byte(`{"mcpServers":{}}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, appCfgPath); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, _, err := EnableGlobalMCP(home, "odd-agy"); err == nil {
+			t.Fatalf("expected EnableGlobalMCP to fail on symlinked config.json")
+		}
+		if got, _ := os.ReadFile(settingsPath); string(got) != `{"theme":"dark"}`+"\n" {
+			t.Fatalf("settings.json mutated despite symlinked config.json")
+		}
+		if got, _ := os.ReadFile(mcpPath); string(got) != `{"mcpServers":{}}`+"\n" {
+			t.Fatalf("mcp_config.json mutated despite symlinked config.json")
+		}
+	})
+
+	t.Run("corrupt_mcp_config_leaves_app_config_byte_identical", func(t *testing.T) {
+		home := t.TempDir()
+		appCfgPath := GlobalAppConfigPath(home)
+		mcpPath := GlobalMCPConfigPath(home)
+		const appOrig = "{\n  \"plugins\": {\"keep\": true}\n}\n"
+		if err := os.MkdirAll(filepath.Dir(appCfgPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(appCfgPath, []byte(appOrig), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(mcpPath, []byte(`{"mcpServers": `), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, _, err := EnableGlobalMCP(home, "odd-agy"); err == nil {
+			t.Fatalf("expected EnableGlobalMCP to fail on corrupt mcp_config.json")
+		}
+		if got, _ := os.ReadFile(appCfgPath); string(got) != appOrig {
+			t.Fatalf("config.json mutated despite corrupt mcp_config.json: %q", string(got))
+		}
+		if matches, _ := filepath.Glob(appCfgPath + ".odd-agy.bak.*"); len(matches) != 0 {
+			t.Fatalf("unexpected config.json backups: %v", matches)
+		}
+	})
+
+	t.Run("plain_init_never_writes_gemini_while_enable_updates_all_three", func(t *testing.T) {
+		ws := t.TempDir()
+		home := t.TempDir()
+		if _, err := Init(ws, InitOptions{
+			HomeDir:  home,
+			LookPath: fakeLookPath(map[string]string{"agy": "/bin/agy", "engram": "/bin/engram"}),
+		}); err != nil {
+			t.Fatalf("plain Init: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".gemini")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("plain Init touched ~/.gemini: err=%v", err)
+		}
+
+		permRes, regRes, err := EnableGlobalMCP(home, "/opt/odd-agy")
+		if err != nil {
+			t.Fatalf("EnableGlobalMCP: %v", err)
+		}
+		if !permRes.Enabled || !permRes.AppEnabled || !regRes.Registered {
+			t.Fatalf("unexpected EnableGlobalMCP results: perm=%+v reg=%+v", permRes, regRes)
+		}
+		if ok, err := CheckGlobalMCPPermissions(home); err != nil || !ok {
+			t.Fatalf("CheckGlobalMCPPermissions = (%t, %v)", ok, err)
+		}
+		if ok, err := CheckGlobalAppMCPPermissions(home); err != nil || !ok {
+			t.Fatalf("CheckGlobalAppMCPPermissions = (%t, %v)", ok, err)
+		}
+		if reg, cmd, err := GlobalMCPServerRegistered(home); err != nil || !reg || cmd != "/opt/odd-agy" {
+			t.Fatalf("GlobalMCPServerRegistered = (%t, %q, %v)", reg, cmd, err)
+		}
+	})
+}
+
 

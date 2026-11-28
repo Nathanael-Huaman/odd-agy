@@ -42,8 +42,10 @@ type InitResult struct {
 	AddedEngramMCP      bool
 	ManifestPath        string
 	GlobalMCPAllowed    bool
+	GlobalAppMCPAllowed bool
 	GlobalMCPRegistered bool
 	GlobalSettingsPath  string
+	GlobalAppConfigPath string
 	GlobalMCPConfigPath string
 }
 

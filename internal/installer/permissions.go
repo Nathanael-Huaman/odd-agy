@@ -24,12 +24,17 @@ const (
 	MCPAskRule = "mcp(odd-agy/odd_review_consent)"
 )
 
-// GlobalPermissionsResult summarizes a Grant or Revoke operation on ~/.gemini/antigravity-cli/settings.json.
+// GlobalPermissionsResult summarizes a Grant or Revoke operation on
+// ~/.gemini/antigravity-cli/settings.json and/or ~/.gemini/config/config.json.
 type GlobalPermissionsResult struct {
-	SettingsPath string
-	BackupPath   string
-	Changed      bool
-	Enabled      bool
+	SettingsPath  string
+	BackupPath    string
+	Changed       bool
+	Enabled       bool
+	AppConfigPath string
+	AppBackupPath string
+	AppChanged    bool
+	AppEnabled    bool
 }
 
 // GlobalMCPRegistrationResult summarizes a Register or Unregister operation on ~/.gemini/config/mcp_config.json.
@@ -49,6 +54,11 @@ func SessionSettingsPath(workspaceRoot string) string {
 // GlobalSettingsPath returns the path to <homeDir>/.gemini/antigravity-cli/settings.json.
 func GlobalSettingsPath(homeDir string) string {
 	return filepath.Join(resolveHomeDir(homeDir), ".gemini", "antigravity-cli", "settings.json")
+}
+
+// GlobalAppConfigPath returns the path to <homeDir>/.gemini/config/config.json.
+func GlobalAppConfigPath(homeDir string) string {
+	return filepath.Join(resolveHomeDir(homeDir), ".gemini", "config", "config.json")
 }
 
 // GlobalMCPConfigPath returns the path to <homeDir>/.gemini/config/mcp_config.json.
@@ -313,6 +323,218 @@ func CheckGlobalMCPPermissions(homeDir string) (bool, error) {
 	return containsRule(allow, MCPAllowRule) && containsRule(ask, MCPAskRule), nil
 }
 
+// GrantGlobalAppMCPPermissions ensures mcp(odd-agy/*) is in userSettings.globalPermissionGrants.allow
+// and mcp(odd-agy/odd_review_consent) is in userSettings.globalPermissionGrants.ask inside
+// <homeDir>/.gemini/config/config.json while preserving all unrelated keys and rules.
+// If the file already exists and needs changes, a timestamped 0600 backup is written first.
+func GrantGlobalAppMCPPermissions(homeDir string) (GlobalPermissionsResult, error) {
+	hd := resolveHomeDir(homeDir)
+	if hd == "" {
+		return GlobalPermissionsResult{}, errors.New("home directory unavailable")
+	}
+	if err := checkGlobalAppConfigSymlinks(hd); err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+	p := GlobalAppConfigPath(hd)
+
+	var origBytes []byte
+	doc, exists, err := readJSONObject(p)
+	if err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+	if exists {
+		origBytes, err = os.ReadFile(p)
+		if err != nil {
+			return GlobalPermissionsResult{}, fmt.Errorf("read %s for backup: %w", p, err)
+		}
+	}
+
+	userSettings, grants, allow, ask, err := extractAppGrants(doc, p)
+	if err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+
+	changed := !exists
+	if !containsRule(allow, MCPAllowRule) {
+		allow = append(allow, MCPAllowRule)
+		changed = true
+	}
+	if !containsRule(ask, MCPAskRule) {
+		ask = append(ask, MCPAskRule)
+		changed = true
+	}
+
+	if !changed {
+		return GlobalPermissionsResult{
+			SettingsPath:  p,
+			Changed:       false,
+			Enabled:       true,
+			AppConfigPath: p,
+			AppChanged:    false,
+			AppEnabled:    true,
+		}, nil
+	}
+
+	var backupPath string
+	if exists {
+		backupPath, err = allocateSettingsBackupPath(p)
+		if err != nil {
+			return GlobalPermissionsResult{}, err
+		}
+		if err := writeFileAtomic(backupPath, origBytes, 0o600); err != nil {
+			return GlobalPermissionsResult{}, fmt.Errorf("write backup %s: %w", backupPath, err)
+		}
+	}
+
+	grants["allow"] = allow
+	grants["ask"] = ask
+	userSettings["globalPermissionGrants"] = grants
+	doc["userSettings"] = userSettings
+
+	if err := writeJSONAtomic(p, doc, 0o600); err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+
+	return GlobalPermissionsResult{
+		SettingsPath:  p,
+		BackupPath:    backupPath,
+		Changed:       true,
+		Enabled:       true,
+		AppConfigPath: p,
+		AppBackupPath: backupPath,
+		AppChanged:    true,
+		AppEnabled:    true,
+	}, nil
+}
+
+// RevokeGlobalAppMCPPermissions idempotently removes only mcp(odd-agy/*) from
+// userSettings.globalPermissionGrants.allow and mcp(odd-agy/odd_review_consent) from
+// userSettings.globalPermissionGrants.ask in <homeDir>/.gemini/config/config.json.
+// When modifying an existing file, a timestamped 0600 backup is written first.
+func RevokeGlobalAppMCPPermissions(homeDir string) (GlobalPermissionsResult, error) {
+	hd := resolveHomeDir(homeDir)
+	if hd == "" {
+		return GlobalPermissionsResult{}, errors.New("home directory unavailable")
+	}
+	if err := checkGlobalAppConfigSymlinks(hd); err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+	p := GlobalAppConfigPath(hd)
+
+	doc, exists, err := readJSONObject(p)
+	if err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+	if !exists {
+		return GlobalPermissionsResult{
+			SettingsPath:  p,
+			Changed:       false,
+			Enabled:       false,
+			AppConfigPath: p,
+			AppChanged:    false,
+			AppEnabled:    false,
+		}, nil
+	}
+
+	userSettings, grants, allow, ask, err := extractAppGrants(doc, p)
+	if err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+
+	newAllow, allowRemoved := removeRule(allow, MCPAllowRule)
+	newAsk, askRemoved := removeRule(ask, MCPAskRule)
+	if !allowRemoved && !askRemoved {
+		return GlobalPermissionsResult{
+			SettingsPath:  p,
+			Changed:       false,
+			Enabled:       false,
+			AppConfigPath: p,
+			AppChanged:    false,
+			AppEnabled:    false,
+		}, nil
+	}
+
+	origBytes, err := os.ReadFile(p)
+	if err != nil {
+		return GlobalPermissionsResult{}, fmt.Errorf("read %s for backup: %w", p, err)
+	}
+	backupPath, err := allocateSettingsBackupPath(p)
+	if err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+	if err := writeFileAtomic(backupPath, origBytes, 0o600); err != nil {
+		return GlobalPermissionsResult{}, fmt.Errorf("write backup %s: %w", backupPath, err)
+	}
+
+	if allowRemoved {
+		if len(newAllow) == 0 {
+			delete(grants, "allow")
+		} else {
+			grants["allow"] = newAllow
+		}
+	}
+	if askRemoved {
+		if len(newAsk) == 0 {
+			delete(grants, "ask")
+		} else {
+			grants["ask"] = newAsk
+		}
+	}
+	if len(grants) == 0 {
+		delete(userSettings, "globalPermissionGrants")
+	} else {
+		userSettings["globalPermissionGrants"] = grants
+	}
+	if len(userSettings) == 0 {
+		delete(doc, "userSettings")
+	} else {
+		doc["userSettings"] = userSettings
+	}
+
+	if err := writeJSONAtomic(p, doc, 0o600); err != nil {
+		return GlobalPermissionsResult{}, err
+	}
+
+	return GlobalPermissionsResult{
+		SettingsPath:  p,
+		BackupPath:    backupPath,
+		Changed:       true,
+		Enabled:       false,
+		AppConfigPath: p,
+		AppBackupPath: backupPath,
+		AppChanged:    true,
+		AppEnabled:    false,
+	}, nil
+}
+
+// CheckGlobalAppMCPPermissions reports whether both odd-agy rules are present in
+// userSettings.globalPermissionGrants in <homeDir>/.gemini/config/config.json without modifying disk.
+func CheckGlobalAppMCPPermissions(homeDir string) (bool, error) {
+	hd := resolveHomeDir(homeDir)
+	if hd == "" {
+		return false, errors.New("home directory unavailable")
+	}
+	if err := checkGlobalAppConfigSymlinks(hd); err != nil {
+		return false, err
+	}
+	p := GlobalAppConfigPath(hd)
+
+	doc, exists, err := readJSONObject(p)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+
+	_, _, allow, ask, err := extractAppGrants(doc, p)
+	if err != nil {
+		return false, err
+	}
+
+	return containsRule(allow, MCPAllowRule) && containsRule(ask, MCPAskRule), nil
+}
+
 // GlobalMCPServerRegistered reports whether mcpServers["odd-agy"] is configured and enabled
 // in <homeDir>/.gemini/config/mcp_config.json without modifying disk.
 func GlobalMCPServerRegistered(homeDir string) (registered bool, command string, err error) {
@@ -513,9 +735,10 @@ func UnregisterGlobalMCPServer(homeDir string) (GlobalMCPRegistrationResult, err
 	}, nil
 }
 
-// PreflightGlobalMCP performs zero-write validation of both global Antigravity config files
-// (<homeDir>/.gemini/antigravity-cli/settings.json and <homeDir>/.gemini/config/mcp_config.json):
-// it rejects symlinks along either path and validates JSON structure and required field types.
+// PreflightGlobalMCP performs zero-write validation of all three global Antigravity config files
+// (<homeDir>/.gemini/antigravity-cli/settings.json, <homeDir>/.gemini/config/config.json, and
+// <homeDir>/.gemini/config/mcp_config.json): it rejects symlinks along any path and validates
+// JSON structure and required field types.
 func PreflightGlobalMCP(homeDir string) error {
 	hd := resolveHomeDir(homeDir)
 	if hd == "" {
@@ -540,6 +763,18 @@ func PreflightGlobalMCP(homeDir string) error {
 		return err
 	}
 
+	if err := checkGlobalAppConfigSymlinks(hd); err != nil {
+		return err
+	}
+	appPath := GlobalAppConfigPath(hd)
+	appDoc, _, err := readJSONObject(appPath)
+	if err != nil {
+		return err
+	}
+	if _, _, _, _, err := extractAppGrants(appDoc, appPath); err != nil {
+		return err
+	}
+
 	if err := checkGlobalMCPConfigSymlinks(hd); err != nil {
 		return err
 	}
@@ -557,8 +792,8 @@ func PreflightGlobalMCP(homeDir string) error {
 }
 
 // EnableGlobalMCP performs two-phase global MCP activation:
-// Phase 1 preflights symlinks and schemas on both settings.json and mcp_config.json with zero writes;
-// Phase 2 grants permissions and registers mcpServers["odd-agy"] with 0600 backups.
+// Phase 1 preflights symlinks and schemas on settings.json, config.json, and mcp_config.json with zero writes;
+// Phase 2 grants CLI & Desktop App permissions and registers mcpServers["odd-agy"] with 0600 backups.
 func EnableGlobalMCP(homeDir, binaryPath string) (GlobalPermissionsResult, GlobalMCPRegistrationResult, error) {
 	if err := PreflightGlobalMCP(homeDir); err != nil {
 		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
@@ -567,6 +802,15 @@ func EnableGlobalMCP(homeDir, binaryPath string) (GlobalPermissionsResult, Globa
 	if err != nil {
 		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
 	}
+	appRes, err := GrantGlobalAppMCPPermissions(homeDir)
+	if err != nil {
+		return permRes, GlobalMCPRegistrationResult{}, err
+	}
+	permRes.AppConfigPath = appRes.AppConfigPath
+	permRes.AppBackupPath = appRes.AppBackupPath
+	permRes.AppChanged = appRes.AppChanged
+	permRes.AppEnabled = appRes.AppEnabled
+
 	regRes, err := RegisterGlobalMCPServer(homeDir, binaryPath)
 	if err != nil {
 		return permRes, GlobalMCPRegistrationResult{}, err
@@ -575,8 +819,8 @@ func EnableGlobalMCP(homeDir, binaryPath string) (GlobalPermissionsResult, Globa
 }
 
 // DisableGlobalMCP performs two-phase global MCP deactivation:
-// Phase 1 preflights symlinks and schemas on both settings.json and mcp_config.json with zero writes;
-// Phase 2 revokes permissions and unregisters mcpServers["odd-agy"] cleanly.
+// Phase 1 preflights symlinks and schemas on settings.json, config.json, and mcp_config.json with zero writes;
+// Phase 2 revokes CLI & Desktop App permissions and unregisters mcpServers["odd-agy"] cleanly.
 func DisableGlobalMCP(homeDir string) (GlobalPermissionsResult, GlobalMCPRegistrationResult, error) {
 	if err := PreflightGlobalMCP(homeDir); err != nil {
 		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
@@ -585,6 +829,15 @@ func DisableGlobalMCP(homeDir string) (GlobalPermissionsResult, GlobalMCPRegistr
 	if err != nil {
 		return GlobalPermissionsResult{}, GlobalMCPRegistrationResult{}, err
 	}
+	appRes, err := RevokeGlobalAppMCPPermissions(homeDir)
+	if err != nil {
+		return permRes, GlobalMCPRegistrationResult{}, err
+	}
+	permRes.AppConfigPath = appRes.AppConfigPath
+	permRes.AppBackupPath = appRes.AppBackupPath
+	permRes.AppChanged = appRes.AppChanged
+	permRes.AppEnabled = appRes.AppEnabled
+
 	regRes, err := UnregisterGlobalMCPServer(homeDir)
 	if err != nil {
 		return permRes, GlobalMCPRegistrationResult{}, err
@@ -593,37 +846,40 @@ func DisableGlobalMCP(homeDir string) (GlobalPermissionsResult, GlobalMCPRegistr
 }
 
 func checkGlobalSettingsSymlinks(hd string) error {
-	geminiDir := filepath.Join(hd, ".gemini")
-	cliDir := filepath.Join(geminiDir, "antigravity-cli")
-	settingsFile := filepath.Join(cliDir, "settings.json")
-	return checkGlobalFilePathSymlinks([]string{geminiDir, cliDir, settingsFile})
+	return checkGlobalFilePathSymlinks(hd, ".gemini", "antigravity-cli", "settings.json")
+}
+
+func checkGlobalAppConfigSymlinks(hd string) error {
+	return checkGlobalFilePathSymlinks(hd, ".gemini", "config", "config.json")
 }
 
 func checkGlobalMCPConfigSymlinks(hd string) error {
-	geminiDir := filepath.Join(hd, ".gemini")
-	configDir := filepath.Join(geminiDir, "config")
-	configFile := filepath.Join(configDir, "mcp_config.json")
-	return checkGlobalFilePathSymlinks([]string{geminiDir, configDir, configFile})
+	return checkGlobalFilePathSymlinks(hd, ".gemini", "config", "mcp_config.json")
 }
 
-func checkGlobalFilePathSymlinks(paths []string) error {
-	last := len(paths) - 1
-	for i, p := range paths {
-		info, err := os.Lstat(p)
+func checkGlobalFilePathSymlinks(hd string, parts ...string) error {
+	if len(parts) == 0 {
+		return nil
+	}
+	cur := hd
+	last := len(parts) - 1
+	for i, part := range parts {
+		cur = filepath.Join(cur, part)
+		info, err := os.Lstat(cur)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
-			return fmt.Errorf("lstat %s: %w", p, err)
+			return fmt.Errorf("lstat %s: %w", cur, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s: symlink is not allowed", p)
+			return fmt.Errorf("%s: symlink is not allowed", cur)
 		}
 		if i < last && !info.IsDir() {
-			return fmt.Errorf("%s: expected directory", p)
+			return fmt.Errorf("%s: expected directory", cur)
 		}
 		if i == last && info.IsDir() {
-			return fmt.Errorf("%s: expected file, got directory", p)
+			return fmt.Errorf("%s: expected file, got directory", cur)
 		}
 	}
 	return nil
@@ -676,6 +932,52 @@ func extractRuleSlice(perms map[string]any, key, filePath string) ([]any, error)
 	arr, ok := raw.([]any)
 	if !ok {
 		return nil, fmt.Errorf("%s: permissions.%s must be a JSON array", filePath, key)
+	}
+	return slices.Clone(arr), nil
+}
+
+func extractAppGrants(doc map[string]any, filePath string) (map[string]any, map[string]any, []any, []any, error) {
+	var userSettings map[string]any
+	if rawUS, exists := doc["userSettings"]; exists && rawUS != nil {
+		typed, ok := rawUS.(map[string]any)
+		if !ok {
+			return nil, nil, nil, nil, fmt.Errorf("%s: userSettings must be a JSON object", filePath)
+		}
+		userSettings = typed
+	} else {
+		userSettings = map[string]any{}
+	}
+
+	var grants map[string]any
+	if rawGrants, exists := userSettings["globalPermissionGrants"]; exists && rawGrants != nil {
+		typed, ok := rawGrants.(map[string]any)
+		if !ok {
+			return nil, nil, nil, nil, fmt.Errorf("%s: userSettings.globalPermissionGrants must be a JSON object", filePath)
+		}
+		grants = typed
+	} else {
+		grants = map[string]any{}
+	}
+
+	allow, err := extractAppRuleSlice(grants, "allow", filePath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	ask, err := extractAppRuleSlice(grants, "ask", filePath)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return userSettings, grants, allow, ask, nil
+}
+
+func extractAppRuleSlice(grants map[string]any, key, filePath string) ([]any, error) {
+	raw, exists := grants[key]
+	if !exists || raw == nil {
+		return []any{}, nil
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s: userSettings.globalPermissionGrants.%s must be a JSON array", filePath, key)
 	}
 	return slices.Clone(arr), nil
 }
