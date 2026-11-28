@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -106,9 +107,25 @@ func isFilesystemRoot(p string) bool {
 	return cleaned == "" || filepath.Dir(cleaned) == cleaned
 }
 
+func isCaseInsensitiveOS() bool {
+	return runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+}
+
+func workspaceCacheKey(canonicalRoot string) string {
+	cleaned := filepath.Clean(canonicalRoot)
+	if isCaseInsensitiveOS() {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
+}
+
 func isSameOrSubpath(target, root string) bool {
 	target = filepath.Clean(target)
 	root = filepath.Clean(root)
+	if isCaseInsensitiveOS() {
+		target = strings.ToLower(target)
+		root = strings.ToLower(root)
+	}
 	if target == root {
 		return true
 	}
@@ -117,6 +134,22 @@ func isSameOrSubpath(target, root string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func collectDirStats(path string) []os.FileInfo {
+	var stats []os.FileInfo
+	cur := filepath.Clean(path)
+	for cur != "" && !isFilesystemRoot(cur) {
+		if info, err := os.Stat(cur); err == nil {
+			stats = append(stats, info)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return stats
 }
 
 func (s *Server) isSensitiveWorkspaceRoot(cleaned, resolved string) (string, bool) {
@@ -144,6 +177,7 @@ func (s *Server) isSensitiveWorkspaceRoot(cleaned, resolved string) (string, boo
 			)
 		}
 	}
+	candidateStats := collectDirStats(resolved)
 	for _, root := range roots {
 		if isSameOrSubpath(cleaned, root) || isSameOrSubpath(resolved, root) {
 			return root, true
@@ -151,6 +185,13 @@ func (s *Server) isSensitiveWorkspaceRoot(cleaned, resolved string) (string, boo
 		if canonRoot, err := filepath.EvalSymlinks(root); err == nil && canonRoot != root {
 			if isSameOrSubpath(cleaned, canonRoot) || isSameOrSubpath(resolved, canonRoot) {
 				return root, true
+			}
+		}
+		if rootInfo, err := os.Stat(root); err == nil {
+			for _, candInfo := range candidateStats {
+				if os.SameFile(candInfo, rootInfo) {
+					return root, true
+				}
 			}
 		}
 	}
@@ -190,9 +231,10 @@ func (s *Server) validateWorkspaceDir(raw string) (string, error) {
 }
 
 func (s *Server) getOrCreateWorkspace(canonicalRoot string) *workspaceServices {
+	key := workspaceCacheKey(canonicalRoot)
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
-	if ws, ok := s.workspaces[canonicalRoot]; ok {
+	if ws, ok := s.workspaces[key]; ok {
 		return ws
 	}
 	eng := rdd.NewEngine(canonicalRoot)
@@ -207,7 +249,7 @@ func (s *Server) getOrCreateWorkspace(canonicalRoot string) *workspaceServices {
 			ReviewHost: &serverReviewHost{rdd: eng},
 		}),
 	}
-	s.workspaces[canonicalRoot] = ws
+	s.workspaces[key] = ws
 	return ws
 }
 

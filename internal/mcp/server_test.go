@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2340,5 +2341,212 @@ func TestMCPDesktopAppRootCwdWorkspaceRootMultiProject(t *testing.T) {
 	_ = inWSens.Close()
 	if err := <-doneSens; err != nil {
 		t.Fatalf("Serve sens error: %v", err)
+	}
+}
+
+func TestMCPWorkspaceRootRejectsCaseVariedSensitiveDirsOnCaseInsensitiveFS(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	for _, credDir := range []string{
+		filepath.Join(fakeHome, ".config", "odd-agy"),
+		filepath.Join(fakeHome, ".gemini"),
+		filepath.Join(fakeHome, ".ssh"),
+		filepath.Join(fakeHome, ".ssh", "nested"),
+	} {
+		if err := os.MkdirAll(credDir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", credDir, err)
+		}
+	}
+
+	startServer := func() (*Server, *rpcClient, *io.PipeWriter, chan error, context.CancelFunc) {
+		server := NewServer(ServerConfig{Workspace: "/"})
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- server.Serve(ctx, inR, outW)
+			_ = outW.Close()
+		}()
+		cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+		return server, cli, inW, done, cancel
+	}
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"upper_ssh", filepath.Join(fakeHome, ".SSH")},
+		{"upper_ssh_nested", filepath.Join(fakeHome, ".SSH", "nested")},
+		{"mixed_gemini", filepath.Join(fakeHome, ".Gemini")},
+		{"upper_config_odd_agy", filepath.Join(fakeHome, ".CONFIG", "ODD-AGY")},
+		{"lower_system", "/system"},
+		{"lower_library", "/library"},
+		{"mixed_private_etc", "/private/ETC"},
+	}
+
+	_, cli, inW, done, cancel := startServer()
+	defer cancel()
+	if resp := cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"}); resp["error"] != nil {
+		t.Fatalf("initialize error: %v", resp["error"])
+	}
+	cli.notify("notifications/initialized", map[string]any{})
+
+	for _, tc := range cases {
+		info, statErr := os.Stat(tc.path)
+		existsOnFS := statErr == nil && info.IsDir()
+		if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && strings.HasPrefix(tc.path, fakeHome) && !existsOnFS {
+			t.Logf("%s: case-varied home dir %q did not stat on this filesystem (%v)", tc.name, tc.path, statErr)
+		}
+
+		// 1. Direct workspaceRoot argument on tool call.
+		out, isErr := cli.callTool("odd_review_assess", map[string]any{"workspaceRoot": tc.path})
+		if !isErr {
+			t.Fatalf("%s: workspaceRoot %q unexpectedly succeeded: %s", tc.name, tc.path, out)
+		}
+		if existsOnFS && !strings.Contains(out, "targets restricted directory") {
+			t.Fatalf("%s: workspaceRoot %q failed with %q, want restricted directory rejection", tc.name, tc.path, out)
+		}
+
+		// 2. initialize rootUri must not adopt case-varied sensitive directory.
+		_, cliInit, inWInit, doneInit, cancelInit := startServer()
+		if resp := cliInit.call("initialize", map[string]any{
+			"protocolVersion": "2024-11-05",
+			"rootUri":         "file://" + tc.path,
+		}); resp["error"] != nil {
+			cancelInit()
+			t.Fatalf("%s: initialize(rootUri) error: %v", tc.name, resp["error"])
+		}
+		cliInit.notify("notifications/initialized", map[string]any{})
+		assessOut, assessErr := cliInit.callTool("odd_review_assess", map[string]any{})
+		if !assessErr || !strings.Contains(assessOut, "workspaceRoot") {
+			cancelInit()
+			t.Fatalf("%s: initialize(rootUri=%q) unexpectedly adopted sensitive path: err=%v out=%s", tc.name, tc.path, assessErr, assessOut)
+		}
+		_ = inWInit.Close()
+		cancelInit()
+		if err := <-doneInit; err != nil && err != context.Canceled {
+			t.Fatalf("%s: Serve error: %v", tc.name, err)
+		}
+	}
+
+	_ = inW.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPWorkspaceCacheKeyNormalizesCaseInsensitiveOS(t *testing.T) {
+	parent := t.TempDir()
+	repo := filepath.Join(parent, "MixedCaseRepo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	for _, args := range [][]string{{"add", "main.go"}, {"commit", "-m", "init"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+
+	lowerRepo := filepath.Join(parent, "mixedcaserepo")
+	upperRepo := filepath.Join(parent, "MIXEDCASEREPO")
+
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case-varied path cache test applies to darwin/windows")
+	}
+
+	infoL, errL := os.Stat(lowerRepo)
+	infoU, errU := os.Stat(upperRepo)
+	if errL != nil || errU != nil || !os.SameFile(infoL, infoU) {
+		t.Skipf("filesystem is case-sensitive (errL=%v errU=%v)", errL, errU)
+	}
+
+	server := NewServer(ServerConfig{Workspace: "/"})
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	if resp := cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"}); resp["error"] != nil {
+		t.Fatalf("initialize error: %v", resp["error"])
+	}
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// Write todo using lowerRepo, read using upperRepo.
+	if out, isErr := cli.callTool("todo", map[string]any{
+		"workspaceRoot": lowerRepo,
+		"action":        "write",
+		"tasks":         []map[string]any{{"title": "SharedCacheTask", "status": "in_progress"}},
+	}); isErr {
+		t.Fatalf("todo write(lowerRepo) failed: %s", out)
+	}
+	listOut, isErr := cli.callTool("todo", map[string]any{
+		"workspaceRoot": upperRepo,
+		"action":        "list",
+	})
+	if isErr || !strings.Contains(listOut, "SharedCacheTask") {
+		t.Fatalf("todo list(upperRepo) unexpected (err=%v): %s", isErr, listOut)
+	}
+
+	server.wsMu.Lock()
+	cacheLen := len(server.workspaces)
+	server.wsMu.Unlock()
+	if cacheLen != 1 {
+		t.Fatalf("len(server.workspaces) = %d, want 1 (case-varied paths must share cache entry)", cacheLen)
+	}
+
+	wsLower, err := server.resolveWorkspace(lowerRepo)
+	if err != nil {
+		t.Fatalf("resolveWorkspace(lowerRepo): %v", err)
+	}
+	wsUpper, err := server.resolveWorkspace(upperRepo)
+	if err != nil {
+		t.Fatalf("resolveWorkspace(upperRepo): %v", err)
+	}
+	if wsLower != wsUpper {
+		t.Fatalf("expected identical *workspaceServices pointer for %q and %q", lowerRepo, upperRepo)
+	}
+
+	// PRESERVE: distinct repo still gets its own cache entry.
+	otherRepo := initMCPRepo(t)
+	if out, isErr := cli.callTool("odd_review_mode", map[string]any{
+		"workspaceRoot": otherRepo,
+		"action":        "status",
+	}); isErr {
+		t.Fatalf("odd_review_mode(otherRepo) failed: %s", out)
+	}
+	server.wsMu.Lock()
+	cacheLenAfter := len(server.workspaces)
+	server.wsMu.Unlock()
+	if cacheLenAfter != 2 {
+		t.Fatalf("len(server.workspaces) = %d, want 2 after distinct repo", cacheLenAfter)
+	}
+
+	_ = inW.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve error: %v", err)
 	}
 }
