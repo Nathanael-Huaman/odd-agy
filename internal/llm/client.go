@@ -13,16 +13,20 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 )
 
 const (
-	defaultHTTPTimeout  = 120 * time.Second
-	defaultProbeTimeout = 5 * time.Second
-	maxResponseBytes    = 8 << 20 // 8 MiB
-	maxErrorBodyBytes   = 512
+	defaultHeaderTimeout     = 90 * time.Second
+	defaultIdleTimeout       = 60 * time.Second
+	defaultMaxRequestTimeout = 165 * time.Second
+	defaultProbeTimeout      = 5 * time.Second
+	maxResponseBytes         = 8 << 20 // 8 MiB
+	maxErrorBodyBytes        = 512
 )
 
 // ErrMissingAPIKey indicates an external provider requires an API key env var that is not set.
@@ -154,15 +158,64 @@ type NativeFallback struct {
 
 // Client speaks OpenAI-compatible chat completions (including deepseek-thinking).
 type Client struct {
-	httpClient *http.Client
+	httpClient        *http.Client
+	headerTimeout     time.Duration
+	idleTimeout       time.Duration
+	maxRequestTimeout time.Duration
+}
+
+func newDefaultHTTPClient(headerTimeout time.Duration) *http.Client {
+	if headerTimeout <= 0 {
+		headerTimeout = defaultHeaderTimeout
+	}
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	tr.ResponseHeaderTimeout = headerTimeout
+	return &http.Client{
+		Transport: tr,
+	}
 }
 
 // NewClient creates a new OpenAI-compatible HTTP client.
 func NewClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
+		httpClient = newDefaultHTTPClient(defaultHeaderTimeout)
 	}
-	return &Client{httpClient: httpClient}
+	return &Client{
+		httpClient:        httpClient,
+		headerTimeout:     defaultHeaderTimeout,
+		idleTimeout:       defaultIdleTimeout,
+		maxRequestTimeout: defaultMaxRequestTimeout,
+	}
+}
+
+func (c *Client) effectiveIdleTimeout() time.Duration {
+	if c != nil && c.idleTimeout > 0 {
+		return c.idleTimeout
+	}
+	return defaultIdleTimeout
+}
+
+func (c *Client) effectiveMaxRequestTimeout() time.Duration {
+	if c != nil && c.maxRequestTimeout > 0 {
+		return c.maxRequestTimeout
+	}
+	return defaultMaxRequestTimeout
+}
+
+func (c *Client) effectiveHTTPClient() *http.Client {
+	if c != nil && c.httpClient != nil {
+		return c.httpClient
+	}
+	var ht time.Duration
+	if c != nil {
+		ht = c.headerTimeout
+	}
+	return newDefaultHTTPClient(ht)
 }
 
 type wireMessage struct {
@@ -235,50 +288,176 @@ func (c *Client) ChatCompletions(ctx context.Context, ep config.ResolvedEndpoint
 		ToolChoice:  toolChoice,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
-		Stream:      false,
+		Stream:      true,
 	}
 
-	bodyBytes, err := json.Marshal(payload)
-	if err != nil {
-		return ChatResponse{}, fmt.Errorf("marshal chat request: %w", err)
+	maxTimeout := c.effectiveMaxRequestTimeout()
+	reqCtx := ctx
+	var reqCancel context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= maxTimeout {
+		reqCtx, reqCancel = context.WithCancel(ctx)
+	} else {
+		reqCtx, reqCancel = context.WithTimeout(ctx, maxTimeout)
 	}
+	defer reqCancel()
 
 	endpointURL := strings.TrimRight(ep.BaseURL, "/") + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(bodyBytes))
+
+	resp, retryFallback, err := c.doChatCompletion(reqCtx, ep, endpointURL, payload, true)
+	if retryFallback {
+		if ctxErr := reqCtx.Err(); ctxErr != nil {
+			return ChatResponse{}, fmt.Errorf("request %s failed: %s", RedactURL(endpointURL), redactError(ctxErr, ep.APIKey))
+		}
+		resp, _, err = c.doChatCompletion(reqCtx, ep, endpointURL, payload, false)
+	}
+	return resp, err
+}
+
+func (c *Client) doChatCompletion(
+	reqCtx context.Context,
+	ep config.ResolvedEndpoint,
+	endpointURL string,
+	payload wireChatRequest,
+	stream bool,
+) (ChatResponse, bool, error) {
+	payload.Stream = stream
+	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return ChatResponse{}, fmt.Errorf("build request for %s: %s", RedactURL(endpointURL), redactError(err, ep.APIKey))
+		return ChatResponse{}, false, fmt.Errorf("marshal chat request: %w", err)
+	}
+
+	attemptCtx, attemptCancel := context.WithCancel(reqCtx)
+	defer attemptCancel()
+
+	httpReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, endpointURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return ChatResponse{}, false, fmt.Errorf("build request for %s: %s", RedactURL(endpointURL), redactError(err, ep.APIKey))
 	}
 	for k, v := range ep.Headers {
 		httpReq.Header.Set(k, v)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if stream {
+		httpReq.Header.Set("Accept", "text/event-stream, application/json")
+	} else {
+		httpReq.Header.Set("Accept", "application/json")
+	}
 	if ep.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+ep.APIKey)
 	}
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.effectiveHTTPClient().Do(httpReq)
 	if err != nil {
-		return ChatResponse{}, fmt.Errorf("request %s failed: %s", RedactURL(endpointURL), redactError(err, ep.APIKey))
+		return ChatResponse{}, false, fmt.Errorf("request %s failed: %s", RedactURL(endpointURL), redactError(err, ep.APIKey))
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	respBytes, err := readResponseWithIdleTimeout(attemptCtx, attemptCancel, resp.Body, maxResponseBytes, c.effectiveIdleTimeout())
 	if err != nil {
-		return ChatResponse{}, fmt.Errorf("read response from %s: %s", RedactURL(endpointURL), redactError(err, ep.APIKey))
+		return ChatResponse{}, false, fmt.Errorf("read response from %s: %s", RedactURL(endpointURL), redactError(err, ep.APIKey))
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if stream && resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(string(respBytes)), "stream") {
+			return ChatResponse{}, true, nil
+		}
 		msg := strings.TrimSpace(string(respBytes))
 		if len(msg) > maxErrorBodyBytes {
 			msg = msg[:maxErrorBodyBytes] + "..."
 		}
-		return ChatResponse{}, &APIError{
+		return ChatResponse{}, false, &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    redactText(msg, ep.APIKey),
 		}
 	}
 
-	return decodeChatResponse(respBytes, resp.Header.Get("Content-Type"), endpointURL, ep.APIKey)
+	parsed, err := decodeChatResponse(respBytes, resp.Header.Get("Content-Type"), endpointURL, ep.APIKey)
+	return parsed, false, err
+}
+
+func readResponseWithIdleTimeout(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	body io.ReadCloser,
+	maxBytes int64,
+	idleTimeout time.Duration,
+) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+
+	var idleTimedOut atomic.Bool
+	activityCh := make(chan struct{}, 1)
+	doneCh := make(chan struct{})
+	var wg sync.WaitGroup
+
+	if idleTimeout > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			timer := time.NewTimer(idleTimeout)
+			defer timer.Stop()
+			for {
+				select {
+				case <-doneCh:
+					return
+				case <-ctx.Done():
+					return
+				case <-activityCh:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(idleTimeout)
+				case <-timer.C:
+					idleTimedOut.Store(true)
+					if cancel != nil {
+						cancel()
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	defer func() {
+		close(doneCh)
+		wg.Wait()
+	}()
+
+	var reader io.Reader = body
+	if maxBytes > 0 {
+		reader = io.LimitReader(body, maxBytes)
+	}
+
+	var out []byte
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			out = append(out, buf[:n]...)
+			if idleTimeout > 0 {
+				select {
+				case activityCh <- struct{}{}:
+				default:
+				}
+			}
+		}
+		if err == io.EOF {
+			return out, nil
+		}
+		if err != nil {
+			if idleTimedOut.Load() {
+				return nil, fmt.Errorf("stream idle timeout after %s without data", idleTimeout)
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, err
+		}
+	}
 }
 
 type sseToolCallDelta struct {

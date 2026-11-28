@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 	"github.com/Nathanael-Huaman/odd-agy/internal/rdd"
@@ -1287,51 +1289,350 @@ func TestValueAndIsolatedEnv(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsSendsStreamFalse(t *testing.T) {
-	var rawBody map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
-		if err := json.Unmarshal(body, &rawBody); err != nil {
-			t.Fatalf("unmarshal body: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":    "json-1",
-			"model": "gpt-4.1",
-			"choices": []map[string]any{{
-				"index":         0,
-				"message":       map[string]any{"role": "assistant", "content": "ok"},
-				"finish_reason": "stop",
-			}},
-		})
-	}))
-	defer srv.Close()
+func TestChatCompletionsDefaultsToStreamTrueAndFallsBackOnHTTP400(t *testing.T) {
+	t.Run("default request sends stream=true and Accept header", func(t *testing.T) {
+		var rawBody map[string]any
+		var gotAccept string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAccept = r.Header.Get("Accept")
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if err := json.Unmarshal(body, &rawBody); err != nil {
+				t.Fatalf("unmarshal body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    "json-1",
+				"model": "gpt-4.1",
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "ok"},
+					"finish_reason": "stop",
+				}},
+			})
+		}))
+		defer srv.Close()
 
-	client := NewClient(srv.Client())
-	ep := config.ResolvedEndpoint{
-		BaseURL: srv.URL + "/v1",
-	}
-	resp, err := client.ChatCompletions(context.Background(), ep, ChatRequest{
-		Model:    "gpt-4.1",
-		Messages: []Message{{Role: "user", Content: "hello"}},
+		client := NewClient(srv.Client())
+		ep := config.ResolvedEndpoint{
+			BaseURL: srv.URL + "/v1",
+		}
+		resp, err := client.ChatCompletions(context.Background(), ep, ChatRequest{
+			Model:    "gpt-4.1",
+			Messages: []Message{{Role: "user", Content: "hello"}},
+		})
+		if err != nil {
+			t.Fatalf("ChatCompletions: %v", err)
+		}
+		if resp.Choices[0].Message.Content != "ok" {
+			t.Fatalf("content = %q, want ok", resp.Choices[0].Message.Content)
+		}
+		streamVal, exists := rawBody["stream"]
+		if !exists {
+			t.Fatalf("expected request JSON to include explicit \"stream\": true, got body: %+v", rawBody)
+		}
+		streamBool, ok := streamVal.(bool)
+		if !ok || !streamBool {
+			t.Fatalf("expected request JSON \"stream\" to be true, got %#v", streamVal)
+		}
+		if gotAccept != "text/event-stream, application/json" {
+			t.Fatalf("Accept header = %q, want %q", gotAccept, "text/event-stream, application/json")
+		}
 	})
-	if err != nil {
-		t.Fatalf("ChatCompletions: %v", err)
-	}
-	if resp.Choices[0].Message.Content != "ok" {
-		t.Fatalf("content = %q, want ok", resp.Choices[0].Message.Content)
-	}
-	streamVal, exists := rawBody["stream"]
-	if !exists {
-		t.Fatalf("expected request JSON to include explicit \"stream\": false, got body: %+v", rawBody)
-	}
-	streamBool, ok := streamVal.(bool)
-	if !ok || streamBool {
-		t.Fatalf("expected request JSON \"stream\" to be false, got %#v", streamVal)
-	}
+
+	t.Run("HTTP 400 mentioning stream falls back once to stream=false", func(t *testing.T) {
+		var attempts atomic.Int32
+		var seenStreams []bool
+		var seenAccepts []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := attempts.Add(1)
+			seenAccepts = append(seenAccepts, r.Header.Get("Accept"))
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request %d: %v", n, err)
+			}
+			s, _ := body["stream"].(bool)
+			seenStreams = append(seenStreams, s)
+
+			if n == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"Streaming is not supported for this model (Stream=true rejected)"}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":    "json-fallback",
+				"model": "gpt-4.1",
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "fallback ok"},
+					"finish_reason": "stop",
+				}},
+			})
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		resp, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: srv.URL + "/v1",
+		}, ChatRequest{
+			Model:    "gpt-4.1",
+			Messages: []Message{{Role: "user", Content: "hello"}},
+		})
+		if err != nil {
+			t.Fatalf("ChatCompletions fallback failed: %v", err)
+		}
+		if resp.Choices[0].Message.Content != "fallback ok" {
+			t.Fatalf("content = %q, want %q", resp.Choices[0].Message.Content, "fallback ok")
+		}
+		if attempts.Load() != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts.Load())
+		}
+		if len(seenStreams) != 2 || !seenStreams[0] || seenStreams[1] {
+			t.Fatalf("seenStreams = %v, want [true false]", seenStreams)
+		}
+		if seenAccepts[0] != "text/event-stream, application/json" {
+			t.Fatalf("attempt 1 Accept = %q, want text/event-stream, application/json", seenAccepts[0])
+		}
+	})
+
+	t.Run("HTTP 400 not mentioning stream does not retry", func(t *testing.T) {
+		var attempts atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"invalid model name"}}`)
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		_, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: srv.URL + "/v1",
+		}, ChatRequest{Model: "bad", Messages: []Message{{Role: "user", Content: "hi"}}})
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected HTTP 400 *APIError, got %v", err)
+		}
+		if attempts.Load() != 1 {
+			t.Fatalf("attempts = %d, want 1", attempts.Load())
+		}
+	})
+
+	t.Run("HTTP 400 mentioning stream on both attempts retries only once", func(t *testing.T) {
+		var attempts atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"stream option invalid"}}`)
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		_, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: srv.URL + "/v1",
+		}, ChatRequest{Model: "m1", Messages: []Message{{Role: "user", Content: "hi"}}})
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected HTTP 400 *APIError, got %v", err)
+		}
+		if attempts.Load() != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts.Load())
+		}
+	})
+
+	t.Run("HTTP 400 fallback respects context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var attempts atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"stream unsupported"}}`)
+			cancel()
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		_, err := client.ChatCompletions(ctx, config.ResolvedEndpoint{
+			BaseURL: srv.URL + "/v1",
+		}, ChatRequest{Model: "m1", Messages: []Message{{Role: "user", Content: "hi"}}})
+		if err == nil {
+			t.Fatal("expected error when ctx cancelled")
+		}
+		if attempts.Load() != 1 {
+			t.Fatalf("attempts = %d, want 1 (should not retry after ctx cancellation)", attempts.Load())
+		}
+	})
+}
+
+func TestChatCompletionsIdleTimeoutAllowsActiveStreamAndAbortsStalledStream(t *testing.T) {
+	t.Run("NewClient(nil) configures ResponseHeaderTimeout and no hard Client.Timeout", func(t *testing.T) {
+		c := NewClient(nil)
+		if c.httpClient == nil {
+			t.Fatal("expected non-nil httpClient")
+		}
+		if c.httpClient.Timeout != 0 {
+			t.Fatalf("httpClient.Timeout = %s, want 0 (no wall-clock body cutoff)", c.httpClient.Timeout)
+		}
+		tr, ok := c.httpClient.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("Transport = %T, want *http.Transport", c.httpClient.Transport)
+		}
+		if tr.ResponseHeaderTimeout != 90*time.Second {
+			t.Fatalf("ResponseHeaderTimeout = %s, want 90s", tr.ResponseHeaderTimeout)
+		}
+		if c.headerTimeout != 90*time.Second || c.idleTimeout != 60*time.Second || c.maxRequestTimeout != 165*time.Second {
+			t.Fatalf("unexpected default timeouts: header=%s idle=%s max=%s", c.headerTimeout, c.idleTimeout, c.maxRequestTimeout)
+		}
+
+		// PRESERVE: caller-supplied httpClient is used untouched.
+		custom := &http.Client{Timeout: 42 * time.Second}
+		cc := NewClient(custom)
+		if cc.httpClient != custom || cc.httpClient.Timeout != 42*time.Second {
+			t.Fatalf("caller-supplied httpClient was altered: %+v", cc.httpClient)
+		}
+	})
+
+	t.Run("active SSE stream exceeding idleTimeout in total duration completes cleanly", func(t *testing.T) {
+		chunks := []string{
+			`data: {"id":"active-1","model":"m1","choices":[{"index":0,"delta":{"role":"assistant","content":"A"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"content":"B"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"content":"C"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"content":"D"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"content":"E"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"content":"F"}}]}`,
+			`data: {"choices":[{"index":0,"delta":{"content":"G"},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			for _, ch := range chunks {
+				_, _ = io.WriteString(w, ch+"\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(30 * time.Millisecond):
+				}
+			}
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		client.idleTimeout = 80 * time.Millisecond
+		client.maxRequestTimeout = 2 * time.Second
+
+		resp, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: srv.URL + "/v1",
+		}, ChatRequest{
+			Model:    "m1",
+			Messages: []Message{{Role: "user", Content: "stream"}},
+		})
+		if err != nil {
+			t.Fatalf("active stream failed unexpectedly: %v", err)
+		}
+		if len(resp.Choices) != 1 || resp.Choices[0].Message.Content != "ABCDEFG" {
+			t.Fatalf("assembled content = %+v, want ABCDEFG", resp.Choices)
+		}
+	})
+
+	t.Run("stalled SSE stream aborts promptly with redacted idle timeout error and zero goroutine leaks", func(t *testing.T) {
+		const secretKey = "sk-idle-timeout-secret"
+		beforeGoroutines := runtime.NumGoroutine()
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			_, _ = io.WriteString(w, "data: {\"id\":\"stall-1\",\"model\":\"m1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial \"}}]}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			// Stall until client cancels.
+			<-r.Context().Done()
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		client.idleTimeout = 80 * time.Millisecond
+		client.maxRequestTimeout = 2 * time.Second
+
+		start := time.Now()
+		_, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: strings.Replace(srv.URL, "http://", "http://user:pw@", 1) + "/v1?token=secret",
+			APIKey:  secretKey,
+		}, ChatRequest{
+			Model:    "m1",
+			Messages: []Message{{Role: "user", Content: "stall"}},
+		})
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("expected idle timeout error on stalled stream")
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "idle timeout") {
+			t.Fatalf("expected error mentioning idle timeout, got: %v", err)
+		}
+		if strings.Contains(err.Error(), secretKey) || strings.Contains(err.Error(), "user:pw") || strings.Contains(err.Error(), "token=secret") {
+			t.Fatalf("idle timeout error leaked credentials: %v", err)
+		}
+		if elapsed > 1*time.Second {
+			t.Fatalf("stalled stream took too long to abort: %s (expected << maxRequestTimeout 2s)", elapsed)
+		}
+
+		// Allow net/http connection teardown goroutines to settle and verify zero leak.
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if runtime.NumGoroutine() <= beforeGoroutines+2 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := runtime.NumGoroutine(); got > beforeGoroutines+2 {
+			t.Fatalf("goroutine count grew from %d to %d after stalled stream", beforeGoroutines, got)
+		}
+	})
+
+	t.Run("maxRequestTimeout caps overly long active stream", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 20; i++ {
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(30 * time.Millisecond):
+				}
+			}
+		}))
+		defer srv.Close()
+
+		client := NewClient(srv.Client())
+		client.idleTimeout = 1 * time.Second
+		client.maxRequestTimeout = 120 * time.Millisecond
+
+		start := time.Now()
+		_, err := client.ChatCompletions(context.Background(), config.ResolvedEndpoint{
+			BaseURL: srv.URL + "/v1",
+		}, ChatRequest{
+			Model:    "m1",
+			Messages: []Message{{Role: "user", Content: "long"}},
+		})
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("expected maxRequestTimeout error")
+		}
+		if elapsed > 1*time.Second {
+			t.Fatalf("maxRequestTimeout took too long: %s", elapsed)
+		}
+	})
 }
 
 func TestChatCompletionsSSEReasoningAndTextChunks(t *testing.T) {
