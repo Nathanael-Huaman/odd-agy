@@ -813,10 +813,12 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMess
 			if runErr != nil {
 				res.Status = llm.TaskStatusFailed
 				res.Error = runErr.Error()
+				if !rec.SubmittedToLineage {
+					res.FallbackToNative = true
+				}
+			} else if !rec.SubmittedToLineage {
 				res.FallbackToNative = true
-			} else if rec.Status == llm.TaskStatusFallbackNative || rec.Status == llm.TaskStatusFailed || rec.Status == llm.TaskStatusMaxTurns || !rec.SubmittedToLineage {
-				res.FallbackToNative = true
-				if res.Error == "" && !rec.SubmittedToLineage && rec.Status != llm.TaskStatusFallbackNative {
+				if res.Error == "" && rec.Status != llm.TaskStatusFallbackNative {
 					res.Error = "external lens did not submit findings to lineage"
 				}
 			}
@@ -830,17 +832,30 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMess
 		postStatus = st
 	}
 
+	postPendingSet := make(map[string]bool, len(postStatus.PendingLenses))
+	for _, l := range postStatus.PendingLenses {
+		postPendingSet[l] = true
+	}
+
 	fallbackSet := make(map[string]bool)
 	for _, ex := range executed {
-		if ex.FallbackToNative {
+		if ex.FallbackToNative && !ex.SubmittedToLineage && postPendingSet[ex.Lens] {
 			fallbackSet[ex.Lens] = true
 		}
 	}
 
 	nativePending := make([]string, 0, len(targetLenses))
+	var fallbackRoles []string
 	for _, lens := range targetLenses {
+		if !postPendingSet[lens] {
+			continue
+		}
 		if nativeSet[lens] || fallbackSet[lens] {
-			nativePending = append(nativePending, "review-"+lens)
+			role := "review-" + lens
+			nativePending = append(nativePending, role)
+			if fallbackSet[lens] {
+				fallbackRoles = append(fallbackRoles, role)
+			}
 		}
 	}
 
@@ -851,6 +866,12 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMess
 			strings.Join(nativePending, ", "),
 			lineageID,
 		)
+		if len(fallbackRoles) > 0 {
+			nextAction += fmt.Sprintf(
+				" Include fallback_to_native in the prompt for failed external-mcp role(s) ([%s]) so PreToolUse admits the invoke_subagent batch.",
+				strings.Join(fallbackRoles, ", "),
+			)
+		}
 	}
 
 	return toolJSONOrErr(reviewRunLensesResult{

@@ -1536,6 +1536,9 @@ func TestMCPReviewRunLensesMixedAndNativeOnlyAndFailureFallback(t *testing.T) {
 	if !strings.Contains(mixedRes.NextAction, "invoke_subagent") {
 		t.Fatalf("expected nextAction to mention invoke_subagent, got %q", mixedRes.NextAction)
 	}
+	if !strings.Contains(mixedRes.NextAction, "fallback_to_native") || !strings.Contains(mixedRes.NextAction, "review-reliability") {
+		t.Fatalf("expected nextAction to mention fallback_to_native and review-reliability, got %q", mixedRes.NextAction)
+	}
 
 	// 3. Optional lenses subset and invalid lens error handling.
 	// Submit reliability and readability manually so lineage closes, then verify closed lineage fails cleanly.
@@ -1603,6 +1606,238 @@ func TestMCPReviewRunLensesMixedAndNativeOnlyAndFailureFallback(t *testing.T) {
 		"lineageId": startRes.LineageID,
 	}); !closedErr {
 		t.Fatalf("expected error on closed lineage, got: %s", closedOut)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestReviewRunLensesPostSubmitSummaryErrorDoesNotMarkFallback(t *testing.T) {
+	var failBeforeSubmit atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msgs := payload["messages"].([]any)
+		var toolCount int
+		for _, rawM := range msgs {
+			if rawM.(map[string]any)["role"] == "tool" {
+				toolCount++
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch toolCount {
+		case 0:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading frozen scope",
+						"tool_calls": []map[string]any{{
+							"id":   "call_scope",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "read_review_scope",
+								"arguments": `{"cursor":0}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		case 1:
+			if failBeforeSubmit.Load() {
+				http.Error(w, "upstream error before submit", http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t2", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submitting findings",
+						"tool_calls": []map[string]any{{
+							"id":   "call_submit",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": `{"findings":[]}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		default:
+			// Post-submit summary turn returns HTTP 500.
+			http.Error(w, "upstream summary failure", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(10) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// 1. Post-submit HTTP 500 on summary turn must NOT mark fallbackToNative or nativeLensesPending, and nextAction == "ack".
+	startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk"},
+		"lensesReason": "verify post-submit HTTP 500 does not trigger fallback",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start failed: %s", startOut)
+	}
+	var startRes rdd.StartResult
+	if err := json.Unmarshal([]byte(startOut), &startRes); err != nil {
+		t.Fatalf("unmarshal startRes: %v", err)
+	}
+	if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": startRes.LineageID,
+		"answer":    "granted",
+	}); isErr {
+		t.Fatal("odd_review_consent failed")
+	}
+
+	runOut, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr {
+		t.Fatalf("odd_review_run_lenses failed: %s", runOut)
+	}
+	var runRes struct {
+		ExecutedLenses []struct {
+			Lens               string `json:"lens"`
+			Status             string `json:"status"`
+			SubmittedToLineage bool   `json:"submittedToLineage"`
+			FallbackToNative   bool   `json:"fallbackToNative"`
+			Error              string `json:"error"`
+		} `json:"executedLenses"`
+		NativeLensesPending []string          `json:"nativeLensesPending"`
+		NextAction          string            `json:"nextAction"`
+		ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
+	}
+	if err := json.Unmarshal([]byte(runOut), &runRes); err != nil {
+		t.Fatalf("unmarshal runRes: %v\n%s", err, runOut)
+	}
+	if len(runRes.ExecutedLenses) != 1 {
+		t.Fatalf("executedLenses len = %d, want 1: %s", len(runRes.ExecutedLenses), runOut)
+	}
+	ex := runRes.ExecutedLenses[0]
+	if ex.Lens != "risk" || !ex.SubmittedToLineage || ex.FallbackToNative {
+		t.Fatalf("post-submit error lens result = %+v, want SubmittedToLineage=true and FallbackToNative=false", ex)
+	}
+	if len(runRes.NativeLensesPending) != 0 {
+		t.Fatalf("expected empty nativeLensesPending after submit, got %v", runRes.NativeLensesPending)
+	}
+	if runRes.ReviewStatus.Status != rdd.StatusApprovedPending {
+		t.Fatalf("reviewStatus.Status = %q, want %q", runRes.ReviewStatus.Status, rdd.StatusApprovedPending)
+	}
+	if runRes.NextAction != "ack" {
+		t.Fatalf("nextAction = %q, want %q", runRes.NextAction, "ack")
+	}
+	if ackOut, isErr := cli.callTool("odd_review_ack", map[string]any{
+		"lineageId": startRes.LineageID,
+	}); isErr || !strings.Contains(ackOut, rdd.AuthorityBurned) {
+		t.Fatalf("odd_review_ack unexpected (err=%v): %s", isErr, ackOut)
+	}
+
+	// 2. When an external lens actually fails BEFORE submitting, fallbackToNative=true, nativeLensesPending=["review-risk"],
+	// and nextAction explicitly instructs mentioning fallback_to_native for the failed external lens role.
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(11) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go v2: %v", err)
+	}
+	failBeforeSubmit.Store(true)
+
+	start2Out, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk"},
+		"lensesReason": "verify pre-submit failure sets fallback_to_native guidance",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start 2 failed: %s", start2Out)
+	}
+	var start2Res rdd.StartResult
+	if err := json.Unmarshal([]byte(start2Out), &start2Res); err != nil {
+		t.Fatalf("unmarshal start2Res: %v", err)
+	}
+	if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": start2Res.LineageID,
+		"answer":    "granted",
+	}); isErr {
+		t.Fatal("odd_review_consent 2 failed")
+	}
+
+	run2Out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": start2Res.LineageID,
+	})
+	if isErr {
+		t.Fatalf("odd_review_run_lenses 2 failed: %s", run2Out)
+	}
+	var run2Res struct {
+		ExecutedLenses []struct {
+			Lens               string `json:"lens"`
+			SubmittedToLineage bool   `json:"submittedToLineage"`
+			FallbackToNative   bool   `json:"fallbackToNative"`
+		} `json:"executedLenses"`
+		NativeLensesPending []string `json:"nativeLensesPending"`
+		NextAction          string   `json:"nextAction"`
+	}
+	if err := json.Unmarshal([]byte(run2Out), &run2Res); err != nil {
+		t.Fatalf("unmarshal run2Res: %v\n%s", err, run2Out)
+	}
+	if len(run2Res.ExecutedLenses) != 1 || run2Res.ExecutedLenses[0].SubmittedToLineage || !run2Res.ExecutedLenses[0].FallbackToNative {
+		t.Fatalf("pre-submit failure lens result = %+v, want SubmittedToLineage=false and FallbackToNative=true", run2Res.ExecutedLenses)
+	}
+	if len(run2Res.NativeLensesPending) != 1 || run2Res.NativeLensesPending[0] != "review-risk" {
+		t.Fatalf("nativeLensesPending = %v, want [review-risk]", run2Res.NativeLensesPending)
+	}
+	if !strings.Contains(run2Res.NextAction, "fallback_to_native") || !strings.Contains(run2Res.NextAction, "review-risk") {
+		t.Fatalf("expected nextAction to mention fallback_to_native and review-risk, got %q", run2Res.NextAction)
 	}
 
 	_ = inW.Close()
