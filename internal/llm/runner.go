@@ -625,7 +625,7 @@ func (r *Runner) reviewHostTools(role, lineageID string) []ToolDefinition {
 					"type": "object",
 					"properties": map[string]any{
 						"id":        map[string]any{"type": "string", "description": "Unique finding identifier"},
-						"severity":  map[string]any{"type": "string", "enum": []string{"BLOCKER", "WARNING", "SUGGESTION"}},
+						"severity":  map[string]any{"type": "string", "enum": []string{"BLOCKER", "SEVERE", "WARNING", "SUGGESTION"}},
 						"causality": map[string]any{"type": "string", "enum": []string{"candidate", "pre_existing", "unknown"}},
 						"location":  map[string]any{"type": "string", "description": "file:line"},
 						"claim":     map[string]any{"type": "string", "description": "Concise evidence-backed finding"},

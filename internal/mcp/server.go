@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 	"github.com/Nathanael-Huaman/odd-agy/internal/llm"
 	"github.com/Nathanael-Huaman/odd-agy/internal/rdd"
 	"github.com/Nathanael-Huaman/odd-agy/internal/todo"
@@ -425,6 +426,8 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 		return s.handleReviewScope(rawArgs)
 	case "odd_review_submit":
 		return s.handleReviewSubmit(rawArgs)
+	case "odd_review_run_lenses":
+		return s.handleReviewRunLenses(ctx, rawArgs)
 	case "odd_review_apply_correction":
 		return s.handleReviewApplyCorrection(rawArgs)
 	case "odd_review_status":
@@ -671,6 +674,225 @@ func (s *Server) handleReviewAck(rawArgs json.RawMessage) (callToolResult, *rpcE
 	return toolJSONOrErr(res, err), nil
 }
 
+type lensExecResult struct {
+	Lens               string `json:"lens"`
+	Role               string `json:"role"`
+	Provider           string `json:"provider,omitempty"`
+	Model              string `json:"model,omitempty"`
+	Status             string `json:"status"`
+	SubmittedToLineage bool   `json:"submittedToLineage"`
+	TaskID             string `json:"taskId,omitempty"`
+	Error              string `json:"error,omitempty"`
+	FallbackToNative   bool   `json:"fallbackToNative,omitempty"`
+}
+
+type reviewRunLensesResult struct {
+	LineageID           string            `json:"lineageId"`
+	ExecutedLenses      []lensExecResult  `json:"executedLenses"`
+	NativeLensesPending []string          `json:"nativeLensesPending"`
+	NextAction          string            `json:"nextAction"`
+	ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
+}
+
+func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMessage) (callToolResult, *rpcError) {
+	var args struct {
+		LineageID string   `json:"lineageId"`
+		Lenses    []string `json:"lenses"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
+	}
+	lineageID := strings.TrimSpace(args.LineageID)
+	if lineageID == "" {
+		return toolErr(errors.New("lineageId is required")), nil
+	}
+
+	st, err := s.rdd.Status(lineageID)
+	if err != nil {
+		return toolErr(err), nil
+	}
+	if st.Status != rdd.StatusCollectingLenses {
+		return toolErr(fmt.Errorf("lineage %s is in status %q, expected %q", lineageID, st.Status, rdd.StatusCollectingLenses)), nil
+	}
+
+	pendingLenses := make([]string, 0, len(st.Lenses))
+	if len(st.PendingLenses) > 0 {
+		pendingLenses = append(pendingLenses, st.PendingLenses...)
+	} else {
+		completed := make(map[string]bool, len(st.CompletedLenses))
+		for _, c := range st.CompletedLenses {
+			completed[c] = true
+		}
+		for _, l := range st.Lenses {
+			if !completed[l] {
+				pendingLenses = append(pendingLenses, l)
+			}
+		}
+	}
+	if len(pendingLenses) == 0 {
+		return toolErr(fmt.Errorf("lineage %s has no pending lenses", lineageID)), nil
+	}
+
+	pendingSet := make(map[string]bool, len(pendingLenses))
+	for _, l := range pendingLenses {
+		pendingSet[l] = true
+	}
+
+	var targetLenses []string
+	if len(args.Lenses) == 0 {
+		targetLenses = append([]string(nil), pendingLenses...)
+	} else {
+		requestedSet := make(map[string]bool, len(args.Lenses))
+		for _, raw := range args.Lenses {
+			norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(raw)), "review-")
+			switch norm {
+			case rdd.LensRisk, rdd.LensResilience, rdd.LensReadability, rdd.LensReliability:
+			default:
+				return toolErr(fmt.Errorf("invalid lens %q: must be one of risk, resilience, readability, reliability", raw)), nil
+			}
+			if requestedSet[norm] {
+				return toolErr(fmt.Errorf("duplicate lens %q", norm)), nil
+			}
+			if !pendingSet[norm] {
+				return toolErr(fmt.Errorf("lens %q is not pending for lineage %s", norm, lineageID)), nil
+			}
+			requestedSet[norm] = true
+		}
+		for _, l := range pendingLenses {
+			if requestedSet[l] {
+				targetLenses = append(targetLenses, l)
+			}
+		}
+	}
+
+	profs, err := config.LoadProfiles(s.workspace)
+	if err != nil {
+		return toolErr(err), nil
+	}
+	pf, hasPF := profs.Profiles[profs.ActiveProfile]
+
+	var externalLenses []string
+	nativeSet := make(map[string]bool, len(targetLenses))
+	for _, lens := range targetLenses {
+		role := "review-" + lens
+		isExternal := false
+		if hasPF {
+			if ra, ok := pf.Roles[role]; ok && ra.Runtime == config.RuntimeExternalMCP {
+				isExternal = true
+			}
+		}
+		if isExternal {
+			externalLenses = append(externalLenses, lens)
+		} else {
+			nativeSet[lens] = true
+		}
+	}
+
+	executed := make([]lensExecResult, len(externalLenses))
+	var wg sync.WaitGroup
+	for i, lens := range externalLenses {
+		wg.Add(1)
+		go func(idx int, l string) {
+			defer wg.Done()
+			role := "review-" + l
+			rec, runErr := s.runner.Run(ctx, llm.RunRequest{
+				Role:      role,
+				LineageID: lineageID,
+				Task:      buildReviewLensPrompt(lineageID, l, role),
+			})
+			res := lensExecResult{
+				Lens:               l,
+				Role:               role,
+				Provider:           rec.Provider,
+				Model:              rec.Model,
+				Status:             rec.Status,
+				SubmittedToLineage: rec.SubmittedToLineage,
+				TaskID:             rec.TaskID,
+				Error:              rec.Error,
+			}
+			if runErr != nil {
+				res.Status = llm.TaskStatusFailed
+				res.Error = runErr.Error()
+				if !rec.SubmittedToLineage {
+					res.FallbackToNative = true
+				}
+			} else if !rec.SubmittedToLineage {
+				res.FallbackToNative = true
+				if res.Error == "" && rec.Status != llm.TaskStatusFallbackNative {
+					res.Error = "external lens did not submit findings to lineage"
+				}
+			}
+			executed[idx] = res
+		}(i, lens)
+	}
+	wg.Wait()
+
+	postStatus, err := s.rdd.Status(lineageID)
+	if err != nil {
+		postStatus = st
+	}
+
+	postPendingSet := make(map[string]bool, len(postStatus.PendingLenses))
+	for _, l := range postStatus.PendingLenses {
+		postPendingSet[l] = true
+	}
+
+	fallbackSet := make(map[string]bool)
+	for _, ex := range executed {
+		if ex.FallbackToNative && !ex.SubmittedToLineage && postPendingSet[ex.Lens] {
+			fallbackSet[ex.Lens] = true
+		}
+	}
+
+	nativePending := make([]string, 0, len(targetLenses))
+	var fallbackRoles []string
+	for _, lens := range targetLenses {
+		if !postPendingSet[lens] {
+			continue
+		}
+		if nativeSet[lens] || fallbackSet[lens] {
+			role := "review-" + lens
+			nativePending = append(nativePending, role)
+			if fallbackSet[lens] {
+				fallbackRoles = append(fallbackRoles, role)
+			}
+		}
+	}
+
+	nextAction := postStatus.NextAction
+	if len(nativePending) > 0 {
+		nextAction = fmt.Sprintf(
+			"Launch all pending native review lenses ([%s]) together in a single parallel invoke_subagent call for lineage %s.",
+			strings.Join(nativePending, ", "),
+			lineageID,
+		)
+		if len(fallbackRoles) > 0 {
+			nextAction += fmt.Sprintf(
+				" Include fallback_to_native in the prompt for failed external-mcp role(s) ([%s]) so PreToolUse admits the invoke_subagent batch.",
+				strings.Join(fallbackRoles, ", "),
+			)
+		}
+	}
+
+	return toolJSONOrErr(reviewRunLensesResult{
+		LineageID:           lineageID,
+		ExecutedLenses:      executed,
+		NativeLensesPending: nativePending,
+		NextAction:          nextAction,
+		ReviewStatus:        postStatus,
+	}, nil), nil
+}
+
+func buildReviewLensPrompt(lineageID, lens, role string) string {
+	return fmt.Sprintf(
+		"You are %s evaluating the %s lens for frozen RDD review lineage %s.\n"+
+			"1. Read the frozen candidate snapshot exclusively using read_review_scope (never inspect live worktree files).\n"+
+			"2. Submit your structured findings directly using submit_review_findings (with severity BLOCKER, SEVERE, WARNING, or SUGGESTION; causality candidate, pre_existing, or unknown; location file:line; and concise claim).\n"+
+			"3. After submitting, provide a brief summary.",
+		role, lens, lineageID,
+	)
+}
+
 func (s *Server) handleExternalProfiles() (callToolResult, *rpcError) {
 	res, err := s.runner.ProfilesSummary()
 	return toolJSONOrErr(res, err), nil
@@ -866,7 +1088,7 @@ func (s *Server) toolDefinitions() []toolSpec {
 							"type": "object",
 							"properties": map[string]any{
 								"id":        map[string]any{"type": "string", "description": "Unique finding identifier"},
-								"severity":  map[string]any{"type": "string", "enum": []string{"BLOCKER", "WARNING", "SUGGESTION"}},
+								"severity":  map[string]any{"type": "string", "enum": []string{"BLOCKER", "SEVERE", "WARNING", "SUGGESTION"}},
 								"causality": map[string]any{"type": "string", "enum": []string{"candidate", "pre_existing", "unknown"}},
 								"location":  map[string]any{"type": "string", "description": "file:line"},
 								"claim":     map[string]any{"type": "string", "description": "Concise evidence-backed finding"},
@@ -889,6 +1111,25 @@ func (s *Server) toolDefinitions() []toolSpec {
 					},
 				},
 				"required": []string{"lineageId", "role"},
+			},
+		},
+		{
+			Name:        "odd_review_run_lenses",
+			Description: "Run all pending external-mcp 4R review lenses in parallel for an RDD lineage and report any agy-native lenses to launch together.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"lineageId": map[string]any{
+						"type":        "string",
+						"description": "Active RDD review lineage ID (in collecting_lenses status)",
+					},
+					"lenses": map[string]any{
+						"type":        "array",
+						"description": "Optional subset of pending 4R lenses; defaults to all currently pending lenses for lineageId",
+						"items":       map[string]any{"type": "string"},
+					},
+				},
+				"required": []string{"lineageId"},
 			},
 		},
 		{

@@ -1644,13 +1644,25 @@ func TestExternalReviewRoleWithReviewHostUsesFrozenScopeAndSubmitsDirectly(t *te
 
 	var step atomic.Int32
 	var seenToolNames []string
+	var seenSeverityEnum []any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		n := step.Add(1)
 		if n == 1 {
 			for _, item := range payload["tools"].([]any) {
-				seenToolNames = append(seenToolNames, item.(map[string]any)["function"].(map[string]any)["name"].(string))
+				fn := item.(map[string]any)["function"].(map[string]any)
+				name := fn["name"].(string)
+				seenToolNames = append(seenToolNames, name)
+				if name == "submit_review_findings" {
+					params := fn["parameters"].(map[string]any)
+					props := params["properties"].(map[string]any)
+					findings := props["findings"].(map[string]any)
+					items := findings["items"].(map[string]any)
+					itemProps := items["properties"].(map[string]any)
+					sev := itemProps["severity"].(map[string]any)
+					seenSeverityEnum, _ = sev["enum"].([]any)
+				}
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1805,6 +1817,15 @@ func TestExternalReviewRoleWithReviewHostUsesFrozenScopeAndSubmitsDirectly(t *te
 	}
 	if !toolSet["read_review_scope"] || !toolSet["submit_review_findings"] {
 		t.Fatalf("unexpected tool set for review-risk: %v", seenToolNames)
+	}
+	wantSev := []string{"BLOCKER", "SEVERE", "WARNING", "SUGGESTION"}
+	if len(seenSeverityEnum) != len(wantSev) {
+		t.Fatalf("submit_review_findings severity.enum = %v, want %v", seenSeverityEnum, wantSev)
+	}
+	for i, w := range wantSev {
+		if seenSeverityEnum[i] != w {
+			t.Fatalf("submit_review_findings severity.enum[%d] = %v, want %v", i, seenSeverityEnum[i], w)
+		}
 	}
 
 	// Verify forbidden live-tree tool rejections and read_review_scope content.

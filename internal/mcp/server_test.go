@@ -236,7 +236,7 @@ func TestStdioMCPEndToEnd(t *testing.T) {
 	for _, required := range []string{
 		"todo",
 		"odd_review_mode", "odd_review_assess", "odd_review_start", "odd_review_consent",
-		"odd_review_scope", "odd_review_submit", "odd_review_apply_correction", "odd_review_status", "odd_review_ack",
+		"odd_review_scope", "odd_review_submit", "odd_review_run_lenses", "odd_review_apply_correction", "odd_review_status", "odd_review_ack",
 		"odd_external_profiles", "odd_external_run", "odd_external_continue", "odd_external_status",
 	} {
 		if !toolNames[required] {
@@ -1052,8 +1052,28 @@ func TestMCPToolsListSchemas(t *testing.T) {
 	}
 	itemProps := items["properties"].(map[string]any)
 	sevEnum := itemProps["severity"].(map[string]any)["enum"].([]any)
-	if len(sevEnum) != 3 || sevEnum[0] != "BLOCKER" || sevEnum[1] != "WARNING" || sevEnum[2] != "SUGGESTION" {
-		t.Fatalf("severity.enum = %v, want [BLOCKER WARNING SUGGESTION]", sevEnum)
+	wantSev := []string{"BLOCKER", "SEVERE", "WARNING", "SUGGESTION"}
+	if len(sevEnum) != len(wantSev) {
+		t.Fatalf("severity.enum = %v, want %v", sevEnum, wantSev)
+	}
+	for i, w := range wantSev {
+		if sevEnum[i] != w {
+			t.Fatalf("severity.enum[%d] = %v, want %v (full=%v)", i, sevEnum[i], w, sevEnum)
+		}
+	}
+
+	// Verify odd_review_run_lenses schema exists and requires lineageId.
+	runLensesTool, hasRunLenses := byName["odd_review_run_lenses"]
+	if !hasRunLenses {
+		t.Fatal("tools/list missing odd_review_run_lenses")
+	}
+	runLensesSchema := runLensesTool["inputSchema"].(map[string]any)
+	runLensesProps := runLensesSchema["properties"].(map[string]any)
+	if _, ok := runLensesProps["lineageId"]; !ok {
+		t.Fatalf("odd_review_run_lenses missing lineageId property: %+v", runLensesProps)
+	}
+	if lensesProp, ok := runLensesProps["lenses"].(map[string]any); !ok || lensesProp["type"] != "array" {
+		t.Fatalf("odd_review_run_lenses missing array lenses property: %+v", runLensesProps)
 	}
 	causEnum := itemProps["causality"].(map[string]any)["enum"].([]any)
 	if len(causEnum) != 3 || causEnum[0] != "candidate" || causEnum[1] != "pre_existing" || causEnum[2] != "unknown" {
@@ -1101,6 +1121,723 @@ func TestMCPToolsListSchemas(t *testing.T) {
 		}},
 	}); isErr || !strings.Contains(out, rdd.StatusCollectingRefuter) || !strings.Contains(out, rdd.SeveritySEVERE) {
 		t.Fatalf("odd_review_submit BLOCKER unexpected (err=%v): %s", isErr, out)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPReviewRunLensesExecutesAllExternalLensesInParallel(t *testing.T) {
+	const expectedLenses = 3
+	var inFlight atomic.Int32
+	barrierReady := make(chan struct{})
+	var barrierOnce sync.Once
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msgs := payload["messages"].([]any)
+		var rolePrompt string
+		if len(msgs) >= 1 {
+			rolePrompt, _ = msgs[0].(map[string]any)["content"].(string)
+		}
+		var toolCount int
+		for _, rawM := range msgs {
+			if rawM.(map[string]any)["role"] == "tool" {
+				toolCount++
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch toolCount {
+		case 0:
+			// Barrier on first turn across all 3 external lenses.
+			if n := inFlight.Add(1); n == expectedLenses {
+				barrierOnce.Do(func() { close(barrierReady) })
+			}
+			select {
+			case <-barrierReady:
+			case <-time.After(3 * time.Second):
+				http.Error(w, "timed out waiting for all 3 lenses to run concurrently", http.StatusGatewayTimeout)
+				return
+			case <-r.Context().Done():
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading frozen scope",
+						"tool_calls": []map[string]any{{
+							"id":   "call_scope",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "read_review_scope",
+								"arguments": `{"cursor":0}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		case 1:
+			// Submit finding or empty findings depending on lens; use SEVERE+pre_existing on one to verify SEVERE schema & non-blocking advisory.
+			argsJSON := `{"findings":[]}`
+			switch {
+			case strings.Contains(rolePrompt, "review-risk"):
+				argsJSON = `{"findings":[{"id":"RISK-ADV-1","severity":"SEVERE","causality":"pre_existing","location":"main.go:1","claim":"pre-existing note"}]}`
+			case strings.Contains(rolePrompt, "review-reliability"):
+				argsJSON = `{"findings":[{"id":"REL-1","severity":"WARNING","causality":"candidate","location":"main.go:3","claim":"minor note"}]}`
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t2", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submitting lens findings",
+						"tool_calls": []map[string]any{{
+							"id":   "call_submit",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": argsJSON,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t3", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "lens complete",
+						"reasoning_content": "done",
+					},
+					"finish_reason": "stop",
+				}},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(7) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk", "reliability", "readability"},
+		"lensesReason": "verify parallel grouped external lens execution",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start failed: %s", startOut)
+	}
+	var startRes rdd.StartResult
+	if err := json.Unmarshal([]byte(startOut), &startRes); err != nil {
+		t.Fatalf("unmarshal startRes: %v", err)
+	}
+
+	// Before consent, odd_review_run_lenses must fail cleanly.
+	preConsentOut, preConsentErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if !preConsentErr {
+		t.Fatalf("expected error before consent, got: %s", preConsentOut)
+	}
+
+	if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": startRes.LineageID,
+		"answer":    "granted",
+	}); isErr {
+		t.Fatal("odd_review_consent failed")
+	}
+
+	runOut, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr {
+		t.Fatalf("odd_review_run_lenses failed: %s", runOut)
+	}
+
+	var runRes struct {
+		LineageID      string `json:"lineageId"`
+		ExecutedLenses []struct {
+			Lens               string `json:"lens"`
+			Role               string `json:"role"`
+			Provider           string `json:"provider"`
+			Model              string `json:"model"`
+			Status             string `json:"status"`
+			SubmittedToLineage bool   `json:"submittedToLineage"`
+			TaskID             string `json:"taskId"`
+			Error              string `json:"error"`
+			FallbackToNative   bool   `json:"fallbackToNative"`
+		} `json:"executedLenses"`
+		NativeLensesPending []string          `json:"nativeLensesPending"`
+		NextAction          string            `json:"nextAction"`
+		ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
+	}
+	if err := json.Unmarshal([]byte(runOut), &runRes); err != nil {
+		t.Fatalf("unmarshal odd_review_run_lenses result: %v\n%s", err, runOut)
+	}
+	if runRes.LineageID != startRes.LineageID {
+		t.Fatalf("lineageId = %q, want %q", runRes.LineageID, startRes.LineageID)
+	}
+	if len(runRes.ExecutedLenses) != 3 {
+		t.Fatalf("executedLenses len = %d, want 3: %s", len(runRes.ExecutedLenses), runOut)
+	}
+	for _, ex := range runRes.ExecutedLenses {
+		if ex.Status != "completed" || !ex.SubmittedToLineage || ex.FallbackToNative || ex.TaskID == "" {
+			t.Fatalf("unexpected executed lens result %+v", ex)
+		}
+	}
+	if len(runRes.NativeLensesPending) != 0 {
+		t.Fatalf("expected no nativeLensesPending, got %v", runRes.NativeLensesPending)
+	}
+	if runRes.ReviewStatus.Status != rdd.StatusApprovedPending {
+		t.Fatalf("reviewStatus.Status = %q, want %q", runRes.ReviewStatus.Status, rdd.StatusApprovedPending)
+	}
+
+	// Ack closes/burns cleanly.
+	ackOut, isErr := cli.callTool("odd_review_ack", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr || !strings.Contains(ackOut, rdd.AuthorityBurned) {
+		t.Fatalf("odd_review_ack unexpected (err=%v): %s", isErr, ackOut)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPReviewRunLensesMixedAndNativeOnlyAndFailureFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		msgs := payload["messages"].([]any)
+		var toolCount int
+		for _, rawM := range msgs {
+			if rawM.(map[string]any)["role"] == "tool" {
+				toolCount++
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if toolCount == 0 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "m1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submit directly",
+						"tool_calls": []map[string]any{{
+							"id":   "c1",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": `{"findings":[]}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "m2", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role":              "assistant",
+					"content":           "ok",
+					"reasoning_content": "done",
+				},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(8) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	// 1. Native-only profile (agy-oauth): reports nativeLensesPending cleanly without failing.
+	if err := config.SaveProfiles(repo, config.DefaultProfilesConfig()); err != nil {
+		t.Fatalf("SaveProfiles agy-oauth: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk", "reliability", "readability"},
+		"lensesReason": "verify native and mixed profiles",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start failed: %s", startOut)
+	}
+	var startRes rdd.StartResult
+	_ = json.Unmarshal([]byte(startOut), &startRes)
+	_, _ = cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": startRes.LineageID,
+		"answer":    "granted",
+	})
+
+	nativeOut, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr {
+		t.Fatalf("native-only odd_review_run_lenses should succeed, got error: %s", nativeOut)
+	}
+	var nativeRes struct {
+		ExecutedLenses      []any             `json:"executedLenses"`
+		NativeLensesPending []string          `json:"nativeLensesPending"`
+		NextAction          string            `json:"nextAction"`
+		ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
+	}
+	if err := json.Unmarshal([]byte(nativeOut), &nativeRes); err != nil {
+		t.Fatalf("unmarshal nativeRes: %v", err)
+	}
+	if len(nativeRes.ExecutedLenses) != 0 {
+		t.Fatalf("expected 0 executedLenses for agy-oauth, got %d", len(nativeRes.ExecutedLenses))
+	}
+	if len(nativeRes.NativeLensesPending) != 3 {
+		t.Fatalf("expected 3 nativeLensesPending, got %v", nativeRes.NativeLensesPending)
+	}
+	if !strings.Contains(nativeRes.NextAction, "invoke_subagent") {
+		t.Fatalf("expected nextAction to mention invoke_subagent, got %q", nativeRes.NextAction)
+	}
+
+	// 2. Mixed profile: review-risk=external-mcp, review-reliability=external-mcp (missing openai key -> fallback), review-readability=agy-native.
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	prof := profiles.Profiles["deepseek-hybrid"]
+	prof.Roles["review-readability"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "pro"}
+	prof.Roles["review-reliability"] = config.RoleRoute{
+		Runtime:  config.RuntimeExternalMCP,
+		Provider: "openai-compatible",
+		Model:    "gpt-4.1",
+		Fallback: []config.RoleTarget{{Runtime: config.RuntimeAgyNative, Model: "pro"}},
+	}
+	profiles.Profiles["deepseek-hybrid"] = prof
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles mixed: %v", err)
+	}
+
+	mixedOut, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr {
+		t.Fatalf("mixed odd_review_run_lenses failed: %s", mixedOut)
+	}
+	var mixedRes struct {
+		ExecutedLenses []struct {
+			Lens               string `json:"lens"`
+			Status             string `json:"status"`
+			SubmittedToLineage bool   `json:"submittedToLineage"`
+			FallbackToNative   bool   `json:"fallbackToNative"`
+		} `json:"executedLenses"`
+		NativeLensesPending []string          `json:"nativeLensesPending"`
+		NextAction          string            `json:"nextAction"`
+		ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
+	}
+	if err := json.Unmarshal([]byte(mixedOut), &mixedRes); err != nil {
+		t.Fatalf("unmarshal mixedRes: %v", err)
+	}
+	if len(mixedRes.ExecutedLenses) != 2 {
+		t.Fatalf("expected 2 executedLenses in mixed profile, got %d: %s", len(mixedRes.ExecutedLenses), mixedOut)
+	}
+	// review-risk should succeed; review-reliability (missing OPENAI_API_KEY) should mark fallbackToNative=true and appear in nativeLensesPending alongside review-readability.
+	if len(mixedRes.NativeLensesPending) != 2 {
+		t.Fatalf("expected 2 nativeLensesPending ([review-reliability, review-readability]), got %v", mixedRes.NativeLensesPending)
+	}
+	pendingSet := map[string]bool{}
+	for _, r := range mixedRes.NativeLensesPending {
+		pendingSet[r] = true
+	}
+	if !pendingSet["review-reliability"] || !pendingSet["review-readability"] {
+		t.Fatalf("nativeLensesPending = %v, want review-reliability and review-readability", mixedRes.NativeLensesPending)
+	}
+	if !strings.Contains(mixedRes.NextAction, "invoke_subagent") {
+		t.Fatalf("expected nextAction to mention invoke_subagent, got %q", mixedRes.NextAction)
+	}
+	if !strings.Contains(mixedRes.NextAction, "fallback_to_native") || !strings.Contains(mixedRes.NextAction, "review-reliability") {
+		t.Fatalf("expected nextAction to mention fallback_to_native and review-reliability, got %q", mixedRes.NextAction)
+	}
+
+	// 3. Optional lenses subset and invalid lens error handling.
+	// Submit reliability and readability manually so lineage closes, then verify closed lineage fails cleanly.
+	if _, isErr := cli.callTool("odd_review_submit", map[string]any{
+		"lineageId": startRes.LineageID,
+		"role":      "reliability",
+		"findings":  []any{},
+	}); isErr {
+		t.Fatal("submit reliability failed")
+	}
+
+	// Invalid lens name fails cleanly.
+	if badLensOut, badLensErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+		"lenses":    []string{"not-a-lens"},
+	}); !badLensErr {
+		t.Fatalf("expected error for invalid lens, got: %s", badLensOut)
+	}
+
+	// Already completed lens ("risk") fails cleanly.
+	if doneLensOut, doneLensErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+		"lenses":    []string{"risk"},
+	}); !doneLensErr {
+		t.Fatalf("expected error for already-completed lens risk, got: %s", doneLensOut)
+	}
+
+	// Run subset ["readability"] via odd_review_run_lenses when readability is external-mcp.
+	prof.Roles["review-readability"] = config.RoleRoute{
+		Runtime:  config.RuntimeExternalMCP,
+		Provider: "deepseek",
+		Model:    "deepseek-v4-pro",
+	}
+	profiles.Profiles["deepseek-hybrid"] = prof
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles readability external: %v", err)
+	}
+	subOut, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+		"lenses":    []string{"readability"},
+	})
+	if isErr {
+		t.Fatalf("subset odd_review_run_lenses failed: %s", subOut)
+	}
+	var subRes struct {
+		ExecutedLenses      []struct{ Lens string } `json:"executedLenses"`
+		NativeLensesPending []string                `json:"nativeLensesPending"`
+		ReviewStatus        rdd.LineageStatus       `json:"reviewStatus"`
+	}
+	if err := json.Unmarshal([]byte(subOut), &subRes); err != nil {
+		t.Fatalf("unmarshal subRes: %v", err)
+	}
+	if len(subRes.ExecutedLenses) != 1 || subRes.ExecutedLenses[0].Lens != "readability" {
+		t.Fatalf("subset executedLenses = %+v, want [readability]", subRes.ExecutedLenses)
+	}
+	if len(subRes.NativeLensesPending) != 0 || subRes.ReviewStatus.Status != rdd.StatusApprovedPending {
+		t.Fatalf("subset unexpected state: %+v", subRes)
+	}
+
+	// Ack and verify closed lineage rejects odd_review_run_lenses cleanly.
+	if _, isErr := cli.callTool("odd_review_ack", map[string]any{"lineageId": startRes.LineageID}); isErr {
+		t.Fatal("odd_review_ack failed")
+	}
+	if closedOut, closedErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+	}); !closedErr {
+		t.Fatalf("expected error on closed lineage, got: %s", closedOut)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestReviewRunLensesPostSubmitSummaryErrorDoesNotMarkFallback(t *testing.T) {
+	var failBeforeSubmit atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msgs := payload["messages"].([]any)
+		var toolCount int
+		for _, rawM := range msgs {
+			if rawM.(map[string]any)["role"] == "tool" {
+				toolCount++
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch toolCount {
+		case 0:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading frozen scope",
+						"tool_calls": []map[string]any{{
+							"id":   "call_scope",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "read_review_scope",
+								"arguments": `{"cursor":0}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		case 1:
+			if failBeforeSubmit.Load() {
+				http.Error(w, "upstream error before submit", http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t2", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submitting findings",
+						"tool_calls": []map[string]any{{
+							"id":   "call_submit",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": `{"findings":[]}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		default:
+			// Post-submit summary turn returns HTTP 500.
+			http.Error(w, "upstream summary failure", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(10) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// 1. Post-submit HTTP 500 on summary turn must NOT mark fallbackToNative or nativeLensesPending, and nextAction == "ack".
+	startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk"},
+		"lensesReason": "verify post-submit HTTP 500 does not trigger fallback",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start failed: %s", startOut)
+	}
+	var startRes rdd.StartResult
+	if err := json.Unmarshal([]byte(startOut), &startRes); err != nil {
+		t.Fatalf("unmarshal startRes: %v", err)
+	}
+	if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": startRes.LineageID,
+		"answer":    "granted",
+	}); isErr {
+		t.Fatal("odd_review_consent failed")
+	}
+
+	runOut, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startRes.LineageID,
+	})
+	if isErr {
+		t.Fatalf("odd_review_run_lenses failed: %s", runOut)
+	}
+	var runRes struct {
+		ExecutedLenses []struct {
+			Lens               string `json:"lens"`
+			Status             string `json:"status"`
+			SubmittedToLineage bool   `json:"submittedToLineage"`
+			FallbackToNative   bool   `json:"fallbackToNative"`
+			Error              string `json:"error"`
+		} `json:"executedLenses"`
+		NativeLensesPending []string          `json:"nativeLensesPending"`
+		NextAction          string            `json:"nextAction"`
+		ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
+	}
+	if err := json.Unmarshal([]byte(runOut), &runRes); err != nil {
+		t.Fatalf("unmarshal runRes: %v\n%s", err, runOut)
+	}
+	if len(runRes.ExecutedLenses) != 1 {
+		t.Fatalf("executedLenses len = %d, want 1: %s", len(runRes.ExecutedLenses), runOut)
+	}
+	ex := runRes.ExecutedLenses[0]
+	if ex.Lens != "risk" || !ex.SubmittedToLineage || ex.FallbackToNative {
+		t.Fatalf("post-submit error lens result = %+v, want SubmittedToLineage=true and FallbackToNative=false", ex)
+	}
+	if len(runRes.NativeLensesPending) != 0 {
+		t.Fatalf("expected empty nativeLensesPending after submit, got %v", runRes.NativeLensesPending)
+	}
+	if runRes.ReviewStatus.Status != rdd.StatusApprovedPending {
+		t.Fatalf("reviewStatus.Status = %q, want %q", runRes.ReviewStatus.Status, rdd.StatusApprovedPending)
+	}
+	if runRes.NextAction != "ack" {
+		t.Fatalf("nextAction = %q, want %q", runRes.NextAction, "ack")
+	}
+	if ackOut, isErr := cli.callTool("odd_review_ack", map[string]any{
+		"lineageId": startRes.LineageID,
+	}); isErr || !strings.Contains(ackOut, rdd.AuthorityBurned) {
+		t.Fatalf("odd_review_ack unexpected (err=%v): %s", isErr, ackOut)
+	}
+
+	// 2. When an external lens actually fails BEFORE submitting, fallbackToNative=true, nativeLensesPending=["review-risk"],
+	// and nextAction explicitly instructs mentioning fallback_to_native for the failed external lens role.
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(11) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go v2: %v", err)
+	}
+	failBeforeSubmit.Store(true)
+
+	start2Out, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk"},
+		"lensesReason": "verify pre-submit failure sets fallback_to_native guidance",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start 2 failed: %s", start2Out)
+	}
+	var start2Res rdd.StartResult
+	if err := json.Unmarshal([]byte(start2Out), &start2Res); err != nil {
+		t.Fatalf("unmarshal start2Res: %v", err)
+	}
+	if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+		"lineageId": start2Res.LineageID,
+		"answer":    "granted",
+	}); isErr {
+		t.Fatal("odd_review_consent 2 failed")
+	}
+
+	run2Out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": start2Res.LineageID,
+	})
+	if isErr {
+		t.Fatalf("odd_review_run_lenses 2 failed: %s", run2Out)
+	}
+	var run2Res struct {
+		ExecutedLenses []struct {
+			Lens               string `json:"lens"`
+			SubmittedToLineage bool   `json:"submittedToLineage"`
+			FallbackToNative   bool   `json:"fallbackToNative"`
+		} `json:"executedLenses"`
+		NativeLensesPending []string `json:"nativeLensesPending"`
+		NextAction          string   `json:"nextAction"`
+	}
+	if err := json.Unmarshal([]byte(run2Out), &run2Res); err != nil {
+		t.Fatalf("unmarshal run2Res: %v\n%s", err, run2Out)
+	}
+	if len(run2Res.ExecutedLenses) != 1 || run2Res.ExecutedLenses[0].SubmittedToLineage || !run2Res.ExecutedLenses[0].FallbackToNative {
+		t.Fatalf("pre-submit failure lens result = %+v, want SubmittedToLineage=false and FallbackToNative=true", run2Res.ExecutedLenses)
+	}
+	if len(run2Res.NativeLensesPending) != 1 || run2Res.NativeLensesPending[0] != "review-risk" {
+		t.Fatalf("nativeLensesPending = %v, want [review-risk]", run2Res.NativeLensesPending)
+	}
+	if !strings.Contains(run2Res.NextAction, "fallback_to_native") || !strings.Contains(run2Res.NextAction, "review-risk") {
+		t.Fatalf("expected nextAction to mention fallback_to_native and review-risk, got %q", run2Res.NextAction)
 	}
 
 	_ = inW.Close()

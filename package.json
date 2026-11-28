@@ -1,6 +1,6 @@
 {
   "name": "odd-agy",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Project-scoped ODD & RDD harness for Antigravity CLI/IDE",
   "type": "module",
   "repository": {

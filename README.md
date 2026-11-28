@@ -137,8 +137,14 @@ Running `odd-agy init` installs:
 ### Unified MCP Server (`odd-agy mcp`)
 
 - **Todo**: `todo` (`write`, `add`, `update`, `list`, `clear`) persisted under `.git/odd-agy/todo.json`.
-- **Frozen-Snapshot RDD**: `odd_review_mode`, `odd_review_assess`, `odd_review_start`, `odd_review_consent` (always preceded by a plain-language explanation of risk tier, lenses, and consent impact), `odd_review_scope` (paginated + SHA-256 verified), `odd_review_submit` (strict `id`/`severity`/`causality`/`location`/`claim` schema for 4R lenses + refuter, max 1 correction), `odd_review_apply_correction`, `odd_review_status`, `odd_review_ack`.
+- **Frozen-Snapshot RDD**: `odd_review_mode`, `odd_review_assess`, `odd_review_start`, `odd_review_consent` (always preceded by a plain-language explanation of risk tier, lenses, and consent impact), `odd_review_scope` (paginated + SHA-256 verified), `odd_review_run_lenses` (grouped concurrent external lens runner returning `nativeLensesPending`), `odd_review_submit` (strict `id`/`severity`/`causality`/`location`/`claim` schema for 4R lenses + refuter, max 1 correction), `odd_review_apply_correction`, `odd_review_status`, `odd_review_ack`.
 - **Sandboxed External Runner**: `odd_external_profiles`, `odd_external_run`, `odd_external_continue`, `odd_external_status` — executes concurrent MCP requests in parallel, enforces `## Allowed edit surfaces` in code, blocks secrets/destructive commands/`git push`, and persists `reasoning_content` history under `.git/odd-agy/tasks/<taskId>.json`. For `review-*` roles given `lineageId`, reviewers run in a frozen-snapshot-only sandbox (`read_review_scope` with sensitive-file redaction + direct `submit_review_findings`, returning `submittedToLineage: true`).
+
+### What's New in `v0.1.3`
+
+- **Code-enforced parallel native lens batching (`PreToolUse`)**: `PreToolUse` blocks one-by-one `invoke_subagent` calls for pending `agy-native` 4R review lenses and requires launching all pending native lenses together in a single parallel batch (permitting single-lens calls only for `fallback_to_native` or a single remaining lens).
+- **Grouped external review tool (`odd_review_run_lenses`)**: Executes all pending `external-mcp` 4R lenses concurrently for a `lineageId`, aggregates submission results, and reports `nativeLensesPending` (including any `fallback_to_native` lenses) for single-batch native dispatch.
+- **`SEVERE` schema enum alignment**: Aligns the external reviewer `submit_review_findings` tool schema with `odd_review_submit` by accepting `"SEVERE"` alongside `"BLOCKER"`, `"WARNING"`, and `"SUGGESTION"`.
 
 ### What's New in `v0.1.2`
 

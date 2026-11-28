@@ -1581,3 +1581,471 @@ func TestPreToolUseInvokeSubagentEnforcesExternalMCPRouting(t *testing.T) {
 		t.Fatalf("expected allow for gentle-ai-explore with fallback_to_native, got %+v", outExploreFallback)
 	}
 }
+
+func TestPreToolUseInvokeSubagentEnforcesParallelNativeReviewBatch(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeFull
+	cfg.RDDEnabled = true
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	// Create candidate diff and start 3-lens RDD lineage in collecting_lenses.
+	writeFile(t, filepath.Join(repo, "app.go"), "package main\nfunc Add(a, b int) int { return a + b }\n")
+	eng := rdd.NewEngine(repo)
+	started, err := eng.Start(rdd.StartRequest{
+		Lenses:       []string{rdd.LensRisk, rdd.LensReliability, rdd.LensReadability},
+		LensesReason: "multi-lens review",
+	})
+	if err != nil {
+		t.Fatalf("rdd.Start: %v", err)
+	}
+
+	// While in consent_required, guard does not block (or wait until collecting_lenses).
+	if _, err := eng.AnswerConsent(started.LineageID, "granted"); err != nil {
+		t.Fatalf("rdd.AnswerConsent: %v", err)
+	}
+
+	// Default agy-oauth (even without profiles.json on disk) treats all 3 pending lenses as native.
+	// 1. Single-lens invoke_subagent([review-risk]) -> DENY naming lineageId, count, and all 3 pending lenses.
+	var singleDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     1,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review lineage " + started.LineageID},
+				},
+			},
+		},
+	}, &singleDeny)
+	if singleDeny.Decision != DecisionDeny {
+		t.Fatalf("single-lens review-risk: expected deny, got %+v", singleDeny)
+	}
+	for _, want := range []string{started.LineageID, "3", "review-risk", "review-reliability", "review-readability"} {
+		if !strings.Contains(singleDeny.Reason, want) {
+			t.Errorf("single-lens deny reason %q missing %q", singleDeny.Reason, want)
+		}
+	}
+
+	// 2. Single-lens without lineageId in prompt -> still resolves active collecting_lenses lineage and DENIES.
+	var inferredDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     2,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review the frozen snapshot."},
+				},
+			},
+		},
+	}, &inferredDeny)
+	if inferredDeny.Decision != DecisionDeny {
+		t.Fatalf("inferred lineage single-lens review-risk: expected deny, got %+v", inferredDeny)
+	}
+	for _, want := range []string{started.LineageID, "review-risk", "review-reliability", "review-readability"} {
+		if !strings.Contains(inferredDeny.Reason, want) {
+			t.Errorf("inferred deny reason %q missing %q", inferredDeny.Reason, want)
+		}
+	}
+
+	// 3. Partial 2-of-3 batch invoke_subagent([review-risk, review-reliability]) -> DENY naming missing review-readability.
+	var partialDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     3,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-reliability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &partialDeny)
+	if partialDeny.Decision != DecisionDeny {
+		t.Fatalf("partial 2-of-3 batch: expected deny, got %+v", partialDeny)
+	}
+	if !strings.Contains(partialDeny.Reason, "review-readability") {
+		t.Errorf("partial 2-of-3 deny reason %q missing missing lens review-readability", partialDeny.Reason)
+	}
+
+	// 4. Duplicate role in batch [review-risk, review-risk, review-reliability, review-readability] -> DENY.
+	var dupDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     4,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-risk", "Prompt": "Duplicate " + started.LineageID},
+					{"Role": "review-reliability", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-readability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &dupDeny)
+	if dupDeny.Decision != DecisionDeny {
+		t.Fatalf("duplicate role in batch: expected deny, got %+v", dupDeny)
+	}
+
+	// 5. Complete 3-of-3 batch invoke_subagent([review-risk, review-reliability, review-readability]) -> ALLOW.
+	var completeAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     5,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-reliability", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-readability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &completeAllow)
+	if completeAllow.Decision != DecisionAllow {
+		t.Fatalf("complete 3-of-3 batch: expected allow, got %+v", completeAllow)
+	}
+
+	// 6. Single-lens WITH fallback_to_native in prompt -> ALLOW even with 3 pending native lenses.
+	var fallbackAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     6,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-reliability", "Prompt": "fallback_to_native after external error on " + started.LineageID},
+				},
+			},
+		},
+	}, &fallbackAllow)
+	if fallbackAllow.Decision != DecisionAllow {
+		t.Fatalf("single-lens with fallback_to_native: expected allow, got %+v", fallbackAllow)
+	}
+
+	// 7. review-refuter alone -> ALLOW.
+	var refuterAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     7,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-refuter", "Prompt": "Refute findings for " + started.LineageID},
+				},
+			},
+		},
+	}, &refuterAllow)
+	if refuterAllow.Decision != DecisionAllow {
+		t.Fatalf("review-refuter alone: expected allow, got %+v", refuterAllow)
+	}
+
+	// 8. Mixed profile: review-readability=external-mcp, review-risk+review-reliability=agy-native.
+	profs := config.DefaultProfilesConfig()
+	profs.ActiveProfile = "agy-oauth"
+	mixed := profs.Profiles["agy-oauth"]
+	mixed.Roles["review-readability"] = config.RoleRoute{
+		Runtime:  config.RuntimeExternalMCP,
+		Provider: "deepseek",
+		Model:    "deepseek-v4-pro",
+	}
+	profs.Profiles["agy-oauth"] = mixed
+	if err := config.SaveProfiles(repo, profs); err != nil {
+		t.Fatalf("SaveProfiles mixed: %v", err)
+	}
+
+	var mixedSingleDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     8,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &mixedSingleDeny)
+	if mixedSingleDeny.Decision != DecisionDeny {
+		t.Fatalf("mixed profile single native lens: expected deny, got %+v", mixedSingleDeny)
+	}
+	if !strings.Contains(mixedSingleDeny.Reason, "2") || !strings.Contains(mixedSingleDeny.Reason, "review-reliability") {
+		t.Errorf("mixed profile deny reason %q should mention 2 pending native lenses and review-reliability", mixedSingleDeny.Reason)
+	}
+
+	var mixedPairAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     9,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-reliability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &mixedPairAllow)
+	if mixedPairAllow.Decision != DecisionAllow {
+		t.Fatalf("mixed profile 2 native lenses together: expected allow, got %+v", mixedPairAllow)
+	}
+
+	// Restore native profile and submit 2 lenses so only 1 remains (review-readability) -> single-lens ALLOW.
+	if err := config.SaveProfiles(repo, config.DefaultProfilesConfig()); err != nil {
+		t.Fatalf("SaveProfiles restore: %v", err)
+	}
+	if _, err := eng.Submit(rdd.SubmitRequest{LineageID: started.LineageID, Lens: rdd.LensRisk}); err != nil {
+		t.Fatalf("Submit risk: %v", err)
+	}
+	if _, err := eng.Submit(rdd.SubmitRequest{LineageID: started.LineageID, Lens: rdd.LensReliability}); err != nil {
+		t.Fatalf("Submit reliability: %v", err)
+	}
+
+	var lastLensAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     10,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-readability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &lastLensAllow)
+	if lastLensAllow.Decision != DecisionAllow {
+		t.Fatalf("single remaining lens review-readability: expected allow, got %+v", lastLensAllow)
+	}
+
+	// PRESERVE: non-review role (gentle-ai-explore) is unaffected even when multiple native lenses are pending.
+	started2, err := eng.Start(rdd.StartRequest{
+		Lenses:       []string{rdd.LensRisk, rdd.LensResilience, rdd.LensReliability},
+		LensesReason: "second lineage",
+	})
+	if err != nil {
+		t.Fatalf("rdd.Start 2: %v", err)
+	}
+	// While started2 is in consent_required (not collecting_lenses), explicit started2 ID is not blocked by batch guard.
+	var preConsentExplore PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-rev", WorkspacePaths: []string{repo}},
+		StepIdx:     11,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "gentle-ai-explore", "Prompt": "Explore repo"},
+				},
+			},
+		},
+	}, &preConsentExplore)
+	if preConsentExplore.Decision != DecisionAllow {
+		t.Fatalf("gentle-ai-explore: expected allow, got %+v", preConsentExplore)
+	}
+	_ = started2
+}
+
+func TestPreToolUseNativeReviewBatchPartialFallbackAndMixedTypeNameDuplicates(t *testing.T) {
+	repo := initTestRepo(t)
+	cfg := config.DefaultConfig()
+	cfg.DelegationMode = config.DelegationModeFull
+	cfg.RDDEnabled = true
+	if err := config.SaveConfig(repo, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+
+	writeFile(t, filepath.Join(repo, "app.go"), "package main\nfunc Mul(a, b int) int { return a * b }\n")
+	eng := rdd.NewEngine(repo)
+	started, err := eng.Start(rdd.StartRequest{
+		Lenses:       []string{rdd.LensRisk, rdd.LensReliability, rdd.LensReadability},
+		LensesReason: "partial fallback and mixed TypeName duplicate checks",
+	})
+	if err != nil {
+		t.Fatalf("rdd.Start: %v", err)
+	}
+	if _, err := eng.AnswerConsent(started.LineageID, "granted"); err != nil {
+		t.Fatalf("rdd.AnswerConsent: %v", err)
+	}
+
+	// 1. Mixed Role and TypeName duplicates (e.g. Role=review-risk + TypeName=REVIEW-RISK) -> DENY.
+	var mixedDupDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-partial", WorkspacePaths: []string{repo}},
+		StepIdx:     1,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"TypeName": "REVIEW-RISK", "Prompt": "Duplicate via TypeName " + started.LineageID},
+					{"Role": "review-reliability", "Prompt": "Review " + started.LineageID},
+					{"TypeName": "review-readability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &mixedDupDeny)
+	if mixedDupDeny.Decision != DecisionDeny {
+		t.Fatalf("mixed Role/TypeName duplicate: expected deny, got %+v", mixedDupDeny)
+	}
+	if !strings.Contains(mixedDupDeny.Reason, "duplicate") || !strings.Contains(mixedDupDeny.Reason, "review-risk") {
+		t.Errorf("mixed Role/TypeName duplicate deny reason %q should mention duplicate and review-risk", mixedDupDeny.Reason)
+	}
+
+	// 2. Valid mixed Role + TypeName (different casing, no duplicates) -> ALLOW.
+	var mixedTypeAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-partial", WorkspacePaths: []string{repo}},
+		StepIdx:     2,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"TypeName": "Review-Reliability", "Prompt": "Review " + started.LineageID},
+					{"TypeName": "review-readability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &mixedTypeAllow)
+	if mixedTypeAllow.Decision != DecisionAllow {
+		t.Fatalf("valid mixed Role/TypeName batch: expected allow, got %+v", mixedTypeAllow)
+	}
+
+	// 3. Partial fallback: mixed profile with review-reliability=external-mcp and review-risk+review-readability=agy-native.
+	profs := config.DefaultProfilesConfig()
+	profs.ActiveProfile = "deepseek-hybrid"
+	prof := profs.Profiles["deepseek-hybrid"]
+	prof.Roles["review-risk"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "pro"}
+	prof.Roles["review-readability"] = config.RoleRoute{Runtime: config.RuntimeAgyNative, Model: "pro"}
+	prof.Roles["review-reliability"] = config.RoleRoute{
+		Runtime:  config.RuntimeExternalMCP,
+		Provider: "deepseek",
+		Model:    "deepseek-v4-pro",
+		Fallback: []config.RoleTarget{{Runtime: config.RuntimeAgyNative, Model: "pro"}},
+	}
+	profs.Profiles["deepseek-hybrid"] = prof
+	if err := config.SaveProfiles(repo, profs); err != nil {
+		t.Fatalf("SaveProfiles partial fallback: %v", err)
+	}
+
+	// 3a. Batch containing failed external role WITHOUT fallback_to_native -> DENY.
+	var missingFallbackMarkerDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-partial", WorkspacePaths: []string{repo}},
+		StepIdx:     3,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-readability", "Prompt": "Review " + started.LineageID},
+					{"TypeName": "review-reliability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &missingFallbackMarkerDeny)
+	if missingFallbackMarkerDeny.Decision != DecisionDeny {
+		t.Fatalf("batch with external-mcp role missing fallback_to_native: expected deny, got %+v", missingFallbackMarkerDeny)
+	}
+	if !strings.Contains(missingFallbackMarkerDeny.Reason, "fallback_to_native") {
+		t.Errorf("expected deny reason to mention fallback_to_native, got %q", missingFallbackMarkerDeny.Reason)
+	}
+
+	// 3b. Partial batch missing native review-readability even though review-reliability has fallback_to_native -> DENY.
+	var partialNativeMissingDeny PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-partial", WorkspacePaths: []string{repo}},
+		StepIdx:     4,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"TypeName": "review-reliability", "Prompt": "fallback_to_native for " + started.LineageID},
+				},
+			},
+		},
+	}, &partialNativeMissingDeny)
+	if partialNativeMissingDeny.Decision != DecisionDeny {
+		t.Fatalf("partial batch missing review-readability: expected deny, got %+v", partialNativeMissingDeny)
+	}
+	if !strings.Contains(partialNativeMissingDeny.Reason, "review-readability") {
+		t.Errorf("expected deny reason to mention missing review-readability, got %q", partialNativeMissingDeny.Reason)
+	}
+
+	// 3c. Complete batch including all pending native lenses + failed external role WITH fallback_to_native -> ALLOW.
+	var fullBatchWithFallbackAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-partial", WorkspacePaths: []string{repo}},
+		StepIdx:     5,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"Role": "review-risk", "Prompt": "Review " + started.LineageID},
+					{"Role": "review-readability", "Prompt": "Review " + started.LineageID},
+					{"TypeName": "review-reliability", "Prompt": "fallback_to_native after external error on " + started.LineageID},
+				},
+			},
+		},
+	}, &fullBatchWithFallbackAllow)
+	if fullBatchWithFallbackAllow.Decision != DecisionAllow {
+		t.Fatalf("complete batch with fallback_to_native: expected allow, got %+v", fullBatchWithFallbackAllow)
+	}
+
+	// 3d. Single fallback lens alone -> ALLOW.
+	var singleFallbackAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-partial", WorkspacePaths: []string{repo}},
+		StepIdx:     6,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"TypeName": "review-reliability", "Prompt": "fallback_to_native for " + started.LineageID},
+				},
+			},
+		},
+	}, &singleFallbackAllow)
+	if singleFallbackAllow.Decision != DecisionAllow {
+		t.Fatalf("single fallback_to_native lens: expected allow, got %+v", singleFallbackAllow)
+	}
+
+	// 3e. After review-risk submits externally, only [review-reliability (fallback), review-readability (native)] remain -> ALLOW together.
+	if _, err := eng.Submit(rdd.SubmitRequest{LineageID: started.LineageID, Lens: rdd.LensRisk}); err != nil {
+		t.Fatalf("Submit risk: %v", err)
+	}
+	var remainingPairAllow PreToolUseOutput
+	dispatchJSON(t, "PreToolUse", PreToolUseInput{
+		CommonInput: CommonInput{ConversationID: "conv-partial", WorkspacePaths: []string{repo}},
+		StepIdx:     7,
+		ToolCall: ToolCall{
+			Name: "invoke_subagent",
+			Args: map[string]any{
+				"Subagents": []map[string]any{
+					{"TypeName": "review-reliability", "Prompt": "fallback_to_native for " + started.LineageID},
+					{"Role": "review-readability", "Prompt": "Review " + started.LineageID},
+				},
+			},
+		},
+	}, &remainingPairAllow)
+	if remainingPairAllow.Decision != DecisionAllow {
+		t.Fatalf("remaining pair (1 fallback + 1 native): expected allow, got %+v", remainingPairAllow)
+	}
+}
