@@ -1,14 +1,17 @@
 package hooks
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
+	"github.com/Nathanael-Huaman/odd-agy/internal/rdd"
 )
 
 type subagentEntry struct {
@@ -19,8 +22,9 @@ type subagentEntry struct {
 }
 
 var (
-	specLinePattern = regexp.MustCompile(`(?i)\bSpec:\s*(odd/tasks/[^\s,)\]]+\.md)\s*,\s*T\d+\b`)
-	riskLinePattern = regexp.MustCompile(`(?i)\bRisk:\s*item\s+([1-6])\b`)
+	specLinePattern   = regexp.MustCompile(`(?i)\bSpec:\s*(odd/tasks/[^\s,)\]]+\.md)\s*,\s*T\d+\b`)
+	riskLinePattern   = regexp.MustCompile(`(?i)\bRisk:\s*item\s+([1-6])\b`)
+	reReviewLineageID = regexp.MustCompile(`\breview-[0-9a-f]+\b`)
 )
 
 func parseSubagents(args map[string]any) []subagentEntry {
@@ -137,6 +141,15 @@ func checkInvokeSubagent(workspace string, cfg config.Config, in PreToolUseInput
 		}
 	}
 
+	if denyReason, err := checkNativeReviewBatch(workspace, entries); err != nil {
+		return PreToolUseOutput{}, err
+	} else if denyReason != "" {
+		return PreToolUseOutput{
+			Decision: DecisionDeny,
+			Reason:   denyReason,
+		}, nil
+	}
+
 	type parsedWriter struct {
 		entry    subagentEntry
 		surfaces []string
@@ -241,6 +254,196 @@ func checkInvokeSubagent(workspace string, cfg config.Config, in PreToolUseInput
 	}
 
 	return PreToolUseOutput{Decision: DecisionAllow}, nil
+}
+
+func isRDDLensRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "review-risk", "review-resilience", "review-readability", "review-reliability":
+		return true
+	default:
+		return false
+	}
+}
+
+func checkNativeReviewBatch(workspace string, entries []subagentEntry) (string, error) {
+	hasLensRole := false
+	for _, entry := range entries {
+		if isRDDLensRole(entry.effectiveRole()) {
+			hasLensRole = true
+			break
+		}
+	}
+	if !hasLensRole {
+		return "", nil
+	}
+
+	// Never block a single-lens fallback_to_native call.
+	if len(entries) == 1 && strings.Contains(strings.ToLower(entries[0].Prompt), "fallback_to_native") {
+		return "", nil
+	}
+
+	// Determine target lineageId from entry prompts or active collecting_lenses lineage.
+	foundIDs := make([]string, 0, 1)
+	seenIDs := make(map[string]bool)
+	for _, entry := range entries {
+		for _, id := range reReviewLineageID.FindAllString(entry.Prompt, -1) {
+			if !seenIDs[id] {
+				seenIDs[id] = true
+				foundIDs = append(foundIDs, id)
+			}
+		}
+	}
+	if len(foundIDs) > 1 {
+		// Ambiguous batch targeting multiple distinct lineages; skip batch guard.
+		return "", nil
+	}
+
+	var st rdd.LineageStatus
+	if len(foundIDs) == 1 {
+		loaded, err := rdd.NewEngine(workspace).Status(foundIDs[0])
+		if err != nil {
+			return "", nil
+		}
+		st = loaded
+	} else {
+		active, ok := findActiveCollectingLineage(workspace)
+		if !ok {
+			return "", nil
+		}
+		st = active
+	}
+
+	if st.Status != rdd.StatusCollectingLenses {
+		return "", nil
+	}
+
+	var pendingLenses []string
+	if len(st.PendingLenses) > 0 {
+		pendingLenses = append(pendingLenses, st.PendingLenses...)
+	} else {
+		completed := make(map[string]bool, len(st.CompletedLenses))
+		for _, c := range st.CompletedLenses {
+			completed[c] = true
+		}
+		for _, l := range st.Lenses {
+			if !completed[l] {
+				pendingLenses = append(pendingLenses, l)
+			}
+		}
+	}
+
+	// Filter to pending lenses routed to agy-native (if profiles.json missing, treat all as native).
+	var pf config.ProfileConfig
+	hasPF := false
+	if profs, err := config.LoadProfiles(workspace); err == nil {
+		pf, hasPF = profs.Profiles[profs.ActiveProfile]
+	}
+
+	pendingNativeRoles := make([]string, 0, len(pendingLenses))
+	for _, lens := range pendingLenses {
+		role := "review-" + lens
+		isNative := true
+		if hasPF {
+			if ra, ok := pf.Roles[role]; ok && ra.Runtime == config.RuntimeExternalMCP {
+				isNative = false
+			}
+		}
+		if isNative {
+			pendingNativeRoles = append(pendingNativeRoles, role)
+		}
+	}
+
+	if len(pendingNativeRoles) < 2 {
+		return "", nil
+	}
+
+	suppliedCounts := make(map[string]int, len(entries))
+	var dupRoles []string
+	for _, entry := range entries {
+		role := entry.effectiveRole()
+		if !isRDDLensRole(role) {
+			continue
+		}
+		suppliedCounts[role]++
+		if suppliedCounts[role] == 2 {
+			dupRoles = append(dupRoles, role)
+		}
+	}
+
+	var missingRoles []string
+	for _, reqRole := range pendingNativeRoles {
+		if suppliedCounts[reqRole] == 0 {
+			missingRoles = append(missingRoles, reqRole)
+		}
+	}
+
+	if len(missingRoles) == 0 && len(dupRoles) == 0 {
+		return "", nil
+	}
+
+	var details []string
+	if len(missingRoles) > 0 {
+		details = append(details, fmt.Sprintf("missing: [%s]", strings.Join(missingRoles, ", ")))
+	}
+	if len(dupRoles) > 0 {
+		details = append(details, fmt.Sprintf("duplicate: [%s]", strings.Join(dupRoles, ", ")))
+	}
+	return fmt.Sprintf(
+		"RDD lineage %q has %d pending native review lenses ([%s]; %s). Launch ALL pending lenses together in a single parallel invoke_subagent call instead of one by one.",
+		st.LineageID,
+		len(pendingNativeRoles),
+		strings.Join(pendingNativeRoles, ", "),
+		strings.Join(details, "; "),
+	), nil
+}
+
+func findActiveCollectingLineage(workspace string) (rdd.LineageStatus, bool) {
+	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd.Dir = workspace
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return rdd.LineageStatus{}, false
+	}
+	gitDir := strings.TrimSpace(stdout.String())
+	if gitDir == "" {
+		return rdd.LineageStatus{}, false
+	}
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(workspace, gitDir)
+	}
+	lineagesDir := filepath.Join(filepath.Clean(gitDir), "odd-agy", "rdd", "lineages")
+	dirEntries, err := os.ReadDir(lineagesDir)
+	if err != nil {
+		return rdd.LineageStatus{}, false
+	}
+
+	eng := rdd.NewEngine(workspace)
+	var active []rdd.LineageStatus
+	for _, de := range dirEntries {
+		if de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		if !strings.HasPrefix(name, "review-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		lineageID := strings.TrimSuffix(name, ".json")
+		st, err := eng.Status(lineageID)
+		if err != nil {
+			continue
+		}
+		if st.Status == rdd.StatusCollectingLenses {
+			active = append(active, st)
+			if len(active) > 1 {
+				return rdd.LineageStatus{}, false
+			}
+		}
+	}
+	if len(active) == 1 {
+		return active[0], true
+	}
+	return rdd.LineageStatus{}, false
 }
 
 func validateVerifierPrompt(workspace, prompt string) error {
