@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -27,6 +30,8 @@ const (
 	errCodeInvalidRequest = -32600
 	errCodeMethodNotFound = -32601
 	errCodeInvalidParams  = -32602
+
+	rootCwdErrorMsg = `MCP server started in filesystem root "/"; pass workspaceRoot (absolute path to the active project directory) in the tool arguments.`
 )
 
 // ServerConfig configures the unified odd-agy stdio MCP server.
@@ -36,14 +41,21 @@ type ServerConfig struct {
 	LookupEnv func(string) (string, bool)
 }
 
+type workspaceServices struct {
+	root   string
+	todos  *todo.Store
+	rdd    *rdd.Engine
+	runner *llm.Runner
+}
+
 // Server exposes todo, RDD (odd_review_*), and external runner (odd_external_*) tools
 // over JSON-RPC 2.0 newline-delimited stdio.
 type Server struct {
-	workspace string
-	todos     *todo.Store
-	rdd       *rdd.Engine
-	runner    *llm.Runner
-	writeMu   sync.Mutex
+	cfg         ServerConfig
+	defaultRoot string
+	wsMu        sync.Mutex
+	workspaces  map[string]*workspaceServices
+	writeMu     sync.Mutex
 }
 
 type serverReviewHost struct {
@@ -66,22 +78,222 @@ func (h *serverReviewHost) Submit(lineageID, role string, findings []rdd.Finding
 
 // NewServer creates a Server rooted at cfg.Workspace.
 func NewServer(cfg ServerConfig) *Server {
-	ws := cfg.Workspace
-	if strings.TrimSpace(ws) == "" {
+	ws := strings.TrimSpace(cfg.Workspace)
+	if ws == "" {
 		ws, _ = os.Getwd()
 	}
-	eng := rdd.NewEngine(ws)
-	return &Server{
-		workspace: ws,
-		todos:     todo.NewStore(ws),
-		rdd:       eng,
+	ws = strings.TrimSpace(ws)
+	if ws != "" {
+		if abs, err := filepath.Abs(ws); err == nil {
+			ws = abs
+		}
+		ws = filepath.Clean(ws)
+	}
+	s := &Server{
+		cfg:         cfg,
+		defaultRoot: ws,
+		workspaces:  make(map[string]*workspaceServices),
+	}
+	if ws != "" && !isFilesystemRoot(ws) {
+		if canon, err := s.validateWorkspaceDir(ws); err == nil {
+			s.defaultRoot = canon
+		}
+	}
+	return s
+}
+
+func isFilesystemRoot(p string) bool {
+	cleaned := filepath.Clean(p)
+	return cleaned == "" || filepath.Dir(cleaned) == cleaned
+}
+
+func isCaseInsensitiveOS() bool {
+	return runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+}
+
+func workspaceCacheKey(canonicalRoot string) string {
+	cleaned := filepath.Clean(canonicalRoot)
+	if isCaseInsensitiveOS() {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
+}
+
+func isSameOrSubpath(target, root string) bool {
+	target = filepath.Clean(target)
+	root = filepath.Clean(root)
+	if isCaseInsensitiveOS() {
+		target = strings.ToLower(target)
+		root = strings.ToLower(root)
+	}
+	if target == root {
+		return true
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func collectDirStats(path string) []os.FileInfo {
+	var stats []os.FileInfo
+	cur := filepath.Clean(path)
+	for cur != "" && !isFilesystemRoot(cur) {
+		if info, err := os.Stat(cur); err == nil {
+			stats = append(stats, info)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return stats
+}
+
+func (s *Server) isSensitiveWorkspaceRoot(cleaned, resolved string) (string, bool) {
+	roots := []string{"/etc", "/private/etc", "/System", "/Library"}
+	var homes []string
+	if h, err := os.UserHomeDir(); err == nil && strings.TrimSpace(h) != "" {
+		homes = append(homes, filepath.Clean(h))
+	}
+	if s.cfg.LookupEnv != nil {
+		if h, ok := s.cfg.LookupEnv("HOME"); ok && strings.TrimSpace(h) != "" {
+			homes = append(homes, filepath.Clean(h))
+		}
+	}
+	for _, h := range homes {
+		roots = append(roots,
+			filepath.Join(h, ".ssh"),
+			filepath.Join(h, ".gemini"),
+			filepath.Join(h, ".config", "odd-agy"),
+		)
+		if canonH, err := filepath.EvalSymlinks(h); err == nil && canonH != h {
+			roots = append(roots,
+				filepath.Join(canonH, ".ssh"),
+				filepath.Join(canonH, ".gemini"),
+				filepath.Join(canonH, ".config", "odd-agy"),
+			)
+		}
+	}
+	candidateStats := collectDirStats(resolved)
+	for _, root := range roots {
+		if isSameOrSubpath(cleaned, root) || isSameOrSubpath(resolved, root) {
+			return root, true
+		}
+		if canonRoot, err := filepath.EvalSymlinks(root); err == nil && canonRoot != root {
+			if isSameOrSubpath(cleaned, canonRoot) || isSameOrSubpath(resolved, canonRoot) {
+				return root, true
+			}
+		}
+		if rootInfo, err := os.Stat(root); err == nil {
+			for _, candInfo := range candidateStats {
+				if os.SameFile(candInfo, rootInfo) {
+					return root, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func (s *Server) validateWorkspaceDir(raw string) (string, error) {
+	if strings.ContainsRune(raw, 0) {
+		return "", errors.New("invalid workspaceRoot: contains null byte")
+	}
+	cleaned := filepath.Clean(strings.TrimSpace(raw))
+	if !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("invalid workspaceRoot %q: must be an absolute path", raw)
+	}
+	if isFilesystemRoot(cleaned) {
+		return "", fmt.Errorf("invalid workspaceRoot %q: filesystem root is not allowed; pass the absolute path to the active project directory", raw)
+	}
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspaceRoot %q: %w", raw, err)
+	}
+	resolved = filepath.Clean(resolved)
+	if isFilesystemRoot(resolved) {
+		return "", fmt.Errorf("invalid workspaceRoot %q: resolves to filesystem root", raw)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspaceRoot %q: %w", raw, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("invalid workspaceRoot %q: path is not a directory", raw)
+	}
+	if blockedRoot, blocked := s.isSensitiveWorkspaceRoot(cleaned, resolved); blocked {
+		return "", fmt.Errorf("invalid workspaceRoot %q: targets restricted directory %q", raw, blockedRoot)
+	}
+	return resolved, nil
+}
+
+func (s *Server) getOrCreateWorkspace(canonicalRoot string) *workspaceServices {
+	key := workspaceCacheKey(canonicalRoot)
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if ws, ok := s.workspaces[key]; ok {
+		return ws
+	}
+	eng := rdd.NewEngine(canonicalRoot)
+	ws := &workspaceServices{
+		root:  canonicalRoot,
+		todos: todo.NewStore(canonicalRoot),
+		rdd:   eng,
 		runner: llm.NewRunner(llm.RunnerConfig{
-			RepoRoot:   ws,
-			Client:     cfg.LLMClient,
-			LookupEnv:  cfg.LookupEnv,
+			RepoRoot:   canonicalRoot,
+			Client:     s.cfg.LLMClient,
+			LookupEnv:  s.cfg.LookupEnv,
 			ReviewHost: &serverReviewHost{rdd: eng},
 		}),
 	}
+	s.workspaces[key] = ws
+	return ws
+}
+
+func (s *Server) resolveWorkspace(requested string) (*workspaceServices, error) {
+	req := strings.TrimSpace(requested)
+	if req == "" {
+		s.wsMu.Lock()
+		eff := s.defaultRoot
+		s.wsMu.Unlock()
+		if eff == "" || isFilesystemRoot(eff) {
+			return nil, errors.New(rootCwdErrorMsg)
+		}
+		canon, err := s.validateWorkspaceDir(eff)
+		if err != nil {
+			return nil, err
+		}
+		return s.getOrCreateWorkspace(canon), nil
+	}
+	canon, err := s.validateWorkspaceDir(req)
+	if err != nil {
+		return nil, err
+	}
+	return s.getOrCreateWorkspace(canon), nil
+}
+
+func parseWorkspaceCandidate(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil || !strings.EqualFold(u.Scheme, "file") {
+			return "", false
+		}
+		if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+			return "", false
+		}
+		if u.Path == "" {
+			return "", false
+		}
+		return u.Path, true
+	}
+	return raw, true
 }
 
 // ServeStdio runs the MCP server on os.Stdin and os.Stdout until EOF or ctx cancellation.
@@ -321,20 +533,7 @@ func (s *Server) handleRawMessage(ctx context.Context, raw []byte) *rpcResponse 
 
 	switch req.Method {
 	case "initialize":
-		return &rpcResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: map[string]any{
-				"protocolVersion": protocolVersion,
-				"capabilities": map[string]any{
-					"tools": map[string]any{},
-				},
-				"serverInfo": map[string]any{
-					"name":    "odd-agy",
-					"version": version.Version,
-				},
-			},
-		}
+		return s.handleInitialize(req)
 
 	case "ping":
 		return &rpcResponse{
@@ -369,7 +568,7 @@ func (s *Server) handleRawMessage(ctx context.Context, raw []byte) *rpcResponse 
 			}
 		}
 		args := params.Arguments
-		if len(bytes.TrimSpace(args)) == 0 {
+		if len(bytes.TrimSpace(args)) == 0 || string(bytes.TrimSpace(args)) == "null" {
 			args = json.RawMessage("{}")
 		}
 		res, rpcErr := s.dispatchTool(ctx, params.Name, args)
@@ -410,38 +609,137 @@ func (s *Server) writeResponse(w io.Writer, resp *rpcResponse) error {
 	return nil
 }
 
+func (s *Server) handleInitialize(req rpcRequest) *rpcResponse {
+	if len(bytes.TrimSpace(req.Params)) > 0 && string(bytes.TrimSpace(req.Params)) != "null" {
+		var params struct {
+			RootURI          string `json:"rootUri"`
+			RootPath         string `json:"rootPath"`
+			WorkspaceFolders []struct {
+				URI string `json:"uri"`
+			} `json:"workspaceFolders"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err == nil {
+			s.wsMu.Lock()
+			shouldAdopt := s.defaultRoot == "" || isFilesystemRoot(s.defaultRoot)
+			s.wsMu.Unlock()
+
+			if shouldAdopt {
+				var candidates []string
+				if params.RootURI != "" {
+					candidates = append(candidates, params.RootURI)
+				}
+				if params.RootPath != "" {
+					candidates = append(candidates, params.RootPath)
+				}
+				if len(params.WorkspaceFolders) > 0 && params.WorkspaceFolders[0].URI != "" {
+					candidates = append(candidates, params.WorkspaceFolders[0].URI)
+				}
+				for _, cand := range candidates {
+					if path, ok := parseWorkspaceCandidate(cand); ok {
+						if canon, err := s.validateWorkspaceDir(path); err == nil {
+							s.wsMu.Lock()
+							if s.defaultRoot == "" || isFilesystemRoot(s.defaultRoot) {
+								s.defaultRoot = canon
+							}
+							s.wsMu.Unlock()
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return &rpcResponse{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Result: map[string]any{
+			"protocolVersion": protocolVersion,
+			"capabilities": map[string]any{
+				"tools": map[string]any{},
+			},
+			"serverInfo": map[string]any{
+				"name":    "odd-agy",
+				"version": version.Version,
+			},
+		},
+	}
+}
+
+func isKnownTool(name string) bool {
+	switch name {
+	case "todo",
+		"odd_review_mode",
+		"odd_review_assess",
+		"odd_review_start",
+		"odd_review_consent",
+		"odd_review_scope",
+		"odd_review_submit",
+		"odd_review_run_lenses",
+		"odd_review_apply_correction",
+		"odd_review_status",
+		"odd_review_ack",
+		"odd_external_profiles",
+		"odd_external_run",
+		"odd_external_continue",
+		"odd_external_status":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.RawMessage) (callToolResult, *rpcError) {
+	if !isKnownTool(name) {
+		return callToolResult{}, &rpcError{
+			Code:    errCodeInvalidParams,
+			Message: fmt.Sprintf("unknown tool %q", name),
+		}
+	}
+
+	var wsArgs struct {
+		WorkspaceRoot string `json:"workspaceRoot"`
+	}
+	if err := json.Unmarshal(rawArgs, &wsArgs); err != nil {
+		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
+	}
+
+	ws, err := s.resolveWorkspace(wsArgs.WorkspaceRoot)
+	if err != nil {
+		return toolErr(err), nil
+	}
+
 	switch name {
 	case "todo":
-		return s.handleTodo(rawArgs)
+		return s.handleTodo(ws, rawArgs)
 	case "odd_review_mode":
-		return s.handleReviewMode(rawArgs)
+		return s.handleReviewMode(ws, rawArgs)
 	case "odd_review_assess":
-		return s.handleReviewAssess(rawArgs)
+		return s.handleReviewAssess(ws, rawArgs)
 	case "odd_review_start":
-		return s.handleReviewStart(rawArgs)
+		return s.handleReviewStart(ws, rawArgs)
 	case "odd_review_consent":
-		return s.handleReviewConsent(rawArgs)
+		return s.handleReviewConsent(ws, rawArgs)
 	case "odd_review_scope":
-		return s.handleReviewScope(rawArgs)
+		return s.handleReviewScope(ws, rawArgs)
 	case "odd_review_submit":
-		return s.handleReviewSubmit(rawArgs)
+		return s.handleReviewSubmit(ws, rawArgs)
 	case "odd_review_run_lenses":
-		return s.handleReviewRunLenses(ctx, rawArgs)
+		return s.handleReviewRunLenses(ctx, ws, rawArgs)
 	case "odd_review_apply_correction":
-		return s.handleReviewApplyCorrection(rawArgs)
+		return s.handleReviewApplyCorrection(ws, rawArgs)
 	case "odd_review_status":
-		return s.handleReviewStatus(rawArgs)
+		return s.handleReviewStatus(ws, rawArgs)
 	case "odd_review_ack":
-		return s.handleReviewAck(rawArgs)
+		return s.handleReviewAck(ws, rawArgs)
 	case "odd_external_profiles":
-		return s.handleExternalProfiles()
+		return s.handleExternalProfiles(ws)
 	case "odd_external_run":
-		return s.handleExternalRun(ctx, rawArgs)
+		return s.handleExternalRun(ctx, ws, rawArgs)
 	case "odd_external_continue":
-		return s.handleExternalContinue(ctx, rawArgs)
+		return s.handleExternalContinue(ctx, ws, rawArgs)
 	case "odd_external_status":
-		return s.handleExternalStatus(rawArgs)
+		return s.handleExternalStatus(ws, rawArgs)
 	default:
 		return callToolResult{}, &rpcError{
 			Code:    errCodeInvalidParams,
@@ -450,7 +748,7 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 	}
 }
 
-func (s *Server) handleTodo(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleTodo(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		Action string           `json:"action"`
 		ID     int              `json:"id"`
@@ -465,10 +763,10 @@ func (s *Server) handleTodo(rawArgs json.RawMessage) (callToolResult, *rpcError)
 
 	switch args.Action {
 	case "list":
-		st, err := s.todos.List()
+		st, err := ws.todos.List()
 		return toolJSONOrErr(st, err), nil
 	case "write":
-		st, err := s.todos.Write(args.Tasks)
+		st, err := ws.todos.Write(args.Tasks)
 		return toolJSONOrErr(st, err), nil
 	case "add":
 		var title, status, note string
@@ -483,20 +781,20 @@ func (s *Server) handleTodo(rawArgs json.RawMessage) (callToolResult, *rpcError)
 		if args.Note != nil {
 			note = *args.Note
 		}
-		st, err := s.todos.Add(title, status, note)
+		st, err := ws.todos.Add(title, status, note)
 		return toolJSONOrErr(st, err), nil
 	case "update":
-		st, err := s.todos.Update(args.ID, args.Title, args.Status, args.Note)
+		st, err := ws.todos.Update(args.ID, args.Title, args.Status, args.Note)
 		return toolJSONOrErr(st, err), nil
 	case "clear":
-		st, err := s.todos.Clear()
+		st, err := ws.todos.Clear()
 		return toolJSONOrErr(st, err), nil
 	default:
 		return toolErr(fmt.Errorf("invalid todo action %q: must be write, add, update, list, or clear", args.Action)), nil
 	}
 }
 
-func (s *Server) handleReviewMode(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewMode(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		Action string `json:"action"`
 	}
@@ -506,29 +804,29 @@ func (s *Server) handleReviewMode(rawArgs json.RawMessage) (callToolResult, *rpc
 	if strings.TrimSpace(args.Action) == "" {
 		args.Action = "status"
 	}
-	res, err := s.rdd.Mode(args.Action)
+	res, err := ws.rdd.Mode(args.Action)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewAssess(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewAssess(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var req rdd.AssessRequest
 	if err := json.Unmarshal(rawArgs, &req); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.rdd.Assess(req)
+	res, err := ws.rdd.Assess(req)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewStart(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewStart(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var req rdd.StartRequest
 	if err := json.Unmarshal(rawArgs, &req); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.rdd.Start(req)
+	res, err := ws.rdd.Start(req)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewConsent(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewConsent(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		LineageID string `json:"lineageId"`
 		Answer    string `json:"answer"`
@@ -536,11 +834,11 @@ func (s *Server) handleReviewConsent(rawArgs json.RawMessage) (callToolResult, *
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.rdd.AnswerConsent(args.LineageID, args.Answer)
+	res, err := ws.rdd.AnswerConsent(args.LineageID, args.Answer)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewScope(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewScope(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		LineageID string `json:"lineageId"`
 		Cursor    int    `json:"cursor"`
@@ -549,11 +847,11 @@ func (s *Server) handleReviewScope(rawArgs json.RawMessage) (callToolResult, *rp
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.rdd.Scope(args.LineageID, args.Cursor, args.Limit)
+	res, err := ws.rdd.Scope(args.LineageID, args.Cursor, args.Limit)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewSubmit(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewSubmit(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	type findingInput struct {
 		ID        string `json:"id"`
 		Severity  string `json:"severity"`
@@ -632,7 +930,7 @@ func (s *Server) handleReviewSubmit(rawArgs json.RawMessage) (callToolResult, *r
 		})
 	}
 
-	res, err := s.rdd.Submit(rdd.SubmitRequest{
+	res, err := ws.rdd.Submit(rdd.SubmitRequest{
 		LineageID: args.LineageID,
 		Lens:      lens,
 		Findings:  findings,
@@ -641,36 +939,36 @@ func (s *Server) handleReviewSubmit(rawArgs json.RawMessage) (callToolResult, *r
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewApplyCorrection(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewApplyCorrection(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		LineageID string `json:"lineageId"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.rdd.ApplyCorrection(args.LineageID)
+	res, err := ws.rdd.ApplyCorrection(args.LineageID)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewStatus(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewStatus(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		LineageID string `json:"lineageId"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.rdd.Status(args.LineageID)
+	res, err := ws.rdd.Status(args.LineageID)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleReviewAck(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewAck(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		LineageID string `json:"lineageId"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.rdd.Ack(args.LineageID)
+	res, err := ws.rdd.Ack(args.LineageID)
 	return toolJSONOrErr(res, err), nil
 }
 
@@ -694,7 +992,7 @@ type reviewRunLensesResult struct {
 	ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
 }
 
-func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleReviewRunLenses(ctx context.Context, ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		LineageID string   `json:"lineageId"`
 		Lenses    []string `json:"lenses"`
@@ -707,7 +1005,7 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMess
 		return toolErr(errors.New("lineageId is required")), nil
 	}
 
-	st, err := s.rdd.Status(lineageID)
+	st, err := ws.rdd.Status(lineageID)
 	if err != nil {
 		return toolErr(err), nil
 	}
@@ -765,7 +1063,7 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMess
 		}
 	}
 
-	profs, err := config.LoadProfiles(s.workspace)
+	profs, err := config.LoadProfiles(ws.root)
 	if err != nil {
 		return toolErr(err), nil
 	}
@@ -795,7 +1093,7 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMess
 		go func(idx int, l string) {
 			defer wg.Done()
 			role := "review-" + l
-			rec, runErr := s.runner.Run(ctx, llm.RunRequest{
+			rec, runErr := ws.runner.Run(ctx, llm.RunRequest{
 				Role:      role,
 				LineageID: lineageID,
 				Task:      buildReviewLensPrompt(lineageID, l, role),
@@ -827,7 +1125,7 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, rawArgs json.RawMess
 	}
 	wg.Wait()
 
-	postStatus, err := s.rdd.Status(lineageID)
+	postStatus, err := ws.rdd.Status(lineageID)
 	if err != nil {
 		postStatus = st
 	}
@@ -893,12 +1191,12 @@ func buildReviewLensPrompt(lineageID, lens, role string) string {
 	)
 }
 
-func (s *Server) handleExternalProfiles() (callToolResult, *rpcError) {
-	res, err := s.runner.ProfilesSummary()
+func (s *Server) handleExternalProfiles(ws *workspaceServices) (callToolResult, *rpcError) {
+	res, err := ws.runner.ProfilesSummary()
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleExternalRun(ctx context.Context, rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleExternalRun(ctx context.Context, ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		Role            string   `json:"role"`
 		Task            string   `json:"task"`
@@ -911,7 +1209,7 @@ func (s *Server) handleExternalRun(ctx context.Context, rawArgs json.RawMessage)
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.runner.Run(ctx, llm.RunRequest{
+	res, err := ws.runner.Run(ctx, llm.RunRequest{
 		Role:            args.Role,
 		Task:            args.Task,
 		LineageID:       args.LineageID,
@@ -923,7 +1221,7 @@ func (s *Server) handleExternalRun(ctx context.Context, rawArgs json.RawMessage)
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleExternalContinue(ctx context.Context, rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleExternalContinue(ctx context.Context, ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		TaskID          string   `json:"taskId"`
 		Prompt          string   `json:"prompt"`
@@ -933,7 +1231,7 @@ func (s *Server) handleExternalContinue(ctx context.Context, rawArgs json.RawMes
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.runner.Continue(ctx, llm.ContinueRequest{
+	res, err := ws.runner.Continue(ctx, llm.ContinueRequest{
 		TaskID:          args.TaskID,
 		Prompt:          args.Prompt,
 		AllowedSurfaces: args.AllowedSurfaces,
@@ -942,14 +1240,14 @@ func (s *Server) handleExternalContinue(ctx context.Context, rawArgs json.RawMes
 	return toolJSONOrErr(res, err), nil
 }
 
-func (s *Server) handleExternalStatus(rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleExternalStatus(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
 		TaskID string `json:"taskId"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := s.runner.Status(args.TaskID)
+	res, err := ws.runner.Status(args.TaskID)
 	return toolJSONOrErr(res, err), nil
 }
 
@@ -974,7 +1272,7 @@ func toolErr(err error) callToolResult {
 }
 
 func (s *Server) toolDefinitions() []toolSpec {
-	return []toolSpec{
+	specs := []toolSpec{
 		{
 			Name:        "todo",
 			Description: "Manage project-scoped ODD todo items (write, add, update, list, clear).",
@@ -1216,4 +1514,18 @@ func (s *Server) toolDefinitions() []toolSpec {
 			},
 		},
 	}
+
+	wsProp := map[string]any{
+		"type":        "string",
+		"description": "Optional absolute path to the active project directory (required when the MCP server starts in '/', e.g. in Antigravity Desktop App).",
+	}
+	for i := range specs {
+		props, ok := specs[i].InputSchema["properties"].(map[string]any)
+		if !ok || props == nil {
+			props = map[string]any{}
+			specs[i].InputSchema["properties"] = props
+		}
+		props["workspaceRoot"] = wsProp
+	}
+	return specs
 }

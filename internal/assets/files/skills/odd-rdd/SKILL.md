@@ -7,6 +7,8 @@ description: Toggle or inspect Receipt-Driven Development (RDD) mode, assess cur
 
 Manage Receipt-Driven Development for the current project:
 
+- **Desktop App / `/` cwd**: When running in Antigravity Desktop App or if an `odd-agy/*` MCP tool reports running in `"/"`, pass `workspaceRoot` (the active project's absolute directory path) in every `odd_review_*`, `todo`, and `odd_external_*` call.
+
 1. **Inspect or toggle mode**:
    - Use `call_mcp_tool` -> `odd_review_mode` (`action: "status" | "enable" | "disable"`) or run `odd-agy rdd status|enable|disable`.
 2. **Assess diff risk**:

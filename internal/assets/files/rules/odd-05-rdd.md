@@ -7,6 +7,8 @@ description: Receipt-Driven Development (RDD) frozen-snapshot workflow using odd
 
 RDD ensures significant diffs are reviewed against an **immutable SHA-256 frozen snapshot** before delivery. RDD is enabled by default in `.agents/odd/config.json` and toggled via `odd-agy rdd <enable|disable|status>` or `odd_review_mode`.
 
+- **Antigravity Desktop App / `/` cwd**: When running in Antigravity Desktop App or if an `odd-agy/*` MCP tool reports running in filesystem root `"/"`, pass `workspaceRoot` (the active project's absolute directory path) in every `odd-agy/*` MCP tool call (`todo`, `odd_review_*`, `odd_external_*`).
+
 ## 1. `odd_review_*` MCP Lifecycle
 
 1. **`odd_review_mode`**: Inspect or toggle project RDD mode (`status` | `enable` | `disable`).

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1842,6 +1843,710 @@ func TestReviewRunLensesPostSubmitSummaryErrorDoesNotMarkFallback(t *testing.T) 
 
 	_ = inW.Close()
 	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPDesktopAppRootCwdWorkspaceRootMultiProject(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	for _, credDir := range []string{
+		filepath.Join(fakeHome, ".config", "odd-agy"),
+		filepath.Join(fakeHome, ".gemini"),
+		filepath.Join(fakeHome, ".ssh"),
+		filepath.Join(fakeHome, ".ssh", "nested"),
+	} {
+		if err := os.MkdirAll(credDir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", credDir, err)
+		}
+	}
+
+	var llmTurns atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		msgs := payload["messages"].([]any)
+		var toolCount int
+		for _, rawM := range msgs {
+			if rawM.(map[string]any)["role"] == "tool" {
+				toolCount++
+			}
+		}
+		llmTurns.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch toolCount {
+		case 0:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "d1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading scope",
+						"tool_calls": []map[string]any{{
+							"id":   "call_scope",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "read_review_scope",
+								"arguments": `{"cursor":0}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "d2", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submitting clean",
+						"tool_calls": []map[string]any{{
+							"id":   "call_submit",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": `{"findings":[]}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "d3", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "lens ok",
+						"reasoning_content": "done",
+					},
+					"finish_reason": "stop",
+				}},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	repoA := initMCPRepo(t)
+	repoB := initMCPRepo(t)
+	if err := os.WriteFile(filepath.Join(repoA, "main.go"), []byte("package main\n\nfunc main() { println(\"A\") }\n"), 0o644); err != nil {
+		t.Fatalf("write repoA main.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoB, "main.go"), []byte("package main\n\nfunc main() { println(\"B\") }\n"), 0o644); err != nil {
+		t.Fatalf("write repoB main.go: %v", err)
+	}
+
+	profilesA := config.DefaultProfilesConfig()
+	profilesA.ActiveProfile = "deepseek-hybrid"
+	dsA := profilesA.Providers["deepseek"]
+	dsA.BaseURL = srv.URL + "/v1"
+	profilesA.Providers["deepseek"] = dsA
+	if err := config.SaveProfiles(repoA, profilesA); err != nil {
+		t.Fatalf("SaveProfiles repoA: %v", err)
+	}
+	if err := config.SaveProfiles(repoB, config.DefaultProfilesConfig()); err != nil {
+		t.Fatalf("SaveProfiles repoB: %v", err)
+	}
+
+	startServer := func(ws string) (*rpcClient, *io.PipeWriter, chan error, context.CancelFunc) {
+		server := NewServer(ServerConfig{
+			Workspace: ws,
+			LookupEnv: func(k string) (string, bool) {
+				if k == "DEEPSEEK_API_KEY" {
+					return "ds-secret", true
+				}
+				return "", false
+			},
+		})
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- server.Serve(ctx, inR, outW)
+			_ = outW.Close()
+		}()
+		cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+		return cli, inW, done, cancel
+	}
+
+	// 1. Desktop App condition: server started with Workspace: "/".
+	cli, inW, serveDone, cancel := startServer("/")
+	defer cancel()
+
+	initResp := cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	if initResp["error"] != nil {
+		t.Fatalf("initialize error: %v", initResp["error"])
+	}
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// Verify all 15 tools expose workspaceRoot in inputSchema.properties.
+	listResp := cli.call("tools/list", map[string]any{})
+	toolsRaw := listResp["result"].(map[string]any)["tools"].([]any)
+	if len(toolsRaw) != 15 {
+		t.Fatalf("tools/list count = %d, want 15", len(toolsRaw))
+	}
+	for _, raw := range toolsRaw {
+		obj := raw.(map[string]any)
+		schema := obj["inputSchema"].(map[string]any)
+		props := schema["properties"].(map[string]any)
+		wsProp, ok := props["workspaceRoot"].(map[string]any)
+		if !ok || wsProp["type"] != "string" {
+			t.Fatalf("tool %s missing string workspaceRoot property in inputSchema: %+v", obj["name"], props)
+		}
+	}
+
+	// Calling odd_review_assess({}) without workspaceRoot must fail cleanly with actionable message.
+	missingOut, missingErr := cli.callTool("odd_review_assess", map[string]any{})
+	if !missingErr || !strings.Contains(missingOut, "workspaceRoot") {
+		t.Fatalf("expected isError=true mentioning workspaceRoot, got err=%v out=%q", missingErr, missingOut)
+	}
+
+	// Calling odd_review_assess({"workspaceRoot": repoA}) succeeds on repoA.
+	assessAOut, assessAErr := cli.callTool("odd_review_assess", map[string]any{"workspaceRoot": repoA})
+	if assessAErr || !strings.Contains(assessAOut, `"reviewDue": true`) {
+		t.Fatalf("odd_review_assess(repoA) unexpected (err=%v): %s", assessAErr, assessAOut)
+	}
+
+	// Reject invalid and sensitive workspaceRoot paths.
+	notAFile := filepath.Join(repoA, "main.go")
+	sshSymlink := filepath.Join(t.TempDir(), "ssh-link")
+	if err := os.Symlink(filepath.Join(fakeHome, ".ssh"), sshSymlink); err != nil {
+		t.Fatalf("symlink to .ssh: %v", err)
+	}
+	badRoots := []struct {
+		name string
+		root string
+	}{
+		{"relative", "relative/path"},
+		{"dot", "."},
+		{"root", "/"},
+		{"nonexistent", filepath.Join(t.TempDir(), "does-not-exist")},
+		{"file_not_dir", notAFile},
+		{"null_byte", repoA + "\x00bad"},
+		{"home_config_odd_agy", filepath.Join(fakeHome, ".config", "odd-agy")},
+		{"home_gemini", filepath.Join(fakeHome, ".gemini")},
+		{"home_ssh", filepath.Join(fakeHome, ".ssh")},
+		{"home_ssh_nested", filepath.Join(fakeHome, ".ssh", "nested")},
+		{"symlink_to_ssh", sshSymlink},
+	}
+	for _, tc := range badRoots {
+		out, isErr := cli.callTool("odd_review_assess", map[string]any{"workspaceRoot": tc.root})
+		if !isErr {
+			t.Fatalf("bad workspaceRoot %s (%q) unexpectedly succeeded: %s", tc.name, tc.root, out)
+		}
+	}
+	for _, sysRoot := range []string{"/etc", "/private/etc", "/System", "/Library"} {
+		if info, err := os.Stat(sysRoot); err == nil && info.IsDir() {
+			out, isErr := cli.callTool("odd_review_assess", map[string]any{"workspaceRoot": sysRoot})
+			if !isErr {
+				t.Fatalf("sensitive system root %q unexpectedly succeeded: %s", sysRoot, out)
+			}
+		}
+	}
+
+	// Concurrent multi-project calls against repoA and repoB must stay isolated and race-free.
+	var writeMu sync.Mutex
+	var nextConcurrentID atomic.Int32
+	nextConcurrentID.Store(500)
+	var respMu sync.Mutex
+	respChans := make(map[int]chan map[string]any)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			line, err := cli.reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			var resp map[string]any
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
+				return
+			}
+			id := int(resp["id"].(float64))
+			respMu.Lock()
+			ch := respChans[id]
+			delete(respChans, id)
+			respMu.Unlock()
+			if ch != nil {
+				ch <- resp
+			}
+		}
+	}()
+
+	callConcurrentTool := func(name string, args map[string]any) (string, bool) {
+		id := int(nextConcurrentID.Add(1))
+		ch := make(chan map[string]any, 1)
+		respMu.Lock()
+		respChans[id] = ch
+		respMu.Unlock()
+
+		msg := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"method":  "tools/call",
+			"params": map[string]any{
+				"name":      name,
+				"arguments": args,
+			},
+		}
+		b, _ := json.Marshal(msg)
+		b = append(b, '\n')
+		writeMu.Lock()
+		_, err := inW.Write(b)
+		writeMu.Unlock()
+		if err != nil {
+			t.Fatalf("write concurrent %s: %v", name, err)
+		}
+		resp := <-ch
+		if errObj, hasErr := resp["error"]; hasErr {
+			t.Fatalf("concurrent %s JSON-RPC error: %v", name, errObj)
+		}
+		res := resp["result"].(map[string]any)
+		isErr, _ := res["isError"].(bool)
+		text := res["content"].([]any)[0].(map[string]any)["text"].(string)
+		return text, isErr
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if out, isErr := callConcurrentTool("todo", map[string]any{
+			"workspaceRoot": repoA,
+			"action":        "write",
+			"tasks":         []map[string]any{{"title": "RepoA Task", "status": "in_progress"}},
+		}); isErr {
+			t.Errorf("repoA todo write failed: %s", out)
+			return
+		}
+		startOut, isErr := callConcurrentTool("odd_review_start", map[string]any{
+			"workspaceRoot": repoA,
+			"lenses":        []string{"risk"},
+			"lensesReason":  "repoA concurrent review",
+		})
+		if isErr {
+			t.Errorf("repoA odd_review_start failed: %s", startOut)
+			return
+		}
+		var sr rdd.StartResult
+		if err := json.Unmarshal([]byte(startOut), &sr); err != nil {
+			t.Errorf("unmarshal repoA start: %v", err)
+			return
+		}
+		if out, isErr := callConcurrentTool("odd_review_consent", map[string]any{
+			"workspaceRoot": repoA,
+			"lineageId":     sr.LineageID,
+			"answer":        "granted",
+		}); isErr {
+			t.Errorf("repoA odd_review_consent failed: %s", out)
+			return
+		}
+		if out, isErr := callConcurrentTool("odd_review_run_lenses", map[string]any{
+			"workspaceRoot": repoA,
+			"lineageId":     sr.LineageID,
+		}); isErr || !strings.Contains(out, `"submittedToLineage": true`) {
+			t.Errorf("repoA odd_review_run_lenses unexpected (err=%v): %s", isErr, out)
+			return
+		}
+		if out, isErr := callConcurrentTool("odd_review_ack", map[string]any{
+			"workspaceRoot": repoA,
+			"lineageId":     sr.LineageID,
+		}); isErr || !strings.Contains(out, rdd.AuthorityBurned) {
+			t.Errorf("repoA odd_review_ack unexpected (err=%v): %s", isErr, out)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if out, isErr := callConcurrentTool("todo", map[string]any{
+			"workspaceRoot": repoB,
+			"action":        "write",
+			"tasks":         []map[string]any{{"title": "RepoB Task", "status": "pending"}},
+		}); isErr {
+			t.Errorf("repoB todo write failed: %s", out)
+			return
+		}
+		if out, isErr := callConcurrentTool("odd_review_mode", map[string]any{
+			"workspaceRoot": repoB,
+			"action":        "disable",
+		}); isErr || !strings.Contains(out, `"rddEnabled": false`) {
+			t.Errorf("repoB odd_review_mode disable unexpected (err=%v): %s", isErr, out)
+			return
+		}
+		if out, isErr := callConcurrentTool("odd_external_profiles", map[string]any{
+			"workspaceRoot": repoB,
+		}); isErr || !strings.Contains(out, `"activeProfile": "agy-oauth"`) {
+			t.Errorf("repoB odd_external_profiles unexpected (err=%v): %s", isErr, out)
+		}
+	}()
+	wg.Wait()
+
+	// Verify repoA and repoB state stayed completely independent.
+	todoA, isErr := callConcurrentTool("todo", map[string]any{"workspaceRoot": repoA, "action": "list"})
+	if isErr || !strings.Contains(todoA, "RepoA Task") || strings.Contains(todoA, "RepoB Task") {
+		t.Fatalf("repoA todo contaminated (err=%v): %s", isErr, todoA)
+	}
+	todoB, isErr := callConcurrentTool("todo", map[string]any{"workspaceRoot": repoB, "action": "list"})
+	if isErr || !strings.Contains(todoB, "RepoB Task") || strings.Contains(todoB, "RepoA Task") {
+		t.Fatalf("repoB todo contaminated (err=%v): %s", isErr, todoB)
+	}
+	modeA, isErr := callConcurrentTool("odd_review_mode", map[string]any{"workspaceRoot": repoA, "action": "status"})
+	if isErr || !strings.Contains(modeA, `"rddEnabled": true`) {
+		t.Fatalf("repoA rddEnabled should still be true (err=%v): %s", isErr, modeA)
+	}
+
+	_ = inW.Close()
+	<-readDone
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+
+	// 2. initialize with rootUri when Workspace: "/" adopts repoA as defaultRoot.
+	spacedDir := filepath.Join(t.TempDir(), "my repo")
+	if err := os.MkdirAll(spacedDir, 0o755); err != nil {
+		t.Fatalf("mkdir spacedDir: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = spacedDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	if err := os.WriteFile(filepath.Join(spacedDir, "a.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	cmdAdd := exec.Command("git", "add", "a.txt")
+	cmdAdd.Dir = spacedDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, string(out))
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "init")
+	cmdCommit.Dir = spacedDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, string(out))
+	}
+	if err := os.WriteFile(filepath.Join(spacedDir, "a.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatalf("edit a.txt: %v", err)
+	}
+
+	cliAdopt, inWAdopt, doneAdopt, cancelAdopt := startServer("/")
+	defer cancelAdopt()
+	encodedURI := "file://" + strings.ReplaceAll(spacedDir, " ", "%20")
+	if resp := cliAdopt.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"rootUri":         encodedURI,
+	}); resp["error"] != nil {
+		t.Fatalf("initialize(rootUri) error: %v", resp["error"])
+	}
+	cliAdopt.notify("notifications/initialized", map[string]any{})
+	adoptedOut, adoptedErr := cliAdopt.callTool("odd_review_assess", map[string]any{})
+	if adoptedErr || !strings.Contains(adoptedOut, `"reviewDue":`) {
+		t.Fatalf("expected odd_review_assess({}) after rootUri adoption to succeed, got err=%v out=%s", adoptedErr, adoptedOut)
+	}
+	_ = inWAdopt.Close()
+	if err := <-doneAdopt; err != nil {
+		t.Fatalf("Serve adopt error: %v", err)
+	}
+
+	// 3. PRESERVE: initialize rootUri MUST NOT override an already-valid non-root defaultRoot,
+	// while explicit workspaceRoot still routes to repoB.
+	cliKeep, inWKeep, doneKeep, cancelKeep := startServer(repoA)
+	defer cancelKeep()
+	if resp := cliKeep.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"rootUri":         "file://" + repoB,
+	}); resp["error"] != nil {
+		t.Fatalf("initialize(non-root) error: %v", resp["error"])
+	}
+	cliKeep.notify("notifications/initialized", map[string]any{})
+	// Omitting workspaceRoot must still read repoA (rddEnabled: true), NOT repoB (rddEnabled: false).
+	keepOut, keepErr := cliKeep.callTool("odd_review_mode", map[string]any{"action": "status"})
+	if keepErr || !strings.Contains(keepOut, `"rddEnabled": true`) {
+		t.Fatalf("non-root server defaultRoot overridden by rootUri! err=%v out=%s", keepErr, keepOut)
+	}
+	// Explicit workspaceRoot routes to repoB even when defaultRoot is repoA.
+	explicitBOut, explicitBErr := cliKeep.callTool("odd_review_mode", map[string]any{
+		"workspaceRoot": repoB,
+		"action":        "status",
+	})
+	if explicitBErr || !strings.Contains(explicitBOut, `"rddEnabled": false`) {
+		t.Fatalf("explicit workspaceRoot(repoB) unexpected (err=%v): %s", explicitBErr, explicitBOut)
+	}
+	_ = inWKeep.Close()
+	if err := <-doneKeep; err != nil {
+		t.Fatalf("Serve keep error: %v", err)
+	}
+
+	// 4. initialize rootPath and workspaceFolders[0].uri adoption + root/sensitive rejection.
+	cliWF, inWWF, doneWF, cancelWF := startServer("/")
+	defer cancelWF()
+	if resp := cliWF.call("initialize", map[string]any{
+		"protocolVersion":  "2024-11-05",
+		"rootUri":          "file:///",
+		"workspaceFolders": []map[string]any{{"uri": "file://" + repoA}},
+	}); resp["error"] != nil {
+		t.Fatalf("initialize(workspaceFolders) error: %v", resp["error"])
+	}
+	cliWF.notify("notifications/initialized", map[string]any{})
+	if out, isErr := cliWF.callTool("odd_review_mode", map[string]any{"action": "status"}); isErr || !strings.Contains(out, `"rddEnabled": true`) {
+		t.Fatalf("workspaceFolders adoption failed (err=%v): %s", isErr, out)
+	}
+	_ = inWWF.Close()
+	if err := <-doneWF; err != nil {
+		t.Fatalf("Serve wf error: %v", err)
+	}
+
+	cliRP, inWRP, doneRP, cancelRP := startServer("/")
+	defer cancelRP()
+	if resp := cliRP.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"rootPath":        repoB,
+	}); resp["error"] != nil {
+		t.Fatalf("initialize(rootPath) error: %v", resp["error"])
+	}
+	cliRP.notify("notifications/initialized", map[string]any{})
+	if out, isErr := cliRP.callTool("odd_review_mode", map[string]any{"action": "status"}); isErr || !strings.Contains(out, `"rddEnabled": false`) {
+		t.Fatalf("rootPath adoption failed (err=%v): %s", isErr, out)
+	}
+	_ = inWRP.Close()
+	if err := <-doneRP; err != nil {
+		t.Fatalf("Serve rp error: %v", err)
+	}
+
+	// Sensitive rootUri during initialize must NOT be adopted.
+	cliSens, inWSens, doneSens, cancelSens := startServer("/")
+	defer cancelSens()
+	if resp := cliSens.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"rootUri":         "file://" + filepath.Join(fakeHome, ".ssh"),
+	}); resp["error"] != nil {
+		t.Fatalf("initialize(sensitive) error: %v", resp["error"])
+	}
+	cliSens.notify("notifications/initialized", map[string]any{})
+	if out, isErr := cliSens.callTool("odd_review_assess", map[string]any{}); !isErr || !strings.Contains(out, "workspaceRoot") {
+		t.Fatalf("expected sensitive rootUri not to be adopted, got err=%v out=%s", isErr, out)
+	}
+	_ = inWSens.Close()
+	if err := <-doneSens; err != nil {
+		t.Fatalf("Serve sens error: %v", err)
+	}
+}
+
+func TestMCPWorkspaceRootRejectsCaseVariedSensitiveDirsOnCaseInsensitiveFS(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	for _, credDir := range []string{
+		filepath.Join(fakeHome, ".config", "odd-agy"),
+		filepath.Join(fakeHome, ".gemini"),
+		filepath.Join(fakeHome, ".ssh"),
+		filepath.Join(fakeHome, ".ssh", "nested"),
+	} {
+		if err := os.MkdirAll(credDir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", credDir, err)
+		}
+	}
+
+	startServer := func() (*Server, *rpcClient, *io.PipeWriter, chan error, context.CancelFunc) {
+		server := NewServer(ServerConfig{Workspace: "/"})
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- server.Serve(ctx, inR, outW)
+			_ = outW.Close()
+		}()
+		cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+		return server, cli, inW, done, cancel
+	}
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"upper_ssh", filepath.Join(fakeHome, ".SSH")},
+		{"upper_ssh_nested", filepath.Join(fakeHome, ".SSH", "nested")},
+		{"mixed_gemini", filepath.Join(fakeHome, ".Gemini")},
+		{"upper_config_odd_agy", filepath.Join(fakeHome, ".CONFIG", "ODD-AGY")},
+		{"lower_system", "/system"},
+		{"lower_library", "/library"},
+		{"mixed_private_etc", "/private/ETC"},
+	}
+
+	_, cli, inW, done, cancel := startServer()
+	defer cancel()
+	if resp := cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"}); resp["error"] != nil {
+		t.Fatalf("initialize error: %v", resp["error"])
+	}
+	cli.notify("notifications/initialized", map[string]any{})
+
+	for _, tc := range cases {
+		info, statErr := os.Stat(tc.path)
+		existsOnFS := statErr == nil && info.IsDir()
+		if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && strings.HasPrefix(tc.path, fakeHome) && !existsOnFS {
+			t.Logf("%s: case-varied home dir %q did not stat on this filesystem (%v)", tc.name, tc.path, statErr)
+		}
+
+		// 1. Direct workspaceRoot argument on tool call.
+		out, isErr := cli.callTool("odd_review_assess", map[string]any{"workspaceRoot": tc.path})
+		if !isErr {
+			t.Fatalf("%s: workspaceRoot %q unexpectedly succeeded: %s", tc.name, tc.path, out)
+		}
+		if existsOnFS && !strings.Contains(out, "targets restricted directory") {
+			t.Fatalf("%s: workspaceRoot %q failed with %q, want restricted directory rejection", tc.name, tc.path, out)
+		}
+
+		// 2. initialize rootUri must not adopt case-varied sensitive directory.
+		_, cliInit, inWInit, doneInit, cancelInit := startServer()
+		if resp := cliInit.call("initialize", map[string]any{
+			"protocolVersion": "2024-11-05",
+			"rootUri":         "file://" + tc.path,
+		}); resp["error"] != nil {
+			cancelInit()
+			t.Fatalf("%s: initialize(rootUri) error: %v", tc.name, resp["error"])
+		}
+		cliInit.notify("notifications/initialized", map[string]any{})
+		assessOut, assessErr := cliInit.callTool("odd_review_assess", map[string]any{})
+		if !assessErr || !strings.Contains(assessOut, "workspaceRoot") {
+			cancelInit()
+			t.Fatalf("%s: initialize(rootUri=%q) unexpectedly adopted sensitive path: err=%v out=%s", tc.name, tc.path, assessErr, assessOut)
+		}
+		_ = inWInit.Close()
+		cancelInit()
+		if err := <-doneInit; err != nil && err != context.Canceled {
+			t.Fatalf("%s: Serve error: %v", tc.name, err)
+		}
+	}
+
+	_ = inW.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPWorkspaceCacheKeyNormalizesCaseInsensitiveOS(t *testing.T) {
+	parent := t.TempDir()
+	repo := filepath.Join(parent, "MixedCaseRepo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	for _, args := range [][]string{{"add", "main.go"}, {"commit", "-m", "init"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, string(out))
+		}
+	}
+
+	lowerRepo := filepath.Join(parent, "mixedcaserepo")
+	upperRepo := filepath.Join(parent, "MIXEDCASEREPO")
+
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case-varied path cache test applies to darwin/windows")
+	}
+
+	infoL, errL := os.Stat(lowerRepo)
+	infoU, errU := os.Stat(upperRepo)
+	if errL != nil || errU != nil || !os.SameFile(infoL, infoU) {
+		t.Skipf("filesystem is case-sensitive (errL=%v errU=%v)", errL, errU)
+	}
+
+	server := NewServer(ServerConfig{Workspace: "/"})
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	if resp := cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"}); resp["error"] != nil {
+		t.Fatalf("initialize error: %v", resp["error"])
+	}
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// Write todo using lowerRepo, read using upperRepo.
+	if out, isErr := cli.callTool("todo", map[string]any{
+		"workspaceRoot": lowerRepo,
+		"action":        "write",
+		"tasks":         []map[string]any{{"title": "SharedCacheTask", "status": "in_progress"}},
+	}); isErr {
+		t.Fatalf("todo write(lowerRepo) failed: %s", out)
+	}
+	listOut, isErr := cli.callTool("todo", map[string]any{
+		"workspaceRoot": upperRepo,
+		"action":        "list",
+	})
+	if isErr || !strings.Contains(listOut, "SharedCacheTask") {
+		t.Fatalf("todo list(upperRepo) unexpected (err=%v): %s", isErr, listOut)
+	}
+
+	server.wsMu.Lock()
+	cacheLen := len(server.workspaces)
+	server.wsMu.Unlock()
+	if cacheLen != 1 {
+		t.Fatalf("len(server.workspaces) = %d, want 1 (case-varied paths must share cache entry)", cacheLen)
+	}
+
+	wsLower, err := server.resolveWorkspace(lowerRepo)
+	if err != nil {
+		t.Fatalf("resolveWorkspace(lowerRepo): %v", err)
+	}
+	wsUpper, err := server.resolveWorkspace(upperRepo)
+	if err != nil {
+		t.Fatalf("resolveWorkspace(upperRepo): %v", err)
+	}
+	if wsLower != wsUpper {
+		t.Fatalf("expected identical *workspaceServices pointer for %q and %q", lowerRepo, upperRepo)
+	}
+
+	// PRESERVE: distinct repo still gets its own cache entry.
+	otherRepo := initMCPRepo(t)
+	if out, isErr := cli.callTool("odd_review_mode", map[string]any{
+		"workspaceRoot": otherRepo,
+		"action":        "status",
+	}); isErr {
+		t.Fatalf("odd_review_mode(otherRepo) failed: %s", out)
+	}
+	server.wsMu.Lock()
+	cacheLenAfter := len(server.workspaces)
+	server.wsMu.Unlock()
+	if cacheLenAfter != 2 {
+		t.Fatalf("len(server.workspaces) = %d, want 2 after distinct repo", cacheLenAfter)
+	}
+
+	_ = inW.Close()
+	if err := <-done; err != nil {
 		t.Fatalf("Serve error: %v", err)
 	}
 }
