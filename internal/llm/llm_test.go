@@ -2234,3 +2234,386 @@ func TestExternalReviewRoleWithReviewHostUsesFrozenScopeAndSubmitsDirectly(t *te
 	}
 }
 
+func TestRunnerStartRunWaitAndLiveTurnProgress(t *testing.T) {
+	repo := initTestGitRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+
+	turn1Entered := make(chan struct{})
+	turn1Release := make(chan struct{})
+	turn2Entered := make(chan struct{})
+	turn2Release := make(chan struct{})
+	var turnCount atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := turnCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			close(turn1Entered)
+			select {
+			case <-turn1Release:
+			case <-r.Context().Done():
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "t1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading app.go",
+						"tool_calls": []map[string]any{{
+							"id":   "call_1",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "read_file",
+								"arguments": `{"path":"src/app.go"}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+				"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+			})
+			return
+		}
+
+		close(turn2Entered)
+		select {
+		case <-turn2Release:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "t2", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index": 0,
+				"message": map[string]any{
+					"role":              "assistant",
+					"content":           "done after two turns",
+					"reasoning_content": "finished",
+				},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+		})
+	}))
+	defer srv.Close()
+
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{
+		RepoRoot: repo,
+		Client:   NewClient(srv.Client()),
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-key", true
+			}
+			return "", false
+		},
+	})
+
+	// Invalid input fails synchronously without starting a background task.
+	if _, _, err := runner.StartRun(context.Background(), RunRequest{Role: "", Task: "x"}); err == nil {
+		t.Fatal("expected StartRun with empty role to fail synchronously")
+	}
+
+	rec, done, err := runner.StartRun(context.Background(), RunRequest{
+		Role: "verify",
+		Task: "Inspect src/app.go",
+	})
+	if err != nil {
+		t.Fatalf("StartRun failed: %v", err)
+	}
+	if rec.Status != TaskStatusRunning || rec.TaskID == "" {
+		t.Fatalf("StartRun initial rec = %+v, want status=running", rec)
+	}
+
+	// Persisted immediately before goroutine completes.
+	persisted, err := runner.Status(rec.TaskID)
+	if err != nil || persisted.Status != TaskStatusRunning {
+		t.Fatalf("Status immediately after StartRun = (%+v, %v), want running", persisted, err)
+	}
+
+	<-turn1Entered
+	wRec, err := runner.Wait(context.Background(), rec.TaskID, 25*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Wait (chunk 1) failed: %v", err)
+	}
+	if wRec.Status != TaskStatusRunning {
+		t.Fatalf("Wait (chunk 1) status = %q, want running", wRec.Status)
+	}
+
+	// Complete turn 1 and block on turn 2; verify live turn progress was persisted.
+	close(turn1Release)
+	<-turn2Entered
+
+	progRec, err := runner.Wait(context.Background(), rec.TaskID, 25*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Wait (chunk 2) failed: %v", err)
+	}
+	if progRec.Status != TaskStatusRunning || progRec.Turns != 1 {
+		t.Fatalf("Wait (chunk 2) = status:%q turns:%d, want status=running turns=1", progRec.Status, progRec.Turns)
+	}
+
+	// Release turn 2 and collect completion via Wait.
+	close(turn2Release)
+	finalRec, err := runner.Wait(context.Background(), rec.TaskID, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Wait (final) failed: %v", err)
+	}
+	if finalRec.Status != TaskStatusCompleted || finalRec.Turns != 2 || finalRec.FinalResponse != "done after two turns" {
+		t.Fatalf("finalRec = %+v, want completed with 2 turns", finalRec)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected done channel to be closed")
+	}
+}
+
+func TestRunnerStartContinueRejectsRunningAndSupportsBoundedWait(t *testing.T) {
+	repo := initTestGitRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+
+	runEntered := make(chan struct{})
+	runRelease := make(chan struct{})
+	contEntered := make(chan struct{})
+	contRelease := make(chan struct{})
+	var callNum atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := callNum.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			close(runEntered)
+			select {
+			case <-runRelease:
+			case <-r.Context().Done():
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "r1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "initial ok", "reasoning_content": "r1"},
+					"finish_reason": "stop",
+				}},
+			})
+			return
+		}
+		close(contEntered)
+		select {
+		case <-contRelease:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "r2", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": "continued ok", "reasoning_content": "r2"},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{
+		RepoRoot: repo,
+		Client:   NewClient(srv.Client()),
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-key", true
+			}
+			return "", false
+		},
+	})
+
+	rec, done, err := runner.StartRun(context.Background(), RunRequest{Role: "verify", Task: "Initial"})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	<-runEntered
+
+	// Reject StartContinue and Continue while task is running.
+	if _, _, err := runner.StartContinue(context.Background(), ContinueRequest{TaskID: rec.TaskID, Prompt: "early"}); err == nil {
+		t.Fatal("expected StartContinue to reject running task")
+	}
+	if _, err := runner.Continue(context.Background(), ContinueRequest{TaskID: rec.TaskID, Prompt: "early"}); err == nil {
+		t.Fatal("expected Continue to reject running task")
+	}
+
+	close(runRelease)
+	<-done
+
+	contRec, contDone, err := runner.StartContinue(context.Background(), ContinueRequest{
+		TaskID: rec.TaskID,
+		Prompt: "Follow up",
+	})
+	if err != nil {
+		t.Fatalf("StartContinue failed: %v", err)
+	}
+	if contRec.Status != TaskStatusRunning {
+		t.Fatalf("StartContinue initial status = %q, want running", contRec.Status)
+	}
+	<-contEntered
+
+	chunkRec, err := runner.Wait(context.Background(), rec.TaskID, 25*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Wait on continue failed: %v", err)
+	}
+	if chunkRec.Status != TaskStatusRunning {
+		t.Fatalf("Wait on continue status = %q, want running", chunkRec.Status)
+	}
+
+	close(contRelease)
+	finalRec, err := runner.Wait(context.Background(), rec.TaskID, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Wait final continue failed: %v", err)
+	}
+	if finalRec.Status != TaskStatusCompleted || finalRec.FinalResponse != "continued ok" {
+		t.Fatalf("final continue rec = %+v, want completed/continued ok", finalRec)
+	}
+	<-contDone
+}
+
+func TestRunnerStartContinueConcurrentRace(t *testing.T) {
+	repo := initTestGitRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+
+	contEntered := make(chan struct{})
+	contRelease := make(chan struct{})
+	var callNum atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := callNum.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "r1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "init ok", "reasoning_content": "r1"},
+					"finish_reason": "stop",
+				}},
+			})
+			return
+		}
+		if n == 2 {
+			close(contEntered)
+		}
+		select {
+		case <-contRelease:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "r2", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": "race winner ok", "reasoning_content": "r2"},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	runner := NewRunner(RunnerConfig{
+		RepoRoot: repo,
+		Client:   NewClient(srv.Client()),
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-key", true
+			}
+			return "", false
+		},
+	})
+
+	initRec, err := runner.Run(context.Background(), RunRequest{Role: "verify", Task: "Init"})
+	if err != nil || initRec.Status != TaskStatusCompleted {
+		t.Fatalf("initial Run = (%+v, %v), want completed", initRec, err)
+	}
+
+	const workers = 8
+	startBarrier := make(chan struct{})
+	type result struct {
+		rec  TaskRecord
+		done <-chan struct{}
+		err  error
+	}
+	results := make(chan result, workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-startBarrier
+			r, d, e := runner.StartContinue(context.Background(), ContinueRequest{
+				TaskID: initRec.TaskID,
+				Prompt: "race follow-up",
+			})
+			results <- result{rec: r, done: d, err: e}
+		}()
+	}
+
+	close(startBarrier)
+
+	var successes int
+	var winnerDone <-chan struct{}
+	var stillRunningErrs int
+	for i := 0; i < workers; i++ {
+		res := <-results
+		if res.err == nil {
+			successes++
+			winnerDone = res.done
+			if res.rec.Status != TaskStatusRunning {
+				t.Fatalf("winning StartContinue returned status %q, want running", res.rec.Status)
+			}
+		} else if strings.Contains(res.err.Error(), "is still running") {
+			stillRunningErrs++
+		} else {
+			t.Fatalf("unexpected StartContinue error: %v", res.err)
+		}
+	}
+
+	if successes != 1 || stillRunningErrs != workers-1 {
+		t.Fatalf("concurrent StartContinue results: successes=%d stillRunningErrs=%d (want 1 and %d)", successes, stillRunningErrs, workers-1)
+	}
+
+	// Status immediately after winning StartContinue must already be running (never stale completed).
+	st, err := runner.Status(initRec.TaskID)
+	if err != nil || st.Status != TaskStatusRunning {
+		t.Fatalf("Status after StartContinue = (%+v, %v), want running", st, err)
+	}
+
+	<-contEntered
+	close(contRelease)
+	<-winnerDone
+
+	finalSt, err := runner.Status(initRec.TaskID)
+	if err != nil || finalSt.Status != TaskStatusCompleted || finalSt.FinalResponse != "race winner ok" {
+		t.Fatalf("final Status after <-done = (%+v, %v), want completed / race winner ok", finalSt, err)
+	}
+}
+

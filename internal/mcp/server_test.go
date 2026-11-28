@@ -2550,3 +2550,776 @@ func TestMCPWorkspaceCacheKeyNormalizesCaseInsensitiveOS(t *testing.T) {
 		t.Fatalf("Serve error: %v", err)
 	}
 }
+
+func TestMCPExternalRunContinueStatusBoundedWaitChunking(t *testing.T) {
+	runGate := make(chan struct{})
+	contGate := make(chan struct{})
+	var callNum atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := callNum.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			select {
+			case <-runGate:
+			case <-r.Context().Done():
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "c1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "run finished", "reasoning_content": "ok"},
+					"finish_reason": "stop",
+				}},
+			})
+			return
+		}
+		select {
+		case <-contGate:
+		case <-r.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "c2", "model": "deepseek-v4-pro",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": "continue finished", "reasoning_content": "ok2"},
+				"finish_reason": "stop",
+			}},
+		})
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+	server.SetWaitTimeout(40 * time.Millisecond)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// Verify waitSeconds schema properties are exposed.
+	listResp := cli.call("tools/list", map[string]any{})
+	toolsRaw := listResp["result"].(map[string]any)["tools"].([]any)
+	byName := make(map[string]map[string]any)
+	for _, raw := range toolsRaw {
+		obj := raw.(map[string]any)
+		byName[obj["name"].(string)] = obj
+	}
+	for _, toolName := range []string{"odd_external_run", "odd_external_continue", "odd_external_status", "odd_review_run_lenses"} {
+		props := byName[toolName]["inputSchema"].(map[string]any)["properties"].(map[string]any)
+		if _, ok := props["waitSeconds"]; !ok {
+			t.Fatalf("%s inputSchema missing waitSeconds property", toolName)
+		}
+	}
+
+	// Negative waitSeconds is rejected.
+	if negOut, negErr := cli.callTool("odd_external_run", map[string]any{
+		"role":        "verify",
+		"task":        "Verify main.go",
+		"waitSeconds": -1,
+	}); !negErr || !strings.Contains(negOut, "waitSeconds") {
+		t.Fatalf("expected negative waitSeconds error, got err=%v out=%s", negErr, negOut)
+	}
+
+	// 1. odd_external_run exceeds 40ms waitTimeout -> returns running without cancelling background task.
+	runOut, isErr := cli.callTool("odd_external_run", map[string]any{
+		"role": "verify",
+		"task": "Verify main.go",
+	})
+	if isErr {
+		t.Fatalf("odd_external_run failed: %s", runOut)
+	}
+	var runObj struct {
+		TaskID     string `json:"taskId"`
+		Status     string `json:"status"`
+		NextAction string `json:"nextAction"`
+	}
+	if err := json.Unmarshal([]byte(runOut), &runObj); err != nil {
+		t.Fatalf("unmarshal runOut: %v", err)
+	}
+	if runObj.Status != "running" || runObj.TaskID == "" || !strings.Contains(runObj.NextAction, "odd_external_status") {
+		t.Fatalf("unexpected running odd_external_run response: %s", runOut)
+	}
+
+	// 2. odd_external_status without waitSeconds returns immediate running status.
+	stNowOut, isErr := cli.callTool("odd_external_status", map[string]any{"taskId": runObj.TaskID})
+	if isErr {
+		t.Fatalf("odd_external_status failed: %s", stNowOut)
+	}
+	if !strings.Contains(stNowOut, `"status": "running"`) || !strings.Contains(stNowOut, "odd_external_status") {
+		t.Fatalf("expected immediate running status with nextAction, got: %s", stNowOut)
+	}
+
+	// 3. Continuing a running task is rejected cleanly.
+	if earlyContOut, earlyContErr := cli.callTool("odd_external_continue", map[string]any{
+		"taskId": runObj.TaskID,
+		"prompt": "too soon",
+	}); !earlyContErr {
+		t.Fatalf("expected odd_external_continue on running task to fail, got: %s", earlyContOut)
+	}
+
+	// 4. Release background run and wait via odd_external_status(waitSeconds: 200 -> clamped to 120s).
+	close(runGate)
+	stDoneOut, isErr := cli.callTool("odd_external_status", map[string]any{
+		"taskId":      runObj.TaskID,
+		"waitSeconds": 200,
+	})
+	if isErr || !strings.Contains(stDoneOut, `"status": "completed"`) || !strings.Contains(stDoneOut, "run finished") {
+		t.Fatalf("odd_external_status(waitSeconds) unexpected (err=%v): %s", isErr, stDoneOut)
+	}
+
+	// 5. odd_external_continue bounded wait + polling via odd_external_status.
+	contOut, isErr := cli.callTool("odd_external_continue", map[string]any{
+		"taskId": runObj.TaskID,
+		"prompt": "Follow up",
+	})
+	if isErr {
+		t.Fatalf("odd_external_continue failed: %s", contOut)
+	}
+	if !strings.Contains(contOut, `"status": "running"`) || !strings.Contains(contOut, "odd_external_status") {
+		t.Fatalf("expected running odd_external_continue response, got: %s", contOut)
+	}
+	close(contGate)
+	contDoneOut, isErr := cli.callTool("odd_external_status", map[string]any{
+		"taskId":      runObj.TaskID,
+		"waitSeconds": 2,
+	})
+	if isErr || !strings.Contains(contDoneOut, `"status": "completed"`) || !strings.Contains(contDoneOut, "continue finished") {
+		t.Fatalf("odd_external_status after continue unexpected (err=%v): %s", isErr, contDoneOut)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPReviewRunLensesChunkedAttachmentZeroDuplicatesAndFinishBetweenPolls(t *testing.T) {
+	var gateMu sync.Mutex
+	activeGate := make(chan struct{})
+	var initialCalls atomic.Int32
+	var emitBlocker atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		msgs := payload["messages"].([]any)
+		var toolCount int
+		for _, rawM := range msgs {
+			if rawM.(map[string]any)["role"] == "tool" {
+				toolCount++
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch toolCount {
+		case 0:
+			initialCalls.Add(1)
+			gateMu.Lock()
+			gate := activeGate
+			gateMu.Unlock()
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "l1", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "reading scope",
+						"tool_calls": []map[string]any{{
+							"id":   "call_scope",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "read_review_scope",
+								"arguments": `{"cursor":0}`,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		case 1:
+			argsJSON := `{"findings":[]}`
+			if emitBlocker.Load() {
+				argsJSON = `{"findings":[{"id":"BLK-1","severity":"SEVERE","causality":"candidate","location":"main.go:3","claim":"needs fix"}]}`
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "l2", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "",
+						"reasoning_content": "submitting",
+						"tool_calls": []map[string]any{{
+							"id":   "call_submit",
+							"type": "function",
+							"function": map[string]any{
+								"name":      "submit_review_findings",
+								"arguments": argsJSON,
+							},
+						}},
+					},
+					"finish_reason": "tool_calls",
+				}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "l3", "model": "deepseek-v4-pro",
+				"choices": []map[string]any{{
+					"index": 0,
+					"message": map[string]any{
+						"role":              "assistant",
+						"content":           "done",
+						"reasoning_content": "done",
+					},
+					"finish_reason": "stop",
+				}},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	repo := initMCPRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(12) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	profiles := config.DefaultProfilesConfig()
+	profiles.ActiveProfile = "deepseek-hybrid"
+	ds := profiles.Providers["deepseek"]
+	ds.BaseURL = srv.URL + "/v1"
+	profiles.Providers["deepseek"] = ds
+	if err := config.SaveProfiles(repo, profiles); err != nil {
+		t.Fatalf("SaveProfiles: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Workspace: repo,
+		LookupEnv: func(k string) (string, bool) {
+			if k == "DEEPSEEK_API_KEY" {
+				return "ds-secret", true
+			}
+			return "", false
+		},
+	})
+	server.SetWaitTimeout(35 * time.Millisecond)
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(ctx, inR, outW)
+		_ = outW.Close()
+	}()
+
+	cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+	_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+	cli.notify("notifications/initialized", map[string]any{})
+
+	// Subtest A: Attach while in flight with zero duplicate LLM calls.
+	startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk", "reliability"},
+		"lensesReason": "verify chunked batch attachment",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start failed: %s", startOut)
+	}
+	var startA rdd.StartResult
+	_ = json.Unmarshal([]byte(startOut), &startA)
+	_, _ = cli.callTool("odd_review_consent", map[string]any{"lineageId": startA.LineageID, "answer": "granted"})
+
+	poll1Out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startA.LineageID,
+		"lenses":    []string{"risk"},
+	})
+	if isErr {
+		t.Fatalf("poll 1 failed: %s", poll1Out)
+	}
+	var poll1 struct {
+		Status              string   `json:"status"`
+		RunningLenses       []string `json:"runningLenses"`
+		NativeLensesPending []string `json:"nativeLensesPending"`
+		NextAction          string   `json:"nextAction"`
+	}
+	if err := json.Unmarshal([]byte(poll1Out), &poll1); err != nil {
+		t.Fatalf("unmarshal poll1: %v\n%s", err, poll1Out)
+	}
+	if poll1.Status != "running" || len(poll1.RunningLenses) != 1 || poll1.RunningLenses[0] != "risk" {
+		t.Fatalf("poll1 = %+v, want status=running runningLenses=[risk]", poll1)
+	}
+	if len(poll1.NativeLensesPending) != 0 {
+		t.Fatalf("poll1 nativeLensesPending must be empty while running, got %v", poll1.NativeLensesPending)
+	}
+	if !strings.Contains(poll1.NextAction, "odd_review_run_lenses") {
+		t.Fatalf("poll1 nextAction missing odd_review_run_lenses: %q", poll1.NextAction)
+	}
+
+	// Conflicting lens subset while active batch is running is rejected.
+	if conflictOut, conflictErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startA.LineageID,
+		"lenses":    []string{"reliability"},
+	}); !conflictErr {
+		t.Fatalf("expected conflicting subset while batch active to fail, got: %s", conflictOut)
+	}
+
+	// Re-calling with waitSeconds=0 attaches without spawning duplicates.
+	poll2Out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId":   startA.LineageID,
+		"waitSeconds": 0,
+	})
+	if isErr || !strings.Contains(poll2Out, `"status": "running"`) {
+		t.Fatalf("poll2(waitSeconds=0) unexpected (err=%v): %s", isErr, poll2Out)
+	}
+	if got := initialCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 initial LLM call (zero duplicates), got %d", got)
+	}
+
+	// Release risk lens and attach with waitSeconds=2 to collect completion.
+	close(activeGate)
+	poll3Out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId":   startA.LineageID,
+		"waitSeconds": 2,
+	})
+	if isErr {
+		t.Fatalf("poll3 failed: %s", poll3Out)
+	}
+	if !strings.Contains(poll3Out, `"status": "completed"`) || !strings.Contains(poll3Out, `"submittedToLineage": true`) {
+		t.Fatalf("poll3 unexpected: %s", poll3Out)
+	}
+	if got := initialCalls.Load(); got != 1 {
+		t.Fatalf("expected still 1 initial LLM call, got %d", got)
+	}
+
+	// Finish reliability and ack startA so we can start Subtest B cleanly.
+	if out, isErr := cli.callTool("odd_review_submit", map[string]any{
+		"lineageId": startA.LineageID, "role": "reliability", "findings": []any{},
+	}); isErr {
+		t.Fatalf("submit reliability failed: %s", out)
+	}
+	if _, isErr := cli.callTool("odd_review_ack", map[string]any{"lineageId": startA.LineageID}); isErr {
+		t.Fatal("ack startA failed")
+	}
+
+	// Subtest B: Lenses finish BETWEEN Poll 1 and Poll 2 (lineage already approved_pending_ack before Poll 2).
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(13) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go v2: %v", err)
+	}
+	gateMu.Lock()
+	activeGate = make(chan struct{})
+	gateMu.Unlock()
+	initialCalls.Store(0)
+
+	startBOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk", "reliability"},
+		"lensesReason": "verify finish-between-polls attachment",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start B failed: %s", startBOut)
+	}
+	var startB rdd.StartResult
+	_ = json.Unmarshal([]byte(startBOut), &startB)
+	_, _ = cli.callTool("odd_review_consent", map[string]any{"lineageId": startB.LineageID, "answer": "granted"})
+
+	pollB1Out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startB.LineageID,
+	})
+	if isErr || !strings.Contains(pollB1Out, `"status": "running"`) {
+		t.Fatalf("pollB1 unexpected (err=%v): %s", isErr, pollB1Out)
+	}
+
+	// Release gate and wait until rdd_status has ALREADY transitioned to approved_pending_ack before Poll 2!
+	gateMu.Lock()
+	close(activeGate)
+	gateMu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		stOut, stErr := cli.callTool("odd_review_status", map[string]any{"lineageId": startB.LineageID})
+		if !stErr && strings.Contains(stOut, rdd.StatusApprovedPending) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	pollB2Out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startB.LineageID,
+	})
+	if isErr {
+		t.Fatalf("pollB2 after completion between polls failed: %s", pollB2Out)
+	}
+	var pollB2 struct {
+		Status         string `json:"status"`
+		ExecutedLenses []struct {
+			Lens               string `json:"lens"`
+			SubmittedToLineage bool   `json:"submittedToLineage"`
+			FallbackToNative   bool   `json:"fallbackToNative"`
+		} `json:"executedLenses"`
+		NativeLensesPending []string          `json:"nativeLensesPending"`
+		ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
+	}
+	if err := json.Unmarshal([]byte(pollB2Out), &pollB2); err != nil {
+		t.Fatalf("unmarshal pollB2: %v\n%s", err, pollB2Out)
+	}
+	if pollB2.Status != "completed" || len(pollB2.ExecutedLenses) != 2 || pollB2.ReviewStatus.Status != rdd.StatusApprovedPending {
+		t.Fatalf("pollB2 = %+v, want completed with 2 executed lenses and approved_pending_ack", pollB2)
+	}
+	for _, ex := range pollB2.ExecutedLenses {
+		if !ex.SubmittedToLineage || ex.FallbackToNative {
+			t.Fatalf("pollB2 unexpected lens entry: %+v", ex)
+		}
+	}
+	if got := initialCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 initial calls for Subtest B, got %d", got)
+	}
+	if _, isErr := cli.callTool("odd_review_ack", map[string]any{"lineageId": startB.LineageID}); isErr {
+		t.Fatal("ack startB failed")
+	}
+
+	// Subtest C: Fresh batch starts after odd_review_apply_correction advances to revision 2.
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(14) }\n"), 0o644); err != nil {
+		t.Fatalf("write main.go v3: %v", err)
+	}
+	emitBlocker.Store(true)
+	initialCalls.Store(0)
+	startCOut, isErr := cli.callTool("odd_review_start", map[string]any{
+		"lenses":       []string{"risk"},
+		"lensesReason": "verify fresh batch on revision 2",
+	})
+	if isErr {
+		t.Fatalf("odd_review_start C failed: %s", startCOut)
+	}
+	var startC rdd.StartResult
+	_ = json.Unmarshal([]byte(startCOut), &startC)
+	_, _ = cli.callTool("odd_review_consent", map[string]any{"lineageId": startC.LineageID, "answer": "granted"})
+
+	if out, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId":   startC.LineageID,
+		"waitSeconds": 2,
+	}); isErr || !strings.Contains(out, rdd.StatusCollectingRefuter) {
+		t.Fatalf("rev1 run_lenses unexpected (err=%v): %s", isErr, out)
+	}
+	if out, isErr := cli.callTool("odd_review_submit", map[string]any{
+		"lineageId": startC.LineageID,
+		"role":      "review-refuter",
+		"refuterVerdicts": []map[string]any{{
+			"findingId": "BLK-1", "verdict": "uphold", "rationale": "confirmed",
+		}},
+	}); isErr || !strings.Contains(out, rdd.StatusCorrectionReq) {
+		t.Fatalf("refuter submit unexpected (err=%v): %s", isErr, out)
+	}
+	if out, isErr := cli.callTool("odd_review_apply_correction", map[string]any{
+		"lineageId": startC.LineageID,
+	}); isErr || !strings.Contains(out, `"revision": 2`) {
+		t.Fatalf("apply_correction unexpected (err=%v): %s", isErr, out)
+	}
+
+	// Revision 2 starts a fresh batch cleanly.
+	emitBlocker.Store(false)
+	gateMu.Lock()
+	activeGate = make(chan struct{})
+	gateMu.Unlock()
+
+	rev2Poll1, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId": startC.LineageID,
+	})
+	if isErr || !strings.Contains(rev2Poll1, `"status": "running"`) {
+		t.Fatalf("rev2 poll1 unexpected (err=%v): %s", isErr, rev2Poll1)
+	}
+	gateMu.Lock()
+	close(activeGate)
+	gateMu.Unlock()
+
+	rev2Poll2, isErr := cli.callTool("odd_review_run_lenses", map[string]any{
+		"lineageId":   startC.LineageID,
+		"waitSeconds": 2,
+	})
+	if isErr || !strings.Contains(rev2Poll2, `"status": "completed"`) || !strings.Contains(rev2Poll2, rdd.StatusApprovedPending) {
+		t.Fatalf("rev2 poll2 unexpected (err=%v): %s", isErr, rev2Poll2)
+	}
+	if got := initialCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 initial LLM calls across rev1 and rev2, got %d", got)
+	}
+
+	_ = inW.Close()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("Serve error: %v", err)
+	}
+}
+
+func TestMCPReviewRunLensesAllSyncStartRunFailureWithZeroWaitAndEOFTeardown(t *testing.T) {
+	t.Run("all synchronous StartRun failures with waitSeconds=0 return completed immediately without dead batch", func(t *testing.T) {
+		repo := initMCPRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(99) }\n"), 0o644); err != nil {
+			t.Fatalf("write main.go: %v", err)
+		}
+
+		profiles := config.DefaultProfilesConfig()
+		profiles.ActiveProfile = "deepseek-hybrid"
+		if err := config.SaveProfiles(repo, profiles); err != nil {
+			t.Fatalf("SaveProfiles: %v", err)
+		}
+
+		server := NewServer(ServerConfig{
+			Workspace: repo,
+			LookupEnv: func(k string) (string, bool) {
+				if k == "DEEPSEEK_API_KEY" {
+					return "ds-secret", true
+				}
+				return "", false
+			},
+		})
+		server.SetWaitTimeout(20 * time.Millisecond)
+
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		serveDone := make(chan error, 1)
+		go func() {
+			serveDone <- server.Serve(ctx, inR, outW)
+			_ = outW.Close()
+		}()
+
+		cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+		_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+		cli.notify("notifications/initialized", map[string]any{})
+
+		startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+			"lenses":       []string{"risk"},
+			"lensesReason": "verify all-sync-StartRun failure with waitSeconds=0",
+		})
+		if isErr {
+			t.Fatalf("odd_review_start failed: %s", startOut)
+		}
+		var startRes rdd.StartResult
+		_ = json.Unmarshal([]byte(startOut), &startRes)
+		if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+			"lineageId": startRes.LineageID,
+			"answer":    "granted",
+		}); isErr {
+			t.Fatal("odd_review_consent failed")
+		}
+
+		// Force ws.runner.StartRun to fail synchronously inside saveTask by placing a file at .git/odd-agy/tasks.
+		tasksBlocker := filepath.Join(repo, ".git", "odd-agy", "tasks")
+		if err := os.MkdirAll(filepath.Dir(tasksBlocker), 0o755); err != nil {
+			t.Fatalf("mkdir odd-agy: %v", err)
+		}
+		if err := os.WriteFile(tasksBlocker, []byte("blocker"), 0o600); err != nil {
+			t.Fatalf("write tasks blocker: %v", err)
+		}
+
+		// Loop 10x to catch any scheduling race between coordinator goroutine and select.
+		for i := 0; i < 10; i++ {
+			out, callErr := cli.callTool("odd_review_run_lenses", map[string]any{
+				"lineageId":   startRes.LineageID,
+				"waitSeconds": 0,
+			})
+			if callErr {
+				t.Fatalf("iter %d: odd_review_run_lenses returned error: %s", i, out)
+			}
+			var res struct {
+				Status              string   `json:"status"`
+				RunningLenses       []string `json:"runningLenses"`
+				NativeLensesPending []string `json:"nativeLensesPending"`
+				ExecutedLenses      []struct {
+					Lens             string `json:"lens"`
+					Status           string `json:"status"`
+					FallbackToNative bool   `json:"fallbackToNative"`
+				} `json:"executedLenses"`
+			}
+			if err := json.Unmarshal([]byte(out), &res); err != nil {
+				t.Fatalf("iter %d: unmarshal error: %v\n%s", i, err, out)
+			}
+			if res.Status != "completed" {
+				t.Fatalf("iter %d: status = %q, want completed (out=%s)", i, res.Status, out)
+			}
+			if len(res.RunningLenses) != 0 {
+				t.Fatalf("iter %d: runningLenses = %v, want empty", i, res.RunningLenses)
+			}
+			if len(res.NativeLensesPending) != 1 || res.NativeLensesPending[0] != "review-risk" {
+				t.Fatalf("iter %d: nativeLensesPending = %v, want [review-risk]", i, res.NativeLensesPending)
+			}
+			if len(res.ExecutedLenses) != 1 || !res.ExecutedLenses[0].FallbackToNative || res.ExecutedLenses[0].Status != "failed" {
+				t.Fatalf("iter %d: executedLenses = %+v, want 1 failed fallbackToNative", i, res.ExecutedLenses)
+			}
+		}
+
+		// Verify no dead batch was left in ws.lensBatches.
+		ws, err := server.resolveWorkspace(repo)
+		if err != nil {
+			t.Fatalf("resolveWorkspace: %v", err)
+		}
+		ws.batchMu.Lock()
+		_, hasDeadBatch := ws.lensBatches[startRes.LineageID]
+		ws.batchMu.Unlock()
+		if hasDeadBatch {
+			t.Fatalf("expected no dead batch remaining in ws.lensBatches for %s", startRes.LineageID)
+		}
+
+		_ = inW.Close()
+		if err := <-serveDone; err != nil {
+			t.Fatalf("Serve error: %v", err)
+		}
+	})
+
+	t.Run("EOF Serve shutdown cancels and awaits in-flight background review lens coordinator", func(t *testing.T) {
+		handlerStarted := make(chan struct{})
+		handlerExited := make(chan struct{})
+		testDone := make(chan struct{})
+		var startOnce sync.Once
+		var exitOnce sync.Once
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			startOnce.Do(func() { close(handlerStarted) })
+			defer exitOnce.Do(func() { close(handlerExited) })
+			select {
+			case <-r.Context().Done():
+			case <-testDone:
+			}
+		}))
+		defer srv.Close()
+		defer close(testDone)
+
+		repo := initMCPRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc main() { println(100) }\n"), 0o644); err != nil {
+			t.Fatalf("write main.go: %v", err)
+		}
+		profiles := config.DefaultProfilesConfig()
+		profiles.ActiveProfile = "deepseek-hybrid"
+		ds := profiles.Providers["deepseek"]
+		ds.BaseURL = srv.URL + "/v1"
+		profiles.Providers["deepseek"] = ds
+		if err := config.SaveProfiles(repo, profiles); err != nil {
+			t.Fatalf("SaveProfiles: %v", err)
+		}
+
+		server := NewServer(ServerConfig{
+			Workspace: repo,
+			LookupEnv: func(k string) (string, bool) {
+				if k == "DEEPSEEK_API_KEY" {
+					return "ds-secret", true
+				}
+				return "", false
+			},
+		})
+		server.SetWaitTimeout(20 * time.Millisecond)
+
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		serveDone := make(chan error, 1)
+		go func() {
+			serveDone <- server.Serve(ctx, inR, outW)
+			_ = outW.Close()
+		}()
+
+		cli := &rpcClient{t: t, pw: inW, reader: bufio.NewReader(outR)}
+		_ = cli.call("initialize", map[string]any{"protocolVersion": "2024-11-05"})
+		cli.notify("notifications/initialized", map[string]any{})
+
+		startOut, isErr := cli.callTool("odd_review_start", map[string]any{
+			"lenses":       []string{"risk"},
+			"lensesReason": "verify EOF teardown awaits background lens",
+		})
+		if isErr {
+			t.Fatalf("odd_review_start failed: %s", startOut)
+		}
+		var startRes rdd.StartResult
+		_ = json.Unmarshal([]byte(startOut), &startRes)
+		if _, isErr := cli.callTool("odd_review_consent", map[string]any{
+			"lineageId": startRes.LineageID,
+			"answer":    "granted",
+		}); isErr {
+			t.Fatal("odd_review_consent failed")
+		}
+
+		runOut, runErr := cli.callTool("odd_review_run_lenses", map[string]any{
+			"lineageId": startRes.LineageID,
+		})
+		if runErr || !strings.Contains(runOut, `"status": "running"`) {
+			t.Fatalf("odd_review_run_lenses unexpected (err=%v): %s", runErr, runOut)
+		}
+		var runRes struct {
+			ExecutedLenses []struct {
+				TaskID string `json:"taskId"`
+			} `json:"executedLenses"`
+		}
+		if err := json.Unmarshal([]byte(runOut), &runRes); err != nil || len(runRes.ExecutedLenses) != 1 {
+			t.Fatalf("unexpected executedLenses: %v (%s)", err, runOut)
+		}
+		taskID := runRes.ExecutedLenses[0].TaskID
+
+		ws, err := server.resolveWorkspace(repo)
+		if err != nil {
+			t.Fatalf("resolveWorkspace: %v", err)
+		}
+		ws.batchMu.Lock()
+		batch := ws.lensBatches[startRes.LineageID]
+		ws.batchMu.Unlock()
+		if batch == nil {
+			t.Fatal("expected active lens batch before EOF")
+		}
+
+		<-handlerStarted
+
+		_ = inW.Close()
+		if err := <-serveDone; err != nil {
+			t.Fatalf("Serve error on EOF: %v", err)
+		}
+
+		// Serve must have already cancelled and awaited both the runner task and the batch.allDone coordinator.
+		select {
+		case <-batch.allDone:
+		default:
+			t.Fatal("Serve returned on EOF before lens coordinator closed batch.allDone")
+		}
+		taskRec, err := ws.runner.Status(taskID)
+		if err != nil || taskRec.Status != "failed" {
+			t.Fatalf("expected persisted task %s to be failed before Serve returned, got (%+v, %v)", taskID, taskRec, err)
+		}
+		select {
+		case <-handlerExited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for background HTTP handler to observe client disconnect")
+		}
+	})
+}
