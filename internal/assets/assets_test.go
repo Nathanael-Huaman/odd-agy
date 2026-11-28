@@ -199,6 +199,12 @@ func TestRulesContractAndBudget(t *testing.T) {
 		"granted",
 		"declined",
 		"lineageId",
+		"odd_review_run_lenses",
+		"nativeLensesPending",
+		"PreToolUse",
+		"agy-native",
+		"external-mcp",
+		"invoke_subagent",
 		"odd_external_run",
 		"read_review_scope",
 		"submit_review_findings",
@@ -215,7 +221,7 @@ func TestRulesContractAndBudget(t *testing.T) {
 		}
 	}
 	lowerRddRule := strings.ToLower(rddRule)
-	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain"} {
+	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain", "single parallel", "one by one"} {
 		if !strings.Contains(lowerRddRule, phrase) {
 			t.Errorf("odd-05-rdd.md missing pre-consent/parallel guidance %q", phrase)
 		}
@@ -231,6 +237,11 @@ func TestRulesContractAndBudget(t *testing.T) {
 		"Allowed edit surfaces",
 		"odd_external_run",
 		"odd_external_continue",
+		"odd_review_run_lenses",
+		"nativeLensesPending",
+		"PreToolUse",
+		"agy-native",
+		"external-mcp",
 		"profiles.json",
 		"3 bounded reads",
 		"manage_subagents",
@@ -243,6 +254,9 @@ func TestRulesContractAndBudget(t *testing.T) {
 		if !strings.Contains(orch, needle) {
 			t.Errorf("odd-02-orchestrator.md missing %q", needle)
 		}
+	}
+	if !strings.Contains(strings.ToLower(orch), "single parallel") {
+		t.Errorf("odd-02-orchestrator.md missing single parallel native lens batch guidance")
 	}
 }
 
@@ -292,6 +306,11 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 		"ask_question",
 		"granted",
 		"declined",
+		"odd_review_run_lenses",
+		"nativeLensesPending",
+		"PreToolUse",
+		"agy-native",
+		"external-mcp",
 		"3 bounded reads",
 		"manage_subagents",
 		"duplicate",
@@ -303,6 +322,9 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 		if !strings.Contains(orchAgent, needle) {
 			t.Errorf("odd-orchestrator.md missing %q", needle)
 		}
+	}
+	if !strings.Contains(strings.ToLower(orchAgent), "single parallel") {
+		t.Errorf("odd-orchestrator.md missing single parallel native lens batch guidance")
 	}
 
 	for _, writerPath := range []string{"agents/gentle-ai-worker.md", "agents/jd-fix-agent.md"} {
@@ -449,6 +471,12 @@ func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
 		"odd_review_consent",
 		"ask_question",
 		"lineageId",
+		"odd_review_run_lenses",
+		"nativeLensesPending",
+		"PreToolUse",
+		"agy-native",
+		"external-mcp",
+		"invoke_subagent",
 		"odd_external_run",
 		"read_review_scope",
 		"submit_review_findings",
@@ -465,7 +493,7 @@ func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
 		}
 	}
 	lowerRddSkill := strings.ToLower(rddSkill)
-	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain"} {
+	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain", "single parallel", "one by one"} {
 		if !strings.Contains(lowerRddSkill, phrase) {
 			t.Errorf("skills/odd-rdd/SKILL.md missing pre-consent/parallel guidance %q", phrase)
 		}

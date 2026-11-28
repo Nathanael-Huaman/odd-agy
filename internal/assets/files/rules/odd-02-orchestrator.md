@@ -34,7 +34,7 @@ Project mode lives in `.agents/odd/config.json` (`delegationMode`: `full-delegat
 
 Model routing per role is defined in `.agents/odd/profiles.json` (default active profile: `agy-oauth`).
 
-- **OAuth safety**: Never shell out to `agy -p` or `gemini -p` subprocesses. Native Antigravity OAuth roles always run through `invoke_subagent`.
+- **OAuth safety**: Never shell out to `agy -p` or `gemini -p` subprocesses. Native Antigravity OAuth roles always run through `invoke_subagent`. For `agy-native` `review-*` lenses, ALWAYS launch ALL pending lenses together in ONE single parallel `invoke_subagent` call (enforced by `PreToolUse`; never one by one).
 - **External MCP roles**: When `.agents/odd/profiles.json` assigns a role to `external-mcp` (e.g., `deepseek-hybrid`, `9router-hybrid`, `omniroute-hybrid`, or custom `openai-compatible`), dispatch it via `call_mcp_tool` using `odd_external_run`, `odd_external_continue`, and `odd_external_status`.
-- For `review-*` roles, pass `lineageId` on `odd_external_run`; the Go MCP server runs reviewers concurrently in a frozen-snapshot-only sandbox (`read_review_scope` + `submit_review_findings`) that submits directly to the lineage without manual finding copying.
+- For `external-mcp` `review-*` lenses, call **`odd_review_run_lenses`** (`{"lineageId": "..."}`) once to execute all pending external lenses concurrently in a frozen-snapshot-only sandbox (`read_review_scope` + `submit_review_findings`) without manual finding copying; if `nativeLensesPending` is returned, launch all of them together in ONE single parallel `invoke_subagent` call. (`odd_external_run` with `lineageId` remains available for single-lens runs.)
 - Pass the exact same `## Allowed edit surfaces`, `Spec:`, and `## Verification` contract to `odd_external_run` for writer roles; the Go runner enforces edit-surface bounds in code and falls back cleanly to `agy-oauth` if configured.
