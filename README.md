@@ -142,6 +142,7 @@ Running `odd-agy init` installs:
 
 ### What's New in `v0.1.3`
 
+- **Antigravity Desktop App multi-project `workspaceRoot` & MCP `rootUri`**: All 15 MCP tools accept an optional `workspaceRoot` parameter and `initialize` adopts `rootUri`/`rootPath`/`workspaceFolders` when started in `/`, keeping per-workspace `todo`, RDD, and external runner state isolated across concurrent projects.
 - **Code-enforced parallel native lens batching (`PreToolUse`)**: `PreToolUse` blocks one-by-one `invoke_subagent` calls for pending `agy-native` 4R review lenses and requires launching all pending native lenses together in a single parallel batch (permitting single-lens calls only for `fallback_to_native` or a single remaining lens).
 - **Grouped external review tool (`odd_review_run_lenses`)**: Executes all pending `external-mcp` 4R lenses concurrently for a `lineageId`, aggregates submission results, and reports `nativeLensesPending` (including any `fallback_to_native` lenses) for single-batch native dispatch.
 - **`SEVERE` schema enum alignment**: Aligns the external reviewer `submit_review_findings` tool schema with `odd_review_submit` by accepting `"SEVERE"` alongside `"BLOCKER"`, `"WARNING"`, and `"SUGGESTION"`.

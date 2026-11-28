@@ -215,6 +215,7 @@ func TestRulesContractAndBudget(t *testing.T) {
 		"causality",
 		"location",
 		"claim",
+		"workspaceRoot",
 	} {
 		if !strings.Contains(rddRule, needle) {
 			t.Errorf("odd-05-rdd.md missing %q", needle)
@@ -318,6 +319,7 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 		"Risk: item N",
 		"lineageId",
 		"review-*",
+		"workspaceRoot",
 	} {
 		if !strings.Contains(orchAgent, needle) {
 			t.Errorf("odd-orchestrator.md missing %q", needle)
@@ -487,6 +489,7 @@ func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
 		"causality",
 		"location",
 		"claim",
+		"workspaceRoot",
 	} {
 		if !strings.Contains(rddSkill, needle) {
 			t.Errorf("skills/odd-rdd/SKILL.md missing %q", needle)
