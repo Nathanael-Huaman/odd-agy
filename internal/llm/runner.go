@@ -51,24 +51,25 @@ type AttemptInfo struct {
 
 // TaskRecord persists full external task state (including reasoning_content) on disk.
 type TaskRecord struct {
-	TaskID          string          `json:"taskId"`
-	Role            string          `json:"role"`
-	Provider        string          `json:"provider,omitempty"`
-	Model           string          `json:"model,omitempty"`
-	Compatibility   string          `json:"compatibility,omitempty"`
+	TaskID             string          `json:"taskId"`
+	Role               string          `json:"role"`
+	Provider           string          `json:"provider,omitempty"`
+	Model              string          `json:"model,omitempty"`
+	Compatibility      string          `json:"compatibility,omitempty"`
 	AllowedSurfaces    []string        `json:"allowedSurfaces,omitempty"`
 	LineageID          string          `json:"lineageId,omitempty"`
 	SubmittedToLineage bool            `json:"submittedToLineage,omitempty"`
 	Messages           []Message       `json:"messages"`
-	Turns           int             `json:"turns"`
-	Usage           Usage           `json:"usage"`
-	Status          string          `json:"status"`
-	FinalResponse   string          `json:"finalResponse,omitempty"`
-	NativeFallback  *NativeFallback `json:"nativeFallback,omitempty"`
-	Attempts        []AttemptInfo   `json:"attempts,omitempty"`
-	Error           string          `json:"error,omitempty"`
-	CreatedAt       string          `json:"createdAt"`
-	UpdatedAt       string          `json:"updatedAt"`
+	Turns              int             `json:"turns"`
+	Usage              Usage           `json:"usage"`
+	Status             string          `json:"status"`
+	FinalResponse      string          `json:"finalResponse,omitempty"`
+	NativeFallback     *NativeFallback `json:"nativeFallback,omitempty"`
+	NextAction         string          `json:"nextAction,omitempty"`
+	Attempts           []AttemptInfo   `json:"attempts,omitempty"`
+	Error              string          `json:"error,omitempty"`
+	CreatedAt          string          `json:"createdAt"`
+	UpdatedAt          string          `json:"updatedAt"`
 }
 
 // RunRequest starts a new bounded external agentic task.
@@ -129,9 +130,15 @@ type RunnerConfig struct {
 	DefaultTimeout  time.Duration
 }
 
+type inFlightTask struct {
+	done chan struct{}
+}
+
 // Runner executes sandboxed multi-turn agentic tasks against OpenAI-compatible providers.
 type Runner struct {
 	mu                sync.Mutex
+	inFlightMu        sync.Mutex
+	inFlight          map[string]*inFlightTask
 	repoRoot          string
 	client            *Client
 	lookupEnv         func(string) (string, bool)
@@ -161,6 +168,7 @@ func NewRunner(cfg RunnerConfig) *Runner {
 		timeout = defaultTaskTimeout
 	}
 	return &Runner{
+		inFlight:          make(map[string]*inFlightTask),
 		repoRoot:          cfg.RepoRoot,
 		client:            client,
 		lookupEnv:         lookupEnv,
@@ -213,11 +221,15 @@ func (r *Runner) ProfilesSummary() (ProfilesSummary, error) {
 	}, nil
 }
 
-// Run resolves the role's routing/fallback chain and runs a bounded sandboxed agentic loop.
-func (r *Runner) Run(ctx context.Context, req RunRequest) (TaskRecord, error) {
+// StartRun validates the request, persists an initial running TaskRecord synchronously,
+// and launches the agentic loop in a background goroutine bound to ctx.
+func (r *Runner) StartRun(ctx context.Context, req RunRequest) (TaskRecord, <-chan struct{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	role := strings.TrimSpace(req.Role)
 	if role == "" {
-		return TaskRecord{}, errors.New("role must not be empty")
+		return TaskRecord{}, nil, errors.New("role must not be empty")
 	}
 
 	var surfaces []string
@@ -228,30 +240,30 @@ func (r *Runner) Run(ctx context.Context, req RunRequest) (TaskRecord, error) {
 		}
 		validated, err := ValidateAllowedSurfaces(rawSurfaces)
 		if err != nil {
-			return TaskRecord{}, fmt.Errorf("writer role %q requires valid Allowed edit surfaces: %w", role, err)
+			return TaskRecord{}, nil, fmt.Errorf("writer role %q requires valid Allowed edit surfaces: %w", role, err)
 		}
 		surfaces = validated
 	} else if len(req.AllowedSurfaces) > 0 {
 		validated, err := ValidateAllowedSurfaces(req.AllowedSurfaces)
 		if err != nil {
-			return TaskRecord{}, fmt.Errorf("invalid allowedSurfaces: %w", err)
+			return TaskRecord{}, nil, fmt.Errorf("invalid allowedSurfaces: %w", err)
 		}
 		surfaces = validated
 	}
 
 	profiles, err := config.LoadProfiles(r.repoRoot)
 	if err != nil {
-		return TaskRecord{}, err
+		return TaskRecord{}, nil, err
 	}
 
 	candidates, nativeFB, err := ResolveRoleChain(role, profiles, req.Provider, req.Model, r.lookupEnv)
 	if err != nil {
-		return TaskRecord{}, err
+		return TaskRecord{}, nil, err
 	}
 
 	taskID, err := newTaskID()
 	if err != nil {
-		return TaskRecord{}, err
+		return TaskRecord{}, nil, err
 	}
 
 	lineageID := strings.TrimSpace(req.LineageID)
@@ -278,50 +290,118 @@ func (r *Runner) Run(ctx context.Context, req RunRequest) (TaskRecord, error) {
 	if maxTurns <= 0 {
 		maxTurns = r.defaultMaxTurns
 	}
+	if maxTurns <= 0 {
+		maxTurns = defaultMaxTurns
+	}
 	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = r.defaultTimeout
 	}
-
-	runCtx := ctx
-	var cancel context.CancelFunc
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		runCtx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+	if timeout <= 0 {
+		timeout = defaultTaskTimeout
 	}
 
-	return r.executeWithCandidates(runCtx, rec, candidates, nativeFB, maxTurns, req.MaxTokens)
+	if err := r.saveTask(rec); err != nil {
+		return TaskRecord{}, nil, err
+	}
+
+	handle := &inFlightTask{done: make(chan struct{})}
+	r.inFlightMu.Lock()
+	if r.inFlight == nil {
+		r.inFlight = make(map[string]*inFlightTask)
+	}
+	r.inFlight[rec.TaskID] = handle
+	r.inFlightMu.Unlock()
+
+	r.launchTaskGoroutine(ctx, rec, handle, candidates, nativeFB, maxTurns, req.MaxTokens, timeout)
+	return rec, handle.done, nil
 }
 
-// Continue reloads a persisted TaskRecord (keeping reasoning_content and surfaces intact)
-// and resumes the conversation with prompt.
-func (r *Runner) Continue(ctx context.Context, req ContinueRequest) (TaskRecord, error) {
+// Run resolves the role's routing/fallback chain and runs a bounded sandboxed agentic loop.
+func (r *Runner) Run(ctx context.Context, req RunRequest) (TaskRecord, error) {
+	rec, done, err := r.StartRun(ctx, req)
+	if err != nil {
+		return TaskRecord{}, err
+	}
+	<-done
+	return r.Status(rec.TaskID)
+}
+
+// StartContinue reloads a persisted TaskRecord (rejecting any task currently running),
+// persists the resumed running state synchronously, and launches the continuation in the background.
+func (r *Runner) StartContinue(ctx context.Context, req ContinueRequest) (TaskRecord, <-chan struct{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.TrimSpace(req.Prompt) == "" {
-		return TaskRecord{}, errors.New("prompt must not be empty")
+		return TaskRecord{}, nil, errors.New("prompt must not be empty")
+	}
+	if err := validateTaskID(req.TaskID); err != nil {
+		return TaskRecord{}, nil, err
+	}
+
+	maxTurns := req.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = r.defaultMaxTurns
+	}
+	if maxTurns <= 0 {
+		maxTurns = defaultMaxTurns
+	}
+	timeout := r.defaultTimeout
+	if timeout <= 0 {
+		timeout = defaultTaskTimeout
+	}
+
+	profiles, err := config.LoadProfiles(r.repoRoot)
+	if err != nil {
+		return TaskRecord{}, nil, err
+	}
+
+	handle := &inFlightTask{done: make(chan struct{})}
+	rec, candidates, nativeFB, err := r.beginContinue(req, profiles, handle)
+	if err != nil {
+		return TaskRecord{}, nil, err
+	}
+
+	r.launchTaskGoroutine(ctx, rec, handle, candidates, nativeFB, maxTurns, 0, timeout)
+	return rec, handle.done, nil
+}
+
+func (r *Runner) beginContinue(
+	req ContinueRequest,
+	profiles config.ProfilesConfig,
+	handle *inFlightTask,
+) (TaskRecord, []ResolvedCandidate, *NativeFallback, error) {
+	r.inFlightMu.Lock()
+	defer r.inFlightMu.Unlock()
+
+	if r.inFlight == nil {
+		r.inFlight = make(map[string]*inFlightTask)
+	}
+	if _, active := r.inFlight[req.TaskID]; active {
+		return TaskRecord{}, nil, nil, fmt.Errorf("task %s is still running; wait for completion with odd_external_status before continuing", req.TaskID)
 	}
 	rec, err := r.Status(req.TaskID)
 	if err != nil {
-		return TaskRecord{}, err
+		return TaskRecord{}, nil, nil, err
+	}
+	if rec.Status == TaskStatusRunning {
+		return TaskRecord{}, nil, nil, fmt.Errorf("task %s is still running; wait for completion with odd_external_status before continuing", rec.TaskID)
 	}
 
 	if len(req.AllowedSurfaces) > 0 {
 		validated, err := ValidateAllowedSurfaces(req.AllowedSurfaces)
 		if err != nil {
-			return TaskRecord{}, fmt.Errorf("invalid allowedSurfaces: %w", err)
+			return TaskRecord{}, nil, nil, fmt.Errorf("invalid allowedSurfaces: %w", err)
 		}
 		rec.AllowedSurfaces = validated
 	} else if isWriterRole(rec.Role) && len(rec.AllowedSurfaces) == 0 {
-		return TaskRecord{}, fmt.Errorf("persisted writer task %s has no AllowedSurfaces", rec.TaskID)
-	}
-
-	profiles, err := config.LoadProfiles(r.repoRoot)
-	if err != nil {
-		return TaskRecord{}, err
+		return TaskRecord{}, nil, nil, fmt.Errorf("persisted writer task %s has no AllowedSurfaces", rec.TaskID)
 	}
 
 	candidates, nativeFB, err := ResolveRoleChain(rec.Role, profiles, rec.Provider, rec.Model, r.lookupEnv)
 	if err != nil {
-		return TaskRecord{}, err
+		return TaskRecord{}, nil, nil, err
 	}
 
 	rec.Messages = append(rec.Messages, Message{
@@ -332,20 +412,100 @@ func (r *Runner) Continue(ctx context.Context, req ContinueRequest) (TaskRecord,
 	rec.Error = ""
 	rec.FinalResponse = ""
 	rec.NativeFallback = nil
+	rec.NextAction = ""
+	rec.UpdatedAt = nowUTC()
 
-	maxTurns := req.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = r.defaultMaxTurns
+	if err := r.saveTask(rec); err != nil {
+		return TaskRecord{}, nil, nil, err
+	}
+	r.inFlight[rec.TaskID] = handle
+	return rec, candidates, nativeFB, nil
+}
+
+// Continue reloads a persisted TaskRecord (keeping reasoning_content and surfaces intact)
+// and resumes the conversation with prompt.
+func (r *Runner) Continue(ctx context.Context, req ContinueRequest) (TaskRecord, error) {
+	rec, done, err := r.StartContinue(ctx, req)
+	if err != nil {
+		return TaskRecord{}, err
+	}
+	<-done
+	return r.Status(rec.TaskID)
+}
+
+// Wait blocks up to waitTimeout for an in-flight task to reach a terminal state,
+// returning the latest persisted TaskRecord without cancelling the background task on timeout.
+func (r *Runner) Wait(ctx context.Context, taskID string, waitTimeout time.Duration) (TaskRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return TaskRecord{}, err
 	}
 
-	runCtx := ctx
-	var cancel context.CancelFunc
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		runCtx, cancel = context.WithTimeout(ctx, r.defaultTimeout)
-		defer cancel()
+	r.inFlightMu.Lock()
+	var handle *inFlightTask
+	if r.inFlight != nil {
+		handle = r.inFlight[taskID]
+	}
+	r.inFlightMu.Unlock()
+
+	if handle != nil && waitTimeout > 0 {
+		timer := time.NewTimer(waitTimeout)
+		defer timer.Stop()
+		select {
+		case <-handle.done:
+		case <-timer.C:
+		case <-ctx.Done():
+			return TaskRecord{}, ctx.Err()
+		}
 	}
 
-	return r.executeWithCandidates(runCtx, rec, candidates, nativeFB, maxTurns, 0)
+	return r.Status(taskID)
+}
+
+func (r *Runner) launchTaskGoroutine(
+	ctx context.Context,
+	rec TaskRecord,
+	handle *inFlightTask,
+	candidates []ResolvedCandidate,
+	nativeFB *NativeFallback,
+	maxTurns int,
+	maxTokens int,
+	timeout time.Duration,
+) {
+	go func() {
+		runCtx := ctx
+		var cancel context.CancelFunc
+		if deadline, hasDeadline := ctx.Deadline(); !hasDeadline || time.Until(deadline) > timeout {
+			runCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		if cancel != nil {
+			defer cancel()
+		}
+
+		defer func() {
+			if panicVal := recover(); panicVal != nil {
+				rec.Status = TaskStatusFailed
+				rec.Error = fmt.Sprintf("internal panic: %v", panicVal)
+				rec.UpdatedAt = nowUTC()
+				_ = r.saveTask(rec)
+			}
+			r.inFlightMu.Lock()
+			if r.inFlight != nil && r.inFlight[rec.TaskID] == handle {
+				delete(r.inFlight, rec.TaskID)
+			}
+			r.inFlightMu.Unlock()
+			close(handle.done)
+		}()
+
+		if _, execErr := r.executeWithCandidates(runCtx, rec, candidates, nativeFB, maxTurns, maxTokens); execErr != nil {
+			rec.Status = TaskStatusFailed
+			rec.Error = execErr.Error()
+			rec.UpdatedAt = nowUTC()
+			_ = r.saveTask(rec)
+		}
+	}()
 }
 
 // Status loads a persisted task record by ID.
@@ -450,6 +610,20 @@ func (r *Runner) executeWithCandidates(
 					break
 				}
 				hitMaxTurns = true
+			} else {
+				progressRec := rec
+				progressRec.Provider = cand.Target.Provider
+				progressRec.Model = cand.Target.Model
+				progressRec.Compatibility = cand.Endpoint.Compatibility
+				progressRec.Messages = append([]Message(nil), attemptMsgs...)
+				progressRec.Turns += turnsTaken
+				progressRec.Usage.PromptTokens += attemptUsage.PromptTokens
+				progressRec.Usage.CompletionTokens += attemptUsage.CompletionTokens
+				progressRec.Usage.TotalTokens += attemptUsage.TotalTokens
+				progressRec.SubmittedToLineage = attemptSubmitted
+				progressRec.Status = TaskStatusRunning
+				progressRec.UpdatedAt = nowUTC()
+				_ = r.saveTask(progressRec)
 			}
 		}
 

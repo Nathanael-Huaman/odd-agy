@@ -216,15 +216,23 @@ func TestRulesContractAndBudget(t *testing.T) {
 		"location",
 		"claim",
 		"workspaceRoot",
+		"waitSeconds",
+		"120",
+		"odd_external_status",
+		"taskId",
+		"runningLenses",
+		"fallbackToNative",
+		"fallback_to_native",
+		"3m0s",
 	} {
 		if !strings.Contains(rddRule, needle) {
 			t.Errorf("odd-05-rdd.md missing %q", needle)
 		}
 	}
 	lowerRddRule := strings.ToLower(rddRule)
-	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain", "single parallel", "one by one"} {
+	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain", "single parallel", "one by one", `status: "running"`, "attach", "duplicate"} {
 		if !strings.Contains(lowerRddRule, phrase) {
-			t.Errorf("odd-05-rdd.md missing pre-consent/parallel guidance %q", phrase)
+			t.Errorf("odd-05-rdd.md missing pre-consent/parallel/polling guidance %q", phrase)
 		}
 	}
 
@@ -238,7 +246,9 @@ func TestRulesContractAndBudget(t *testing.T) {
 		"Allowed edit surfaces",
 		"odd_external_run",
 		"odd_external_continue",
+		"odd_external_status",
 		"odd_review_run_lenses",
+		"odd_review_status",
 		"nativeLensesPending",
 		"PreToolUse",
 		"agy-native",
@@ -251,13 +261,23 @@ func TestRulesContractAndBudget(t *testing.T) {
 		"Risk: item N",
 		"lineageId",
 		"review-*",
+		"waitSeconds",
+		"120",
+		"taskId",
+		"runningLenses",
+		"fallbackToNative",
+		"fallback_to_native",
+		"3m0s",
 	} {
 		if !strings.Contains(orch, needle) {
 			t.Errorf("odd-02-orchestrator.md missing %q", needle)
 		}
 	}
-	if !strings.Contains(strings.ToLower(orch), "single parallel") {
-		t.Errorf("odd-02-orchestrator.md missing single parallel native lens batch guidance")
+	lowerOrch := strings.ToLower(orch)
+	for _, phrase := range []string{"single parallel", `status: "running"`, "attach"} {
+		if !strings.Contains(lowerOrch, phrase) {
+			t.Errorf("odd-02-orchestrator.md missing %q", phrase)
+		}
 	}
 }
 
@@ -320,13 +340,25 @@ func TestAgentsContractAndToolAllowlist(t *testing.T) {
 		"lineageId",
 		"review-*",
 		"workspaceRoot",
+		"odd_external_status",
+		"waitSeconds",
+		"120",
+		"taskId",
+		"runningLenses",
+		"fallbackToNative",
+		"fallback_to_native",
+		"odd_review_status",
+		"3m0s",
 	} {
 		if !strings.Contains(orchAgent, needle) {
 			t.Errorf("odd-orchestrator.md missing %q", needle)
 		}
 	}
-	if !strings.Contains(strings.ToLower(orchAgent), "single parallel") {
-		t.Errorf("odd-orchestrator.md missing single parallel native lens batch guidance")
+	lowerOrchAgent := strings.ToLower(orchAgent)
+	for _, phrase := range []string{"single parallel", `status: "running"`, "attach"} {
+		if !strings.Contains(lowerOrchAgent, phrase) {
+			t.Errorf("odd-orchestrator.md missing %q", phrase)
+		}
 	}
 
 	for _, writerPath := range []string{"agents/gentle-ai-worker.md", "agents/jd-fix-agent.md"} {
@@ -490,15 +522,23 @@ func TestReviewAgentsAndSkillSchemaAlignment(t *testing.T) {
 		"location",
 		"claim",
 		"workspaceRoot",
+		"odd_external_status",
+		"waitSeconds",
+		"120",
+		"taskId",
+		"runningLenses",
+		"fallbackToNative",
+		"fallback_to_native",
+		"3m0s",
 	} {
 		if !strings.Contains(rddSkill, needle) {
 			t.Errorf("skills/odd-rdd/SKILL.md missing %q", needle)
 		}
 	}
 	lowerRddSkill := strings.ToLower(rddSkill)
-	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain", "single parallel", "one by one"} {
+	for _, phrase := range []string{"parallel", "risk tier", "lenses", "explain", "single parallel", "one by one", `status: "running"`, "attach", "duplicate"} {
 		if !strings.Contains(lowerRddSkill, phrase) {
-			t.Errorf("skills/odd-rdd/SKILL.md missing pre-consent/parallel guidance %q", phrase)
+			t.Errorf("skills/odd-rdd/SKILL.md missing pre-consent/parallel/polling guidance %q", phrase)
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Nathanael-Huaman/odd-agy/internal/config"
 	"github.com/Nathanael-Huaman/odd-agy/internal/llm"
@@ -25,6 +26,9 @@ import (
 const (
 	protocolVersion       = "2024-11-05"
 	maxConcurrentRequests = 8
+
+	defaultMCPWaitTimeout = 100 * time.Second
+	maxMCPWaitTimeout     = 120 * time.Second
 
 	errCodeParse          = -32700
 	errCodeInvalidRequest = -32600
@@ -41,11 +45,30 @@ type ServerConfig struct {
 	LookupEnv func(string) (string, bool)
 }
 
+type lensBatchEntry struct {
+	lens     string
+	role     string
+	taskID   string
+	done     <-chan struct{}
+	startErr error
+}
+
+type inFlightLensBatch struct {
+	revision     int
+	targetLenses []string
+	trackedSet   map[string]bool
+	nativeSet    map[string]bool
+	entries      []lensBatchEntry
+	allDone      chan struct{}
+}
+
 type workspaceServices struct {
-	root   string
-	todos  *todo.Store
-	rdd    *rdd.Engine
-	runner *llm.Runner
+	root        string
+	todos       *todo.Store
+	rdd         *rdd.Engine
+	runner      *llm.Runner
+	batchMu     sync.Mutex
+	lensBatches map[string]*inFlightLensBatch
 }
 
 // Server exposes todo, RDD (odd_review_*), and external runner (odd_external_*) tools
@@ -56,6 +79,48 @@ type Server struct {
 	wsMu        sync.Mutex
 	workspaces  map[string]*workspaceServices
 	writeMu     sync.Mutex
+	serveCtxMu  sync.RWMutex
+	serveCtx    context.Context
+	waitTimeout time.Duration
+	bgWG        sync.WaitGroup
+}
+
+// SetWaitTimeout overrides the default bounded-wait window per MCP tool call (primarily for tests).
+func (s *Server) SetWaitTimeout(d time.Duration) {
+	s.serveCtxMu.Lock()
+	defer s.serveCtxMu.Unlock()
+	s.waitTimeout = d
+}
+
+func (s *Server) effectiveDefaultWaitTimeout() time.Duration {
+	s.serveCtxMu.RLock()
+	d := s.waitTimeout
+	s.serveCtxMu.RUnlock()
+	if d > 0 {
+		return d
+	}
+	return defaultMCPWaitTimeout
+}
+
+func (s *Server) backgroundCtx() context.Context {
+	s.serveCtxMu.RLock()
+	ctx := s.serveCtx
+	s.serveCtxMu.RUnlock()
+	if ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+func (s *Server) trackBackground(done <-chan struct{}) {
+	if done == nil {
+		return
+	}
+	s.bgWG.Add(1)
+	go func() {
+		defer s.bgWG.Done()
+		<-done
+	}()
 }
 
 type serverReviewHost struct {
@@ -239,9 +304,10 @@ func (s *Server) getOrCreateWorkspace(canonicalRoot string) *workspaceServices {
 	}
 	eng := rdd.NewEngine(canonicalRoot)
 	ws := &workspaceServices{
-		root:  canonicalRoot,
-		todos: todo.NewStore(canonicalRoot),
-		rdd:   eng,
+		root:        canonicalRoot,
+		todos:       todo.NewStore(canonicalRoot),
+		rdd:         eng,
+		lensBatches: make(map[string]*inFlightLensBatch),
 		runner: llm.NewRunner(llm.RunnerConfig{
 			RepoRoot:   canonicalRoot,
 			Client:     s.cfg.LLMClient,
@@ -308,7 +374,18 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	}
 
 	serveCtx, cancelServe := context.WithCancel(ctx)
-	defer cancelServe()
+	s.serveCtxMu.Lock()
+	s.serveCtx = serveCtx
+	s.serveCtxMu.Unlock()
+	defer func() {
+		s.serveCtxMu.Lock()
+		if s.serveCtx == serveCtx {
+			s.serveCtx = nil
+		}
+		s.serveCtxMu.Unlock()
+		cancelServe()
+		s.bgWG.Wait()
+	}()
 
 	type readItem struct {
 		line []byte
@@ -739,7 +816,7 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 	case "odd_external_continue":
 		return s.handleExternalContinue(ctx, ws, rawArgs)
 	case "odd_external_status":
-		return s.handleExternalStatus(ws, rawArgs)
+		return s.handleExternalStatus(ctx, ws, rawArgs)
 	default:
 		return callToolResult{}, &rpcError{
 			Code:    errCodeInvalidParams,
@@ -986,31 +1063,89 @@ type lensExecResult struct {
 
 type reviewRunLensesResult struct {
 	LineageID           string            `json:"lineageId"`
+	Status              string            `json:"status,omitempty"`
+	RunningLenses       []string          `json:"runningLenses,omitempty"`
 	ExecutedLenses      []lensExecResult  `json:"executedLenses"`
 	NativeLensesPending []string          `json:"nativeLensesPending"`
 	NextAction          string            `json:"nextAction"`
 	ReviewStatus        rdd.LineageStatus `json:"reviewStatus"`
 }
 
-func (s *Server) handleReviewRunLenses(ctx context.Context, ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
-	var args struct {
-		LineageID string   `json:"lineageId"`
-		Lenses    []string `json:"lenses"`
-	}
-	if err := json.Unmarshal(rawArgs, &args); err != nil {
-		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
-	}
-	lineageID := strings.TrimSpace(args.LineageID)
-	if lineageID == "" {
-		return toolErr(errors.New("lineageId is required")), nil
-	}
+func defaultMCPWaitSeconds() int {
+	return int(defaultMCPWaitTimeout / time.Second)
+}
 
-	st, err := ws.rdd.Status(lineageID)
-	if err != nil {
-		return toolErr(err), nil
+func formatRunningTaskNextAction(taskID string, turns int) string {
+	return fmt.Sprintf(
+		"External task %s is still running in the background (turns: %d). Do NOT fall back to native while running. Call odd_external_status with taskId %q and waitSeconds: %d to wait for completion.",
+		taskID, turns, taskID, defaultMCPWaitSeconds(),
+	)
+}
+
+func formatRunningLensesNextAction(runningLenses []string, lineageID string) string {
+	return fmt.Sprintf(
+		"External review lenses ([%s]) are still running for lineage %s. Do NOT fall back to native while running. Call odd_review_run_lenses with lineageId %q (and waitSeconds: %d) to attach to the in-flight batch without duplicating reviews and wait for completion.",
+		strings.Join(runningLenses, ", "),
+		lineageID,
+		lineageID,
+		defaultMCPWaitSeconds(),
+	)
+}
+
+func formatNativeLensesNextAction(nativePending, fallbackRoles []string, lineageID string) string {
+	nextAction := fmt.Sprintf(
+		"Launch all pending native review lenses ([%s]) together in a single parallel invoke_subagent call for lineage %s.",
+		strings.Join(nativePending, ", "),
+		lineageID,
+	)
+	if len(fallbackRoles) > 0 {
+		nextAction += fmt.Sprintf(
+			" Include fallback_to_native in the prompt for failed external-mcp role(s) ([%s]) so PreToolUse admits the invoke_subagent batch.",
+			strings.Join(fallbackRoles, ", "),
+		)
 	}
+	return nextAction
+}
+
+func resolveWaitTimeout(waitSeconds *int, defaultDuration time.Duration) (time.Duration, error) {
+	if waitSeconds == nil {
+		return defaultDuration, nil
+	}
+	if *waitSeconds < 0 {
+		return 0, errors.New("waitSeconds must be >= 0")
+	}
+	d := time.Duration(*waitSeconds) * time.Second
+	if d > maxMCPWaitTimeout {
+		d = maxMCPWaitTimeout
+	}
+	return d, nil
+}
+
+func parseRequestedLenses(rawLenses []string) ([]string, error) {
+	if len(rawLenses) == 0 {
+		return nil, nil
+	}
+	requestedLenses := make([]string, 0, len(rawLenses))
+	requestedSet := make(map[string]bool, len(rawLenses))
+	for _, raw := range rawLenses {
+		norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(raw)), "review-")
+		switch norm {
+		case rdd.LensRisk, rdd.LensResilience, rdd.LensReadability, rdd.LensReliability:
+		default:
+			return nil, fmt.Errorf("invalid lens %q: must be one of risk, resilience, readability, reliability", raw)
+		}
+		if requestedSet[norm] {
+			return nil, fmt.Errorf("duplicate lens %q", norm)
+		}
+		requestedSet[norm] = true
+		requestedLenses = append(requestedLenses, norm)
+	}
+	return requestedLenses, nil
+}
+
+func resolveTargetLenses(st rdd.LineageStatus, requestedLenses []string) ([]string, error) {
 	if st.Status != rdd.StatusCollectingLenses {
-		return toolErr(fmt.Errorf("lineage %s is in status %q, expected %q", lineageID, st.Status, rdd.StatusCollectingLenses)), nil
+		return nil, fmt.Errorf("lineage %s is in status %q, expected %q", st.LineageID, st.Status, rdd.StatusCollectingLenses)
 	}
 
 	pendingLenses := make([]string, 0, len(st.Lenses))
@@ -1028,49 +1163,37 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, ws *workspaceService
 		}
 	}
 	if len(pendingLenses) == 0 {
-		return toolErr(fmt.Errorf("lineage %s has no pending lenses", lineageID)), nil
+		return nil, fmt.Errorf("lineage %s has no pending lenses", st.LineageID)
+	}
+
+	if len(requestedLenses) == 0 {
+		return append([]string(nil), pendingLenses...), nil
 	}
 
 	pendingSet := make(map[string]bool, len(pendingLenses))
 	for _, l := range pendingLenses {
 		pendingSet[l] = true
 	}
-
-	var targetLenses []string
-	if len(args.Lenses) == 0 {
-		targetLenses = append([]string(nil), pendingLenses...)
-	} else {
-		requestedSet := make(map[string]bool, len(args.Lenses))
-		for _, raw := range args.Lenses {
-			norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(raw)), "review-")
-			switch norm {
-			case rdd.LensRisk, rdd.LensResilience, rdd.LensReadability, rdd.LensReliability:
-			default:
-				return toolErr(fmt.Errorf("invalid lens %q: must be one of risk, resilience, readability, reliability", raw)), nil
-			}
-			if requestedSet[norm] {
-				return toolErr(fmt.Errorf("duplicate lens %q", norm)), nil
-			}
-			if !pendingSet[norm] {
-				return toolErr(fmt.Errorf("lens %q is not pending for lineage %s", norm, lineageID)), nil
-			}
-			requestedSet[norm] = true
+	requestedSet := make(map[string]bool, len(requestedLenses))
+	for _, norm := range requestedLenses {
+		if !pendingSet[norm] {
+			return nil, fmt.Errorf("lens %q is not pending for lineage %s", norm, st.LineageID)
 		}
-		for _, l := range pendingLenses {
-			if requestedSet[l] {
-				targetLenses = append(targetLenses, l)
-			}
-		}
+		requestedSet[norm] = true
 	}
 
-	profs, err := config.LoadProfiles(ws.root)
-	if err != nil {
-		return toolErr(err), nil
+	targetLenses := make([]string, 0, len(requestedLenses))
+	for _, l := range pendingLenses {
+		if requestedSet[l] {
+			targetLenses = append(targetLenses, l)
+		}
 	}
+	return targetLenses, nil
+}
+
+func partitionTargetLenses(profs config.ProfilesConfig, targetLenses []string) (externalLenses []string, nativeSet map[string]bool) {
 	pf, hasPF := profs.Profiles[profs.ActiveProfile]
-
-	var externalLenses []string
-	nativeSet := make(map[string]bool, len(targetLenses))
+	nativeSet = make(map[string]bool, len(targetLenses))
 	for _, lens := range targetLenses {
 		role := "review-" + lens
 		isExternal := false
@@ -1085,49 +1208,249 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, ws *workspaceService
 			nativeSet[lens] = true
 		}
 	}
+	return externalLenses, nativeSet
+}
 
-	executed := make([]lensExecResult, len(externalLenses))
-	var wg sync.WaitGroup
-	for i, lens := range externalLenses {
-		wg.Add(1)
-		go func(idx int, l string) {
-			defer wg.Done()
-			role := "review-" + l
-			rec, runErr := ws.runner.Run(ctx, llm.RunRequest{
-				Role:      role,
-				LineageID: lineageID,
-				Task:      buildReviewLensPrompt(lineageID, l, role),
-			})
-			res := lensExecResult{
-				Lens:               l,
-				Role:               role,
-				Provider:           rec.Provider,
-				Model:              rec.Model,
-				Status:             rec.Status,
-				SubmittedToLineage: rec.SubmittedToLineage,
-				TaskID:             rec.TaskID,
-				Error:              rec.Error,
-			}
-			if runErr != nil {
-				res.Status = llm.TaskStatusFailed
-				res.Error = runErr.Error()
-				if !rec.SubmittedToLineage {
-					res.FallbackToNative = true
-				}
-			} else if !rec.SubmittedToLineage {
-				res.FallbackToNative = true
-				if res.Error == "" && rec.Status != llm.TaskStatusFallbackNative {
-					res.Error = "external lens did not submit findings to lineage"
-				}
-			}
-			executed[idx] = res
-		}(i, lens)
+func (s *Server) attachOrStartLensBatch(
+	ws *workspaceServices,
+	lineageID string,
+	requestedLenses []string,
+) (batch *inFlightLensBatch, st rdd.LineageStatus, nativeOnly *reviewRunLensesResult, err error) {
+	ws.batchMu.Lock()
+	defer ws.batchMu.Unlock()
+
+	if ws.lensBatches == nil {
+		ws.lensBatches = make(map[string]*inFlightLensBatch)
 	}
-	wg.Wait()
+	st, err = ws.rdd.Status(lineageID)
+	if err != nil {
+		return nil, rdd.LineageStatus{}, nil, err
+	}
 
+	batch = ws.lensBatches[lineageID]
+	if batch != nil {
+		if st.Revision == batch.revision {
+			for _, rl := range requestedLenses {
+				if !batch.trackedSet[rl] {
+					return nil, rdd.LineageStatus{}, nil, fmt.Errorf(
+						"in-flight lens batch for lineage %s is already running lenses %v; lens %q is not part of the active batch",
+						lineageID, batch.targetLenses, rl,
+					)
+				}
+			}
+			return batch, st, nil, nil
+		}
+		delete(ws.lensBatches, lineageID)
+	}
+
+	targetLenses, err := resolveTargetLenses(st, requestedLenses)
+	if err != nil {
+		return nil, rdd.LineageStatus{}, nil, err
+	}
+
+	profs, err := config.LoadProfiles(ws.root)
+	if err != nil {
+		return nil, rdd.LineageStatus{}, nil, err
+	}
+
+	externalLenses, nativeSet := partitionTargetLenses(profs, targetLenses)
+	if len(externalLenses) == 0 {
+		res := buildNativeOnlyLensesResult(lineageID, st, targetLenses, nativeSet)
+		return nil, st, &res, nil
+	}
+
+	entries := make([]lensBatchEntry, 0, len(externalLenses))
+	bgCtx := s.backgroundCtx()
+	for _, lens := range externalLenses {
+		role := "review-" + lens
+		rec, done, startErr := ws.runner.StartRun(bgCtx, llm.RunRequest{
+			Role:      role,
+			LineageID: lineageID,
+			Task:      buildReviewLensPrompt(lineageID, lens, role),
+		})
+		if startErr != nil {
+			entries = append(entries, lensBatchEntry{
+				lens:     lens,
+				role:     role,
+				startErr: startErr,
+			})
+			continue
+		}
+		s.trackBackground(done)
+		entries = append(entries, lensBatchEntry{
+			lens:   lens,
+			role:   role,
+			taskID: rec.TaskID,
+			done:   done,
+		})
+	}
+
+	trackedSet := make(map[string]bool, len(targetLenses))
+	for _, l := range targetLenses {
+		trackedSet[l] = true
+	}
+	batch = &inFlightLensBatch{
+		revision:     st.Revision,
+		targetLenses: targetLenses,
+		trackedSet:   trackedSet,
+		nativeSet:    nativeSet,
+		entries:      entries,
+		allDone:      make(chan struct{}),
+	}
+
+	startedCount := 0
+	for _, e := range batch.entries {
+		if e.done != nil {
+			startedCount++
+		}
+	}
+	if startedCount == 0 {
+		close(batch.allDone)
+	} else {
+		s.trackBackground(batch.allDone)
+		go func(b *inFlightLensBatch) {
+			for _, e := range b.entries {
+				if e.done != nil {
+					<-e.done
+				}
+			}
+			close(b.allDone)
+		}(batch)
+		ws.lensBatches[lineageID] = batch
+	}
+
+	return batch, st, nil, nil
+}
+
+func releaseLensBatch(ws *workspaceServices, lineageID string, batch *inFlightLensBatch) {
+	ws.batchMu.Lock()
+	defer ws.batchMu.Unlock()
+	if ws.lensBatches != nil && ws.lensBatches[lineageID] == batch {
+		delete(ws.lensBatches, lineageID)
+	}
+}
+
+func awaitLensBatch(ctx context.Context, allDone <-chan struct{}, waitDur time.Duration) (bool, error) {
+	if waitDur <= 0 {
+		select {
+		case <-allDone:
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
+	timer := time.NewTimer(waitDur)
+	defer timer.Stop()
+	select {
+	case <-allDone:
+		return true, nil
+	case <-timer.C:
+		return false, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+func collectLensExecResults(ws *workspaceServices, entries []lensBatchEntry, batchCompleted bool) ([]lensExecResult, []string) {
+	executed := make([]lensExecResult, 0, len(entries))
+	var runningLenses []string
+	for _, e := range entries {
+		if e.startErr != nil {
+			executed = append(executed, lensExecResult{
+				Lens:             e.lens,
+				Role:             e.role,
+				Status:           llm.TaskStatusFailed,
+				Error:            e.startErr.Error(),
+				FallbackToNative: true,
+			})
+			continue
+		}
+		rec, statusErr := ws.runner.Status(e.taskID)
+		if statusErr != nil {
+			if !batchCompleted {
+				runningLenses = append(runningLenses, e.lens)
+				executed = append(executed, lensExecResult{
+					Lens:   e.lens,
+					Role:   e.role,
+					Status: llm.TaskStatusRunning,
+					TaskID: e.taskID,
+				})
+			} else {
+				executed = append(executed, lensExecResult{
+					Lens:             e.lens,
+					Role:             e.role,
+					Status:           llm.TaskStatusFailed,
+					TaskID:           e.taskID,
+					Error:            statusErr.Error(),
+					FallbackToNative: true,
+				})
+			}
+			continue
+		}
+		res := lensExecResult{
+			Lens:               e.lens,
+			Role:               e.role,
+			Provider:           rec.Provider,
+			Model:              rec.Model,
+			Status:             rec.Status,
+			SubmittedToLineage: rec.SubmittedToLineage,
+			TaskID:             e.taskID,
+			Error:              rec.Error,
+		}
+		if !batchCompleted && rec.Status == llm.TaskStatusRunning {
+			runningLenses = append(runningLenses, e.lens)
+		} else if !rec.SubmittedToLineage {
+			res.FallbackToNative = true
+			if res.Error == "" && rec.Status != llm.TaskStatusFallbackNative {
+				res.Error = "external lens did not submit findings to lineage"
+			}
+		}
+		executed = append(executed, res)
+	}
+	return executed, runningLenses
+}
+
+func buildNativeOnlyLensesResult(lineageID string, st rdd.LineageStatus, targetLenses []string, nativeSet map[string]bool) reviewRunLensesResult {
+	nativePending := make([]string, 0, len(targetLenses))
+	for _, lens := range targetLenses {
+		if nativeSet[lens] {
+			nativePending = append(nativePending, "review-"+lens)
+		}
+	}
+	nextAction := st.NextAction
+	if len(nativePending) > 0 {
+		nextAction = formatNativeLensesNextAction(nativePending, nil, lineageID)
+	}
+	return reviewRunLensesResult{
+		LineageID:           lineageID,
+		Status:              llm.TaskStatusCompleted,
+		ExecutedLenses:      []lensExecResult{},
+		NativeLensesPending: nativePending,
+		NextAction:          nextAction,
+		ReviewStatus:        st,
+	}
+}
+
+func buildRunningLensesResult(ws *workspaceServices, lineageID string, fallbackStatus rdd.LineageStatus, runningLenses []string, executed []lensExecResult) reviewRunLensesResult {
+	postStatus, postErr := ws.rdd.Status(lineageID)
+	if postErr != nil {
+		postStatus = fallbackStatus
+	}
+	return reviewRunLensesResult{
+		LineageID:           lineageID,
+		Status:              llm.TaskStatusRunning,
+		RunningLenses:       runningLenses,
+		ExecutedLenses:      executed,
+		NativeLensesPending: []string{},
+		NextAction:          formatRunningLensesNextAction(runningLenses, lineageID),
+		ReviewStatus:        postStatus,
+	}
+}
+
+func buildCompletedLensesResult(ws *workspaceServices, lineageID string, fallbackStatus rdd.LineageStatus, batch *inFlightLensBatch, executed []lensExecResult) reviewRunLensesResult {
 	postStatus, err := ws.rdd.Status(lineageID)
 	if err != nil {
-		postStatus = st
+		postStatus = fallbackStatus
 	}
 
 	postPendingSet := make(map[string]bool, len(postStatus.PendingLenses))
@@ -1142,13 +1465,13 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, ws *workspaceService
 		}
 	}
 
-	nativePending := make([]string, 0, len(targetLenses))
+	nativePending := make([]string, 0, len(batch.targetLenses))
 	var fallbackRoles []string
-	for _, lens := range targetLenses {
+	for _, lens := range batch.targetLenses {
 		if !postPendingSet[lens] {
 			continue
 		}
-		if nativeSet[lens] || fallbackSet[lens] {
+		if batch.nativeSet[lens] || fallbackSet[lens] {
 			role := "review-" + lens
 			nativePending = append(nativePending, role)
 			if fallbackSet[lens] {
@@ -1159,26 +1482,69 @@ func (s *Server) handleReviewRunLenses(ctx context.Context, ws *workspaceService
 
 	nextAction := postStatus.NextAction
 	if len(nativePending) > 0 {
-		nextAction = fmt.Sprintf(
-			"Launch all pending native review lenses ([%s]) together in a single parallel invoke_subagent call for lineage %s.",
-			strings.Join(nativePending, ", "),
-			lineageID,
-		)
-		if len(fallbackRoles) > 0 {
-			nextAction += fmt.Sprintf(
-				" Include fallback_to_native in the prompt for failed external-mcp role(s) ([%s]) so PreToolUse admits the invoke_subagent batch.",
-				strings.Join(fallbackRoles, ", "),
-			)
-		}
+		nextAction = formatNativeLensesNextAction(nativePending, fallbackRoles, lineageID)
 	}
 
-	return toolJSONOrErr(reviewRunLensesResult{
+	return reviewRunLensesResult{
 		LineageID:           lineageID,
+		Status:              llm.TaskStatusCompleted,
 		ExecutedLenses:      executed,
 		NativeLensesPending: nativePending,
 		NextAction:          nextAction,
 		ReviewStatus:        postStatus,
-	}, nil), nil
+	}
+}
+
+func (s *Server) handleReviewRunLenses(ctx context.Context, ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
+	var args struct {
+		LineageID   string   `json:"lineageId"`
+		Lenses      []string `json:"lenses"`
+		WaitSeconds *int     `json:"waitSeconds"`
+	}
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
+	}
+	waitDur, err := resolveWaitTimeout(args.WaitSeconds, s.effectiveDefaultWaitTimeout())
+	if err != nil {
+		return toolErr(err), nil
+	}
+	lineageID := strings.TrimSpace(args.LineageID)
+	if lineageID == "" {
+		return toolErr(errors.New("lineageId is required")), nil
+	}
+	requestedLenses, err := parseRequestedLenses(args.Lenses)
+	if err != nil {
+		return toolErr(err), nil
+	}
+
+	batch, st, nativeOnly, err := s.attachOrStartLensBatch(ws, lineageID, requestedLenses)
+	if err != nil {
+		return toolErr(err), nil
+	}
+	if nativeOnly != nil {
+		return toolJSONOrErr(*nativeOnly, nil), nil
+	}
+
+	allDone, err := awaitLensBatch(ctx, batch.allDone, waitDur)
+	if err != nil {
+		return toolErr(err), nil
+	}
+
+	if !allDone {
+		executed, runningLenses := collectLensExecResults(ws, batch.entries, false)
+		if len(runningLenses) > 0 {
+			return toolJSONOrErr(buildRunningLensesResult(ws, lineageID, st, runningLenses, executed), nil), nil
+		}
+		select {
+		case <-batch.allDone:
+		case <-ctx.Done():
+			return toolErr(ctx.Err()), nil
+		}
+	}
+
+	releaseLensBatch(ws, lineageID, batch)
+	executed, _ := collectLensExecResults(ws, batch.entries, true)
+	return toolJSONOrErr(buildCompletedLensesResult(ws, lineageID, st, batch, executed), nil), nil
 }
 
 func buildReviewLensPrompt(lineageID, lens, role string) string {
@@ -1205,11 +1571,16 @@ func (s *Server) handleExternalRun(ctx context.Context, ws *workspaceServices, r
 		Model           string   `json:"model"`
 		MaxTurns        int      `json:"maxTurns"`
 		AllowedSurfaces []string `json:"allowedSurfaces"`
+		WaitSeconds     *int     `json:"waitSeconds"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := ws.runner.Run(ctx, llm.RunRequest{
+	waitDur, err := resolveWaitTimeout(args.WaitSeconds, s.effectiveDefaultWaitTimeout())
+	if err != nil {
+		return toolErr(err), nil
+	}
+	rec, done, err := ws.runner.StartRun(s.backgroundCtx(), llm.RunRequest{
 		Role:            args.Role,
 		Task:            args.Task,
 		LineageID:       args.LineageID,
@@ -1218,7 +1589,21 @@ func (s *Server) handleExternalRun(ctx context.Context, ws *workspaceServices, r
 		MaxTurns:        args.MaxTurns,
 		AllowedSurfaces: args.AllowedSurfaces,
 	})
-	return toolJSONOrErr(res, err), nil
+	if err != nil {
+		return toolErr(err), nil
+	}
+	s.trackBackground(done)
+
+	if waitDur > 0 {
+		rec, err = ws.runner.Wait(ctx, rec.TaskID, waitDur)
+		if err != nil {
+			return toolErr(err), nil
+		}
+	}
+	if rec.Status == llm.TaskStatusRunning {
+		rec.NextAction = formatRunningTaskNextAction(rec.TaskID, rec.Turns)
+	}
+	return toolJSONOrErr(rec, nil), nil
 }
 
 func (s *Server) handleExternalContinue(ctx context.Context, ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
@@ -1227,28 +1612,58 @@ func (s *Server) handleExternalContinue(ctx context.Context, ws *workspaceServic
 		Prompt          string   `json:"prompt"`
 		AllowedSurfaces []string `json:"allowedSurfaces"`
 		MaxTurns        int      `json:"maxTurns"`
+		WaitSeconds     *int     `json:"waitSeconds"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := ws.runner.Continue(ctx, llm.ContinueRequest{
+	waitDur, err := resolveWaitTimeout(args.WaitSeconds, s.effectiveDefaultWaitTimeout())
+	if err != nil {
+		return toolErr(err), nil
+	}
+	rec, done, err := ws.runner.StartContinue(s.backgroundCtx(), llm.ContinueRequest{
 		TaskID:          args.TaskID,
 		Prompt:          args.Prompt,
 		AllowedSurfaces: args.AllowedSurfaces,
 		MaxTurns:        args.MaxTurns,
 	})
-	return toolJSONOrErr(res, err), nil
+	if err != nil {
+		return toolErr(err), nil
+	}
+	s.trackBackground(done)
+
+	if waitDur > 0 {
+		rec, err = ws.runner.Wait(ctx, rec.TaskID, waitDur)
+		if err != nil {
+			return toolErr(err), nil
+		}
+	}
+	if rec.Status == llm.TaskStatusRunning {
+		rec.NextAction = formatRunningTaskNextAction(rec.TaskID, rec.Turns)
+	}
+	return toolJSONOrErr(rec, nil), nil
 }
 
-func (s *Server) handleExternalStatus(ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
+func (s *Server) handleExternalStatus(ctx context.Context, ws *workspaceServices, rawArgs json.RawMessage) (callToolResult, *rpcError) {
 	var args struct {
-		TaskID string `json:"taskId"`
+		TaskID      string `json:"taskId"`
+		WaitSeconds *int   `json:"waitSeconds"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return toolErr(fmt.Errorf("invalid arguments: %w", err)), nil
 	}
-	res, err := ws.runner.Status(args.TaskID)
-	return toolJSONOrErr(res, err), nil
+	waitDur, err := resolveWaitTimeout(args.WaitSeconds, 0)
+	if err != nil {
+		return toolErr(err), nil
+	}
+	rec, err := ws.runner.Wait(ctx, args.TaskID, waitDur)
+	if err != nil {
+		return toolErr(err), nil
+	}
+	if rec.Status == llm.TaskStatusRunning {
+		rec.NextAction = formatRunningTaskNextAction(rec.TaskID, rec.Turns)
+	}
+	return toolJSONOrErr(rec, nil), nil
 }
 
 func toolJSONOrErr(v any, err error) callToolResult {
@@ -1413,18 +1828,24 @@ func (s *Server) toolDefinitions() []toolSpec {
 		},
 		{
 			Name:        "odd_review_run_lenses",
-			Description: "Run all pending external-mcp 4R review lenses in parallel for an RDD lineage and report any agy-native lenses to launch together.",
+			Description: "Run all pending external-mcp 4R review lenses in parallel for an RDD lineage with bounded-wait chunked polling (returns status=\"running\" when still active so callers can re-call odd_review_run_lenses to attach without duplicating reviews) and report any agy-native lenses to launch together.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"lineageId": map[string]any{
 						"type":        "string",
-						"description": "Active RDD review lineage ID (in collecting_lenses status)",
+						"description": "Active RDD review lineage ID (in collecting_lenses status, or re-polling an in-flight batch)",
 					},
 					"lenses": map[string]any{
 						"type":        "array",
 						"description": "Optional subset of pending 4R lenses; defaults to all currently pending lenses for lineageId",
 						"items":       map[string]any{"type": "string"},
+					},
+					"waitSeconds": map[string]any{
+						"type":        "integer",
+						"minimum":     0,
+						"maximum":     int(maxMCPWaitTimeout / time.Second),
+						"description": fmt.Sprintf("Optional bounded wait window in seconds (0-%d, default %ds) before returning status=\"running\" for chunked re-attachment", int(maxMCPWaitTimeout/time.Second), defaultMCPWaitSeconds()),
 					},
 				},
 				"required": []string{"lineageId"},
@@ -1473,7 +1894,7 @@ func (s *Server) toolDefinitions() []toolSpec {
 		},
 		{
 			Name:        "odd_external_run",
-			Description: "Run a sandboxed agentic task for a role on configured external OpenAI-compatible providers.",
+			Description: "Run a sandboxed agentic task for a role on configured external OpenAI-compatible providers with bounded-wait chunked polling (returns status=\"running\" + taskId if still active so callers can poll with odd_external_status).",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -1484,13 +1905,14 @@ func (s *Server) toolDefinitions() []toolSpec {
 					"model":           map[string]any{"type": "string"},
 					"maxTurns":        map[string]any{"type": "integer"},
 					"allowedSurfaces": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"waitSeconds":     map[string]any{"type": "integer", "minimum": 0, "maximum": int(maxMCPWaitTimeout / time.Second), "description": fmt.Sprintf("Optional bounded wait window in seconds (0-%d, default %ds) before returning status=\"running\"", int(maxMCPWaitTimeout/time.Second), defaultMCPWaitSeconds())},
 				},
 				"required": []string{"role", "task"},
 			},
 		},
 		{
 			Name:        "odd_external_continue",
-			Description: "Resume a persisted external task preserving full history and reasoning_content.",
+			Description: "Resume a persisted external task preserving full history and reasoning_content with bounded-wait chunked polling (returns status=\"running\" + taskId if still active so callers can poll with odd_external_status).",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -1498,17 +1920,19 @@ func (s *Server) toolDefinitions() []toolSpec {
 					"prompt":          map[string]any{"type": "string"},
 					"allowedSurfaces": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 					"maxTurns":        map[string]any{"type": "integer"},
+					"waitSeconds":     map[string]any{"type": "integer", "minimum": 0, "maximum": int(maxMCPWaitTimeout / time.Second), "description": fmt.Sprintf("Optional bounded wait window in seconds (0-%d, default %ds) before returning status=\"running\"", int(maxMCPWaitTimeout/time.Second), defaultMCPWaitSeconds())},
 				},
 				"required": []string{"taskId", "prompt"},
 			},
 		},
 		{
 			Name:        "odd_external_status",
-			Description: "Inspect status and history metadata of a persisted external task.",
+			Description: "Inspect status and history metadata of a persisted external task, optionally blocking up to waitSeconds for completion.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"taskId": map[string]any{"type": "string"},
+					"taskId":      map[string]any{"type": "string"},
+					"waitSeconds": map[string]any{"type": "integer", "minimum": 0, "maximum": int(maxMCPWaitTimeout / time.Second), "description": fmt.Sprintf("Optional bounded wait window in seconds (0-%d, default 0 for instant status check)", int(maxMCPWaitTimeout/time.Second))},
 				},
 				"required": []string{"taskId"},
 			},
